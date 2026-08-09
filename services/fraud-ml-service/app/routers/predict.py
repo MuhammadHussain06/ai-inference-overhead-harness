@@ -1,6 +1,6 @@
 import time
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from ..model import FraudModel
 from ..schemas import PythonTelemetryDto, TransactionPayload, TransactionResponse
@@ -9,8 +9,8 @@ router = APIRouter()
 
 
 @router.post("/predict", response_model=TransactionResponse, response_model_by_alias=True)
-def predict(payload: TransactionPayload):
-    start_total = time.perf_counter()
+def predict(payload: TransactionPayload, request: Request):
+    start_total = request.state.start_time
 
     parsing_time_ms = (time.perf_counter() - start_total) * 1000
 
