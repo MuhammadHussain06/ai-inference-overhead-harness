@@ -1,0 +1,52 @@
+services:
+  python-service:
+    build: ./services/fraud-ml-service
+    container_name: python
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./services/fraud-ml-service/models:/app/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    cpuset: "0-2"
+    deploy:
+      resources:
+        limits:
+          cpus: '3.0'
+          memory: 3G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+    networks:
+      - testbed-net
+
+  transaction-service:
+    build: ./services/transaction-service
+    container_name: java
+    ports:
+      - "8080:8080"
+    environment:
+      - PYTHON_SERVICE_URL=http://python:8000
+      - APP_DB_SAVE_ENABLED=true
+    depends_on:
+      python-service:
+        condition: service_healthy
+    cpuset: "3-5"
+    deploy:
+      resources:
+        limits:
+          cpus: '3.0'
+          memory: 3G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+    networks:
+      - testbed-net
+
+networks:
+  testbed-net:
+    driver: bridge

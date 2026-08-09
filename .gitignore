@@ -1,0 +1,22 @@
+# Java
+services/transaction-service/target/
+services/transaction-service/.mvn/wrapper/maven-wrapper.jar
+
+# Python
+services/fraud-ml-service/**/__pycache__/
+services/fraud-ml-service/training/data/
+venv/
+
+# Note: fraud_model.joblib in services/fraud-ml-service/models/ is
+# intentionally tracked, not ignored — it's the real trained artifact
+# the testbed depends on at container startup.
+
+# Benchmark output (large, regenerated per run — keep the repo reproducible
+# via the scripts, not via committed raw data)
+results/*.json
+results/*.png
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
