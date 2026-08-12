@@ -162,6 +162,7 @@ public class TransactionService {
         response.setAccountId(request.getAccountId());
         response.setAmount(request.getAmount());
         response.setTransactionType(request.getTransactionType());
+        response.setFeatureTier(request.getFeatureTier());
 
         response.setRequestParsingTimeMs(parseTime);
         response.setNetworkCommunicationTimeMs(netTime);

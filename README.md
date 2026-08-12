@@ -128,6 +128,7 @@ Response:
   "riskScore": 0.9123,
   "transactionStatus": "FLAGGED",
   "strategy": "DISTRIBUTED_AI_SYNCHRONOUS",
+  "featureTier": 10,
   "executionTimeMs": 14.7,
   "requestParsingTimeMs": 0.03,
   "networkCommunicationTimeMs": 8.9,

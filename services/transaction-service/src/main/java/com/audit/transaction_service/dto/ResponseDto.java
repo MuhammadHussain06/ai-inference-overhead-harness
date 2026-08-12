@@ -21,6 +21,10 @@ public class ResponseDto {
 
     private String strategy;
 
+    // Number of features (V1..Vn) the scoring model actually used. Null for
+    // DISTRIBUTED_MOCK_GATEWAY, since the mock endpoint ignores features entirely.
+    private Integer featureTier;
+
     public ResponseDto() {}
 
     public ResponseDto(String transactionId, double riskScore, String transactionStatus, String strategy, double executionTimeMs) {
@@ -69,6 +73,9 @@ public class ResponseDto {
 
     public String getStrategy() { return strategy; }
     public void setStrategy(String strategy) { this.strategy = strategy; }
+
+    public Integer getFeatureTier() { return featureTier; }
+    public void setFeatureTier(Integer featureTier) { this.featureTier = featureTier; }
 
     public static class PythonTelemetryDto {
         private double parsingRequestTimeMs = 0.0;
