@@ -58,7 +58,8 @@ they never contend for the same cores during a run.
   is its own XGBoost model, loaded once at startup and held in memory
   alongside the others.
 - Stage-by-stage latency: parsing, network, DB-write, serialization (Java)
-  + parsing, computation, serialization (Python), nested in one response.
+  + parsing, computation (split into DataFrame construction and model
+  inference), serialization (Python), nested in one response.
 - Reactive Java stack end-to-end (WebFlux + R2DBC).
 - CPU-pinned, resource-limited containers.
 - k6 script that alternates strategies and captures Python telemetry as
@@ -137,11 +138,19 @@ Response:
   "pythonTelemetry": {
     "parsingRequestTimeMs": 0.21,
     "computationTimeMs": 1.85,
+    "dataframeConstructionTimeMs": 1.23,
+    "modelInferenceTimeMs": 0.62,
     "serializationResponseTimeMs": 0.09,
     "totalPythonExecutionTimeMs": 2.31
   }
 }
 ```
+
+`computationTimeMs` is the sum of `dataframeConstructionTimeMs` (building the
+single-row pandas `DataFrame` the model expects) and `modelInferenceTimeMs`
+(the `model.predict_proba` call itself) — split out to separate pandas
+overhead from actual tree-traversal cost. For `DISTRIBUTED_MOCK_GATEWAY`
+responses both sub-fields are `0.0`, since the mock does neither.
 
 `transactionId` must be a UUID, `accountId` must match `ACC-\d{4,10}` —
 both validated before reaching the AI layer; invalid requests return `400`
