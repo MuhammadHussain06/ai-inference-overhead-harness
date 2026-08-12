@@ -45,8 +45,6 @@ public class TransactionService {
                     String.format("[Transaction ID: %s] Transaction payload and amount must be present and > 0.", txIdStr)
             ));
         }
-        double requestParsingTimeMs = (System.nanoTime() - parseStart) / 1_000_000.0;
-
         String strategy = request.getStrategy().toUpperCase();
         String endpoint;
         Integer featureTier = null;
@@ -72,6 +70,9 @@ public class TransactionService {
             default:
                 return Mono.error(new IllegalArgumentException("Invalid evaluation strategy topology provided: " + strategy));
         }
+
+
+        double requestParsingTimeMs = (System.nanoTime() - parseStart) / 1_000_000.0;
 
         log.info("[Transaction ID: {}] Sending HTTP POST to Python endpoint {}", request.getTransactionId(), endpoint);
         long netStart = System.nanoTime();
