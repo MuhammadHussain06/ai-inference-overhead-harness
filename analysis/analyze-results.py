@@ -15,7 +15,7 @@ PYTHON_TELEMETRY_METRICS = [
 
 def _summarize(values, label):
     return {
-        "Metric": label,
+        "Group": label,
         "Count": len(values),
         "Mean": round(values.mean(), 2),
         "P50": round(values.median(), 2),
@@ -24,6 +24,13 @@ def _summarize(values, label):
         "Min": round(values.min(), 2),
         "Max": round(values.max(), 2),
     }
+
+
+def _group_label(strategy, tier):
+
+    if tier in (None, "", "mock"):
+        return strategy
+    return f"{strategy} (v{tier})"
 
 
 def analyze_k6_results(filename=DEFAULT_RESULTS_PATH):
@@ -46,6 +53,10 @@ def analyze_k6_results(filename=DEFAULT_RESULTS_PATH):
     df['strategy'] = df['data'].apply(
         lambda x: x.get('tags', {}).get('strategy') if isinstance(x, dict) else None
     )
+
+    df['tier'] = df['data'].apply(
+        lambda x: x.get('tags', {}).get('tier') if isinstance(x, dict) else None
+    )
     df['value'] = df['data'].apply(
         lambda x: x.get('value') if isinstance(x, dict) else None
     )
@@ -56,46 +67,53 @@ def analyze_k6_results(filename=DEFAULT_RESULTS_PATH):
         print("[!] No 'http_req_duration' metrics found in the dataset.")
         return
 
-    strategies = sorted(s for s in req_durations['strategy'].dropna().unique())
-    if not strategies:
-        print("[!] No 'strategy' tag found on requests — falling back to pooled results.")
-        strategies = [None]
+    req_durations['group'] = req_durations.apply(
+        lambda r: _group_label(r['strategy'], r['tier']), axis=1
+    )
 
-    print("\n--- END-TO-END LATENCY BY STRATEGY (ms) ---")
+    groups = sorted(g for g in req_durations['group'].dropna().unique())
+    if not groups:
+        print("[!] No 'strategy' tag found on requests — falling back to pooled results.")
+        groups = [None]
+
+    print("\n--- END-TO-END LATENCY BY STRATEGY/TIER (ms) ---")
     rows = []
-    for strat in strategies:
-        subset = req_durations if strat is None else req_durations[req_durations['strategy'] == strat]
-        rows.append(_summarize(subset['value'], strat or "ALL"))
+    for grp in groups:
+        subset = req_durations if grp is None else req_durations[req_durations['group'] == grp]
+        rows.append(_summarize(subset['value'], grp or "ALL"))
     latency_df = pd.DataFrame(rows)
     print(latency_df.to_markdown(index=False))
 
     for metric_name in PYTHON_TELEMETRY_METRICS:
-        metric_df = df[(df['metric'] == metric_name) & df['value'].notna()]
+        metric_df = df[(df['metric'] == metric_name) & df['value'].notna()].copy()
         if metric_df.empty:
             continue
-        print(f"\n--- {metric_name.upper()} BY STRATEGY (ms) ---")
+        metric_df['group'] = metric_df.apply(
+            lambda r: _group_label(r['strategy'], r['tier']), axis=1
+        )
+        print(f"\n--- {metric_name.upper()} BY STRATEGY/TIER (ms) ---")
         rows = []
-        for strat in strategies:
-            subset = metric_df if strat is None else metric_df[metric_df['strategy'] == strat]
+        for grp in groups:
+            subset = metric_df if grp is None else metric_df[metric_df['group'] == grp]
             if subset.empty:
                 continue
-            rows.append(_summarize(subset['value'], strat or "ALL"))
+            rows.append(_summarize(subset['value'], grp or "ALL"))
         if rows:
             print(pd.DataFrame(rows).to_markdown(index=False))
 
     plt.figure(figsize=(9, 5), dpi=300)
-    colors = ['#2b5c8f', '#c0392b', '#27ae60']
-    for i, strat in enumerate(strategies):
-        subset = req_durations if strat is None else req_durations[req_durations['strategy'] == strat]
+    color_cycle = ['#2b5c8f', '#c0392b', '#27ae60', '#8e44ad', '#e67e22', '#16a085']
+    for i, grp in enumerate(groups):
+        subset = req_durations if grp is None else req_durations[req_durations['group'] == grp]
         plt.hist(subset['value'], bins=60, alpha=0.55,
-                  label=strat or "ALL", color=colors[i % len(colors)], edgecolor='black')
+                 label=grp or "ALL", color=color_cycle[i % len(color_cycle)], edgecolor='black')
 
     plt.title('End-to-End Latency Distribution under Load', fontsize=13, fontweight='bold', pad=12)
     plt.xlabel('Request Latency (ms)', fontsize=11)
     plt.ylabel('Frequency (Request Count)', fontsize=11)
     plt.grid(True, linestyle='--', alpha=0.4)
-    if len(strategies) > 1:
-        plt.legend(title='Strategy')
+    if len(groups) > 1:
+        plt.legend(title='Strategy / Tier', fontsize=8)
 
     output_image = 'latency_distribution_plot.png'
     plt.savefig(output_image, bbox_inches='tight')

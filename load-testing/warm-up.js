@@ -8,43 +8,67 @@ export const options = {
   vus: 5, // Light load to trigger JIT compilation
 };
 
-const STRATEGIES = ['DISTRIBUTED_MOCK_GATEWAY', 'DISTRIBUTED_AI_SYNCHRONOUS'];
+// One target per real endpoint: mock baseline + each feature-count tier.
+// featureTier: null means "mock" (tier is ignored server-side for mock).
+const TARGETS = [
+  { strategy: 'DISTRIBUTED_MOCK_GATEWAY', featureTier: null },
+  { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 5 },
+  { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 10 },
+  { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 20 },
+  { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 28 },
+];
 
 const parsingTime = new Trend('python_parsing_time_ms', true);
 const computationTime = new Trend('python_computation_time_ms', true);
 const serializationTime = new Trend('python_serialization_time_ms', true);
 const totalPythonTime = new Trend('python_total_time_ms', true);
 
+// Client always sends the full V1..V28 vector; each /predict/v{n} endpoint
+// slices the first n values it needs, so one payload shape works for every tier.
+function randomFeatures(n) {
+  const arr = [];
+  for (let i = 0; i < n; i++) {
+    arr.push(Math.random() * 4 - 2); // roughly PCA-component-shaped range
+  }
+  return arr;
+}
+
 export default function () {
   const url = 'http://localhost:8080/api/v1/transactions';
-  const strategy = STRATEGIES[__ITER % STRATEGIES.length];
+  const target = TARGETS[__ITER % TARGETS.length];
+  const tierLabel = target.featureTier !== null ? String(target.featureTier) : 'mock';
 
-  const payload = JSON.stringify({
+  const body = {
     transactionId: uuidv4(),
     accountId: "ACC-1000",
     amount: 100.0,
     transactionType: "PURCHASE",
-    v1: 0.1, v2: 0.2, v3: 0.3, v4: 0.4, v5: 0.5,
-    strategy: strategy
-  });
+    features: randomFeatures(28),
+    strategy: target.strategy,
+  };
+  if (target.featureTier !== null) {
+    body.featureTier = target.featureTier;
+  }
 
   const params = {
     headers: { 'Content-Type': 'application/json' },
-    tags: { strategy: strategy },
+    tags: { strategy: target.strategy, tier: tierLabel },
   };
 
-  const res = http.post(url, payload, params);
+  const res = http.post(url, JSON.stringify(body), params);
 
   if (res.status === 200) {
-    const body = JSON.parse(res.body);
-    const telemetry = body.pythonTelemetry;
+    const responseBody = JSON.parse(res.body);
+    const telemetry = responseBody.pythonTelemetry;
     if (telemetry) {
-      const tags = { strategy: strategy };
+      const tags = { strategy: target.strategy, tier: tierLabel };
       parsingTime.add(telemetry.parsingRequestTimeMs, tags);
       computationTime.add(telemetry.computationTimeMs, tags);
       serializationTime.add(telemetry.serializationResponseTimeMs, tags);
       totalPythonTime.add(telemetry.totalPythonExecutionTimeMs, tags);
     }
+  } else {
+    console.error(`Request failed [${target.strategy}/${tierLabel}]: ${res.status} ${res.body}`);
   }
 
   sleep(0.5);
