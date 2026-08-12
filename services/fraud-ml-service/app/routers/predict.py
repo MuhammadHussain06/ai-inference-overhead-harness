@@ -16,6 +16,9 @@ def predict(n_features: int, payload: TransactionPayload, request: Request):
     parsing_time_ms = (time.perf_counter() - start_total) * 1000
 
     tier = FraudModel.get(n_features)
-    is_fraud, risk_score, comp_time_ms = tier.predict(payload)
+    is_fraud, risk_score, comp_time_ms, df_time_ms, infer_time_ms = tier.predict(payload)
 
-    return build_response(payload, is_fraud, risk_score, parsing_time_ms, comp_time_ms, start_total)
+    return build_response(
+        payload, is_fraud, risk_score, parsing_time_ms, comp_time_ms, start_total,
+        dataframe_construction_time_ms=df_time_ms, model_inference_time_ms=infer_time_ms,
+    )

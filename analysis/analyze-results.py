@@ -8,6 +8,8 @@ DEFAULT_RESULTS_PATH = os.path.join(os.path.dirname(__file__), "..", "results", 
 PYTHON_TELEMETRY_METRICS = [
     "python_parsing_time_ms",
     "python_computation_time_ms",
+    "python_dataframe_construction_time_ms",
+    "python_model_inference_time_ms",
     "python_serialization_time_ms",
     "python_total_time_ms",
 ]

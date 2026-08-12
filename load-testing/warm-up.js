@@ -20,6 +20,8 @@ const TARGETS = [
 
 const parsingTime = new Trend('python_parsing_time_ms', true);
 const computationTime = new Trend('python_computation_time_ms', true);
+const dataframeConstructionTime = new Trend('python_dataframe_construction_time_ms', true);
+const modelInferenceTime = new Trend('python_model_inference_time_ms', true);
 const serializationTime = new Trend('python_serialization_time_ms', true);
 const totalPythonTime = new Trend('python_total_time_ms', true);
 
@@ -64,6 +66,8 @@ export default function () {
       const tags = { strategy: target.strategy, tier: tierLabel };
       parsingTime.add(telemetry.parsingRequestTimeMs, tags);
       computationTime.add(telemetry.computationTimeMs, tags);
+      dataframeConstructionTime.add(telemetry.dataframeConstructionTimeMs, tags);
+      modelInferenceTime.add(telemetry.modelInferenceTimeMs, tags);
       serializationTime.add(telemetry.serializationResponseTimeMs, tags);
       totalPythonTime.add(telemetry.totalPythonExecutionTimeMs, tags);
     }

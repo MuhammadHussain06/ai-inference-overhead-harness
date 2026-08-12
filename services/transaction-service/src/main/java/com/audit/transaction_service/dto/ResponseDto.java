@@ -22,7 +22,7 @@ public class ResponseDto {
     private String strategy;
 
     // Number of features (V1..Vn) the scoring model actually used. Null for
-    // DISTRIBUTED_MOCK_GATEWAY, since the mock endpoint ignores features entirely.
+    // DISTRIBUTED_MOCK_GATEWAY
     private Integer featureTier;
 
     public ResponseDto() {}
@@ -80,6 +80,8 @@ public class ResponseDto {
     public static class PythonTelemetryDto {
         private double parsingRequestTimeMs = 0.0;
         private double computationTimeMs = 0.0;
+        private double dataframeConstructionTimeMs = 0.0;
+        private double modelInferenceTimeMs = 0.0;
         private double serializationResponseTimeMs = 0.0;
         private double totalPythonExecutionTimeMs = 0.0;
 
@@ -90,6 +92,12 @@ public class ResponseDto {
 
         public double getComputationTimeMs() { return computationTimeMs; }
         public void setComputationTimeMs(double computationTimeMs) { this.computationTimeMs = computationTimeMs; }
+
+        public double getDataframeConstructionTimeMs() { return dataframeConstructionTimeMs; }
+        public void setDataframeConstructionTimeMs(double dataframeConstructionTimeMs) { this.dataframeConstructionTimeMs = dataframeConstructionTimeMs; }
+
+        public double getModelInferenceTimeMs() { return modelInferenceTimeMs; }
+        public void setModelInferenceTimeMs(double modelInferenceTimeMs) { this.modelInferenceTimeMs = modelInferenceTimeMs; }
 
         public double getSerializationResponseTimeMs() { return serializationResponseTimeMs; }
         public void setSerializationResponseTimeMs(double serializationResponseTimeMs) { this.serializationResponseTimeMs = serializationResponseTimeMs; }

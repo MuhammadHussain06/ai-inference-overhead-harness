@@ -17,6 +17,8 @@ class PythonTelemetryDto(BaseModel):
 
     parsingRequestTimeMs: float = 0.0
     computationTimeMs: float = 0.0
+    dataframeConstructionTimeMs: float = 0.0
+    modelInferenceTimeMs: float = 0.0
     serializationResponseTimeMs: float = 0.0
     totalPythonExecutionTimeMs: float = 0.0
 

@@ -42,9 +42,15 @@ class FraudMLTier:
 
             log_amount = np.log1p(payload.amount)
             row = list(payload.features[: self.n_features]) + [log_amount]
-            df_input = pd.DataFrame([row], columns=self.column_names)
 
+            start_df = time.perf_counter()
+            df_input = pd.DataFrame([row], columns=self.column_names)
+            dataframe_construction_time_ms = (time.perf_counter() - start_df) * 1000
+
+            start_infer = time.perf_counter()
             risk_score = float(self.model.predict_proba(df_input)[0][1])
+            model_inference_time_ms = (time.perf_counter() - start_infer) * 1000
+
             is_fraud = bool(risk_score >= settings.FRAUD_THRESHOLD)
         except Exception as e:
             raise HTTPException(
@@ -52,7 +58,7 @@ class FraudMLTier:
             )
 
         computation_time_ms = (time.perf_counter() - start_comp) * 1000
-        return is_fraud, risk_score, computation_time_ms
+        return is_fraud, risk_score, computation_time_ms, dataframe_construction_time_ms, model_inference_time_ms
 
 
 class FraudModelRegistry:
