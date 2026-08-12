@@ -187,10 +187,7 @@ metrics split cleanly — use it as the base for larger concurrency sweeps.
 - **Resource limits** depend on Compose version — verify before trusting results.
 - **6-core CPU pinning** is host-specific; results aren't comparable across
   different core counts/SMT settings without adjusting `cpuset`.
-- **`load-testing/warm-up.js` targets the older single-model payload shape**
-  and needs its request body updated to the current `features`/`featureTier`
-  format before it'll run cleanly against this version.
-
+  
 ## Structure
 
 ```
