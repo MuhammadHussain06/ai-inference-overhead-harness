@@ -17,9 +17,9 @@ class TimingMiddleware(BaseHTTPMiddleware):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
-    FraudModel.load()
+    FraudModel.load_all()
     yield
-    FraudModel.model = None
+    FraudModel.clear()
 
 
 app = FastAPI(title="Fraud Detection API", lifespan=lifespan)
@@ -28,7 +28,7 @@ app.add_middleware(TimingMiddleware)
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "loadedTiers": list(FraudModel.tiers.keys())}
 
 
 app.include_router(predict.router)

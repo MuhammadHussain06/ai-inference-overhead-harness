@@ -3,6 +3,7 @@ package com.audit.transaction_service.dto;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import java.math.BigDecimal;
+import java.util.List;
 
 public class RequestDto {
 
@@ -26,15 +27,16 @@ public class RequestDto {
     @NotNull(message = "transactionType is required")
     private String transactionType;
 
-    private double v1;
-    private double v2;
-    private double v3;
-    private double v4;
-    private double v5;
+    @NotNull(message = "features is required")
+    private List<Double> features;
 
-    // Academic topology strategy toggle: DISTRIBUTED_AI_SYNCHRONOUS | DISTRIBUTED_MOCK_GATEWAY
+
     @NotNull(message = "strategy is required")
     private String strategy;
+
+    // Feature-count tier for the AI strategy: one of 5, 10, 20, 28.
+    // Ignored for DISTRIBUTED_MOCK_GATEWAY.
+    private Integer featureTier;
 
     public RequestDto() {}
 
@@ -50,21 +52,12 @@ public class RequestDto {
     public String getTransactionType() { return transactionType; }
     public void setTransactionType(String transactionType) { this.transactionType = transactionType; }
 
-    public double getV1() { return v1; }
-    public void setV1(double v1) { this.v1 = v1; }
-
-    public double getV2() { return v2; }
-    public void setV2(double v2) { this.v2 = v2; }
-
-    public double getV3() { return v3; }
-    public void setV3(double v3) { this.v3 = v3; }
-
-    public double getV4() { return v4; }
-    public void setV4(double v4) { this.v4 = v4; }
-
-    public double getV5() { return v5; }
-    public void setV5(double v5) { this.v5 = v5; }
+    public List<Double> getFeatures() { return features; }
+    public void setFeatures(List<Double> features) { this.features = features; }
 
     public String getStrategy() { return strategy; }
     public void setStrategy(String strategy) { this.strategy = strategy; }
+
+    public Integer getFeatureTier() { return featureTier; }
+    public void setFeatureTier(Integer featureTier) { this.featureTier = featureTier; }
 }

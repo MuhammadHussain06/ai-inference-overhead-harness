@@ -1,3 +1,5 @@
+from typing import List
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -7,11 +9,7 @@ class TransactionPayload(BaseModel):
 
     transactionId: str
     amount: float
-    v1: float = 0.0
-    v2: float = 0.0
-    v3: float = 0.0
-    v4: float = 0.0
-    v5: float = 0.0
+    features: List[float] = Field(default_factory=list)
 
 
 class PythonTelemetryDto(BaseModel):

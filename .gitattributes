@@ -1,0 +1,17 @@
+* text=auto eol=lf
+
+*.java text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sql text eol=lf
+*.properties text eol=lf
+*.xml text eol=lf
+
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+*.joblib binary
+*.jar binary

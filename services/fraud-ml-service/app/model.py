@@ -8,21 +8,26 @@ from fastapi import HTTPException
 from .config import settings
 
 
-class FraudML:
-    def __init__(self):
+class FraudMLTier:
+
+
+    def __init__(self, n_features: int):
+        self.n_features = n_features
         self.model = None
+        self.column_names = [f"V{i}" for i in range(1, n_features + 1)] + ["Amount"]
 
     def load(self):
-        print(f"[fraud-ml-service] Loading model from {settings.MODEL_PATH}")
+        path = settings.model_path(self.n_features)
+        print(f"[fraud-ml-service] Loading v{self.n_features} model from {path}")
         try:
-            self.model = joblib.load(settings.MODEL_PATH)
+            self.model = joblib.load(path)
         except FileNotFoundError as e:
             raise RuntimeError(
-                f"Model artifact not found at '{settings.MODEL_PATH}'. "
-                f"Run training/train_model.py first (see service README)."
+                f"Model artifact not found at '{path}'. Run "
+                f"training/train_model.py --n-features {self.n_features} first."
             ) from e
         except Exception as e:
-            raise RuntimeError(f"Failed to load model into memory: {e}") from e
+            raise RuntimeError(f"Failed to load v{self.n_features} model: {e}") from e
 
     def predict(self, payload):
         if self.model is None:
@@ -30,11 +35,14 @@ class FraudML:
 
         start_comp = time.perf_counter()
         try:
-            column_names = ["V1", "V2", "V3", "V4", "V5", "Amount"]
+            if len(payload.features) < self.n_features:
+                raise ValueError(
+                    f"Expected at least {self.n_features} feature values, got {len(payload.features)}"
+                )
 
             log_amount = np.log1p(payload.amount)
-            features = [payload.v1, payload.v2, payload.v3, payload.v4, payload.v5, log_amount]
-            df_input = pd.DataFrame([features], columns=column_names)
+            row = list(payload.features[: self.n_features]) + [log_amount]
+            df_input = pd.DataFrame([row], columns=self.column_names)
 
             risk_score = float(self.model.predict_proba(df_input)[0][1])
             is_fraud = bool(risk_score >= settings.FRAUD_THRESHOLD)
@@ -47,4 +55,27 @@ class FraudML:
         return is_fraud, risk_score, computation_time_ms
 
 
-FraudModel = FraudML()
+class FraudModelRegistry:
+
+    def __init__(self):
+        self.tiers = {}
+
+    def load_all(self):
+        for n in settings.FEATURE_TIERS:
+            tier = FraudMLTier(n)
+            tier.load()
+            self.tiers[n] = tier
+
+    def get(self, n_features: int) -> FraudMLTier:
+        if n_features not in self.tiers:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No model loaded for tier v{n_features}. Configured tiers: {list(self.tiers)}",
+            )
+        return self.tiers[n_features]
+
+    def clear(self):
+        self.tiers = {}
+
+
+FraudModel = FraudModelRegistry()

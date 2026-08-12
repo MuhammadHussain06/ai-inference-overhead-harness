@@ -9,9 +9,6 @@ CREATE TABLE IF NOT EXISTS transactions (
     transaction_status VARCHAR(255),
     risk_score DOUBLE,
     created_at TIMESTAMP,
-    v1 DOUBLE,
-    v2 DOUBLE,
-    v3 DOUBLE,
-    v4 DOUBLE,
-    v5 DOUBLE
+    feature_tier INT,
+    features_csv VARCHAR(1024)
     );

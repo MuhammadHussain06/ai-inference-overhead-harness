@@ -13,10 +13,15 @@ import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
 
 import java.math.BigDecimal;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
 public class TransactionService {
+
+    private static final Set<Integer> VALID_FEATURE_TIERS = Set.of(5, 10, 20, 28);
 
     private final TransactionRepository transactionRepository;
     private final WebClient webClient;
@@ -44,10 +49,22 @@ public class TransactionService {
 
         String strategy = request.getStrategy().toUpperCase();
         String endpoint;
+        Integer featureTier = null;
 
         switch (strategy) {
             case "DISTRIBUTED_AI_SYNCHRONOUS":
-                endpoint = "/predict";
+                featureTier = request.getFeatureTier();
+                if (featureTier == null || !VALID_FEATURE_TIERS.contains(featureTier)) {
+                    return Mono.error(new IllegalArgumentException(
+                            "featureTier must be one of " + VALID_FEATURE_TIERS + " for strategy DISTRIBUTED_AI_SYNCHRONOUS, got: " + featureTier));
+                }
+                List<Double> features = request.getFeatures();
+                if (features == null || features.size() < featureTier) {
+                    return Mono.error(new IllegalArgumentException(
+                            "features must contain at least " + featureTier + " values for the selected tier, got: "
+                                    + (features == null ? 0 : features.size())));
+                }
+                endpoint = "/predict/v" + featureTier;
                 break;
             case "DISTRIBUTED_MOCK_GATEWAY":
                 endpoint = "/predict/mock";
@@ -62,11 +79,7 @@ public class TransactionService {
         AiRequestDto aiPayload = new AiRequestDto(
                 request.getTransactionId(),
                 request.getAmount().doubleValue(),
-                request.getV1(),
-                request.getV2(),
-                request.getV3(),
-                request.getV4(),
-                request.getV5()
+                request.getFeatures()
         );
 
         return webClient.post()
@@ -106,11 +119,12 @@ public class TransactionService {
                         entity.setAccountId(request.getAccountId());
                         entity.setTransactionAmount(request.getAmount());
                         entity.setTransactionType(request.getTransactionType());
-                        entity.setV1(request.getV1());
-                        entity.setV2(request.getV2());
-                        entity.setV3(request.getV3());
-                        entity.setV4(request.getV4());
-                        entity.setV5(request.getV5());
+                        entity.setFeatureTier(request.getFeatureTier());
+                        if (request.getFeatures() != null) {
+                            entity.setFeaturesCsv(request.getFeatures().stream()
+                                    .map(String::valueOf)
+                                    .collect(Collectors.joining(",")));
+                        }
                         entity.setRiskScore(riskScore);
                         entity.setTransactionStatus(status);
                         entity.setEvaluationStrategy(strategy);

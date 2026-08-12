@@ -20,13 +20,17 @@ analysis.
 
 Every transaction routes through one of two strategies:
 
-- `DISTRIBUTED_AI_SYNCHRONOUS` — scored by the real XGBoost model.
+- `DISTRIBUTED_AI_SYNCHRONOUS` — scored by a real XGBoost model at a chosen
+  feature-count tier (see below).
 - `DISTRIBUTED_MOCK_GATEWAY` — scored by a random-value mock with the
   identical request/response shape and network path.
 
 Since both paths share the same JVM, network hop, DTOs, and DB write, the
 *difference* between them isolates model-inference cost from fixed costs
-(HTTP, serialization, scheduling).
+(HTTP, serialization, scheduling). Within the AI strategy, the model itself
+is swappable across four input-size tiers — `V5`, `V10`, `V20`, `V28` — so
+inference cost can also be measured as a function of feature-vector size,
+not just as a single fixed number.
 
 ## Architecture
 
@@ -37,10 +41,10 @@ k6 load generator
 transaction-service (Java, Spring Boot 3 / WebFlux, Netty, H2 via R2DBC)
         │
         │  WebClient (non-blocking)
-        │    POST /predict       → real inference
-        │    POST /predict/mock  → baseline
+        │    POST /predict/v{5,10,20,28}  → real inference, tier-selected
+        │    POST /predict/mock           → baseline
         ▼
-fraud-ml-service (Python, FastAPI / Uvicorn, XGBoost)
+fraud-ml-service (Python, FastAPI / Uvicorn, XGBoost registry)
 ```
 
 Each service runs in its own container, pinned to a disjoint CPU range, so
@@ -49,6 +53,10 @@ they never contend for the same cores during a run.
 ## Features
 
 - Dual-strategy routing, switchable per-request via `strategy` field.
+- Four feature-count tiers for the AI strategy (`5`/`10`/`20`/`28`), selected
+  per-request via `featureTier` and routed to `/predict/v{tier}` — each tier
+  is its own XGBoost model, loaded once at startup and held in memory
+  alongside the others.
 - Stage-by-stage latency: parsing, network, DB-write, serialization (Java)
   + parsing, computation, serialization (Python), nested in one response.
 - Reactive Java stack end-to-end (WebFlux + R2DBC).
@@ -64,29 +72,29 @@ they never contend for the same cores during a run.
 [Kaggle Credit Card Fraud dataset](https://www.kaggle.com/mlg-ulb/creditcardfraud)
 (anonymized European transactions, Sept 2013).
 
-- Uses `V1`–`V5` (of 28 PCA components) + `Amount`, kept small on purpose.
+- Each tier uses the first `n` of the 28 `V` PCA components (`V1..Vn`) +
+  `Amount`, where `n` is `5`, `10`, `20`, or `28` — columns stay in original
+  order across tiers, so `V10` is a strict superset of `V5`, and so on.
 - `Amount` is `log1p`-transformed at train and inference time.
 - Highly imbalanced (~0.17% fraud) — trained with SMOTE oversampling on the
-  training split, then `XGBClassifier`.
+  training split, then `XGBClassifier`, independently per tier.
 - `creditcard.csv` isn't bundled (Kaggle license) — place it at
-  `services/fraud-ml-service/training/data/creditcard.csv` to retrain, or
-  use `--synthetic` for a structural smoke test only.
+  `services/fraud-ml-service/training/data/creditcard.csv` to train, or use
+  `--synthetic` for a structural smoke test only.
 
-The shipped `models/fraud_model.joblib` is pre-trained — no dataset needed
-just to run the benchmark.
+`training/train_model.py --n-features {5,10,20,28}` trains a single tier;
+omitting the flag trains all four in one pass, writing
+`models/fraud_model_v{n}.joblib` for each. The Python service loads
+whichever tiers are listed in `FEATURE_TIERS` (default `5,10,20,28`) at
+startup — a run will fail to come up if a listed tier's `.joblib` file is
+missing, so train before compose-ing up.
 
-## Methodological Changes From the Original Services
+## Client Payload Shape
 
-1. **Accurate parsing telemetry.** `parsingRequestTimeMs` used to be timed
-   after Pydantic already parsed the request, so it always read ~0. Fixed
-   with a Starlette middleware that timestamps before parsing.
-2. **Concurrency-symmetric endpoints.** Mock was `async def`, real was sync
-   `def` — different Uvicorn scheduling (event loop vs. threadpool), which
-   would skew concurrency comparisons. Both are now sync `def`.
-3. **Shared response builder.** Telemetry/response assembly was duplicated
-   across routers; consolidated into `build_response()` in `app/responses.py`.
-4. **Build reproducibility.** `mvnw`/`mvnw.cmd` lost their executable bit in
-   transit; Dockerfile now `chmod +x`'s them before building.
+Clients send the full `V1..V28` vector regardless of which tier they're
+targeting — each `/predict/v{n}` endpoint slices the first `n` values it
+needs, so the same request body works against any tier without the client
+needing to know each model's exact input size.
 
 ## Example Request
 
@@ -101,14 +109,16 @@ Content-Type: application/json
   "accountId": "ACC-12345",
   "amount": 12500.50,
   "transactionType": "WIRE_TRANSFER",
-  "v1": 2.8,
-  "v2": -1.2,
-  "v3": 0.5,
-  "v4": 1.8,
-  "v5": -0.8,
-  "strategy": "DISTRIBUTED_AI_SYNCHRONOUS"
+  "features": [2.8, -1.2, 0.5, 1.8, -0.8, "... up to V28"],
+  "strategy": "DISTRIBUTED_AI_SYNCHRONOUS",
+  "featureTier": 10
 }
 ```
+
+`featureTier` selects which model (`V5`/`V10`/`V20`/`V28`) scores the
+request and is required when `strategy` is `DISTRIBUTED_AI_SYNCHRONOUS`
+(ignored for `DISTRIBUTED_MOCK_GATEWAY`); `features` must contain at least
+`featureTier` values.
 
 Response:
 
@@ -166,7 +176,9 @@ metrics split cleanly — use it as the base for larger concurrency sweeps.
 ## Limitations
 
 - **Single-node only** — no multi-region/network-hop simulation.
-- **Reduced feature set** (`V1`–`V5` + `Amount`) — benchmarks latency, not
+- **Reduced feature space even at the largest tier** (`V1`–`V28` + `Amount`
+  is the full PCA set the dataset provides, but the dataset itself is a
+  reduced anonymized representation) — benchmarks latency, not
   production-grade fraud detection accuracy.
 - **In-memory H2** — wiped on restart; export `results/` before tearing down.
 - **Mock endpoint** is a latency baseline only, never a real fraud check.
@@ -174,6 +186,9 @@ metrics split cleanly — use it as the base for larger concurrency sweeps.
 - **Resource limits** depend on Compose version — verify before trusting results.
 - **6-core CPU pinning** is host-specific; results aren't comparable across
   different core counts/SMT settings without adjusting `cpuset`.
+- **`load-testing/warm-up.js` targets the older single-model payload shape**
+  and needs its request body updated to the current `features`/`featureTier`
+  format before it'll run cleanly against this version.
 
 ## Structure
 
@@ -186,13 +201,13 @@ metrics split cleanly — use it as the base for larger concurrency sweeps.
     ├── fraud-ml-service/            # Python FastAPI inference service
     │   ├── app/
     │   │   ├── main.py              # entrypoint + TimingMiddleware
-    │   │   ├── model.py             # model load + inference
-    │   │   ├── config.py
+    │   │   ├── model.py             # FraudModelRegistry: one FraudMLTier per tier
+    │   │   ├── config.py            # FEATURE_TIERS, MODEL_DIR
     │   │   ├── schemas.py
     │   │   ├── responses.py         # shared response/telemetry builder
-    │   │   └── routers/predict.py, mock.py
-    │   ├── models/fraud_model.joblib
-    │   └── training/train_model.py
+    │   │   └── routers/predict.py (POST /predict/v{n}), mock.py
+    │   ├── models/fraud_model_v{5,10,20,28}.joblib
+    │   └── training/train_model.py  # --n-features {5,10,20,28}, omit for all four
     └── transaction-service/         # Java Spring Boot orchestrator
         └── src/main/java/.../{controller,service,model,repository,dto,exception}/
 ```
