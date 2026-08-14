@@ -29,6 +29,11 @@ class FraudMLTier:
         except Exception as e:
             raise RuntimeError(f"Failed to load v{self.n_features} model: {e}") from e
 
+        try:
+            self.model.set_params(n_jobs=1)
+        except Exception as e:
+            print(f"[fraud-ml-service] Warning: could not pin n_jobs=1 on v{self.n_features} model: {e}")
+
     def predict(self, payload):
         if self.model is None:
             raise HTTPException(status_code=500, detail="Model not initialized.")
