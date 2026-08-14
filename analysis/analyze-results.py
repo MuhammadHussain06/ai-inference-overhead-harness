@@ -1,19 +1,11 @@
 """
 Analyze k6 load-testing results from load-testing/run-suite.sh.
 
-Phases:
-  E1 (baseline): VUS=1, single-target, high N. Repeated REPS_BASELINE times.
-  E2 (scan):     Concurrency sweep across VUS. Repeated REPS_SCAN times.
-                 Measures latency degradation and multi-session reproducibility.
-
-Variance Levels:
-  - WITHIN-RUN  : Request noise in a single run (bootstrapped CIs).
-  - BETWEEN-RUN : Session variance across clean restarts (Mean/SD/CoV of run means).
-                  Evaluates true reproducibility across fresh process states.
-
-Pipeline:
-  Reads *.json metrics in --results-dir tagged by strategy/tier/vus/phase/rep.
-  Outputs tables (CSV, MD, LaTeX) and plots (PNG, PDF) to --output-dir.
+Evaluates latency distributions, scaling performance, and reproducibility across
+baseline (E1) and concurrency scan (E2) experiments. Separates within-run request
+noise (bootstrapped CIs) from between-run session variance (CoV% across clean stack
+restarts), and performs non-parametric Mann-Whitney U tests between adjacent
+tier/concurrency steps.
 
 Usage:
     python3 analyze-results.py [--results-dir ../results] [--output-dir ./output]
@@ -27,6 +19,7 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.stats import mannwhitneyu
 
 DEFAULT_RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
@@ -101,9 +94,6 @@ def load_results(results_dir):
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df["vus"] = pd.to_numeric(df["vus"], errors="coerce")
     df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
-    # Result files from before repetition support won't have a 'rep'
-    # tag at all -- treat that whole file as a single rep '1' rather
-    # than dropping it, so old single-run data still analyzes cleanly.
     df["rep"] = df["rep"].fillna("1")
     return df
 
@@ -160,17 +150,54 @@ def _throughput_reqs_per_s(subset_df):
     return len(times) / span_s
 
 
+# Stats — significance
+
+def pairwise_mannwhitney(df, metric, phase, group_col, order, label_fn, fixed_filters=None):
+    """
+  Mann-Whitney U test between adjacent pairs in `order` using pooled request values.
+
+  Evaluates if step-wise tier/concurrency increases significantly impact latency.
+  Uses non-parametric Mann-Whitney U due to right-skewed latency distributions.
+  Pools requests across repetitions for statistical power (noting within-rep correlation
+  as a known limitation, complemented by between-run CoV% analysis).
+
+  fixed_filters: Dict of column constraints (e.g., {"vus": 64}) applied during comparison.
+  """
+    sub = df[(df["metric"] == metric) & (df["phase"] == phase) & df["value"].notna()]
+    if fixed_filters:
+        for col, val in fixed_filters.items():
+            sub = sub[sub[col] == val]
+
+    rows = []
+    for a, b in zip(order, order[1:]):
+        vals_a = sub[sub[group_col] == a]["value"].to_numpy()
+        vals_b = sub[sub[group_col] == b]["value"].to_numpy()
+        if len(vals_a) < 2 or len(vals_b) < 2:
+            continue
+        stat, p = mannwhitneyu(vals_a, vals_b, alternative="two-sided")
+        rows.append({
+            "Comparison": f"{label_fn(a)} vs {label_fn(b)}",
+            "N (A)": len(vals_a),
+            "N (B)": len(vals_b),
+            "Median A (ms)": round(float(np.median(vals_a)), 3),
+            "Median B (ms)": round(float(np.median(vals_b)), 3),
+            "U statistic": round(float(stat), 1),
+            "p-value": f"{p:.2e}" if p < 0.001 else round(float(p), 4),
+            "Significant (p<0.05)": "Yes" if p < 0.05 else "No",
+        })
+    return pd.DataFrame(rows)
+
+
 # Stats — between-run
 
 def between_run_consistency(df, metric, phase, group_cols, label_fn):
     """
-  Compute between-run variance (mean, SD, CoV%) across independent repetitions.
+    Compute between-run metrics (Mean, SD, CoV%) across independent repetitions.
 
-  Computes per-repetition metric means for each group (e.g., tier, tier+vus),
-  then aggregates across reps. Reflects true session reproducibility, unlike
-  pooled CIs that hide run-to-run shifts. Uses direct summary statistics (mean/SD/CoV)
-  rather than CIs due to small repetition counts (3-5 reps).
-  """
+    Aggregates per-repetition means to measure true session-to-session reproducibility,
+    avoiding pooled statistics that mask run-level shifts. Uses direct summary statistics
+    (Mean, SD, CoV%) to accommodate small repetition sample sizes (3–5 reps).
+    """
 
     sub = df[(df["metric"] == metric) & (df["phase"] == phase) & df["value"].notna()].copy()
     if sub.empty:
@@ -314,6 +341,15 @@ def analyze_baseline(df, output_dir):
                        "(pooled across all repetitions).",
                label="tab:df-share")
 
+    # Table 5: pairwise significance between adjacent tiers (mock vs v5,
+    # v5 vs v10, v10 vs v20, v20 vs v28) -- answers "is the next tier
+    # actually slower, or could that gap be noise" for each step.
+    table5 = pairwise_mannwhitney(base, "http_req_duration", "baseline", "tier", order, _tier_label)
+    save_table(table5, "table5_baseline_adjacent_tier_significance", output_dir,
+               caption="Mann-Whitney U test between adjacent feature-count tiers, end-to-end latency "
+                       "at VUS=1, pooled across all repetitions.",
+               label="tab:baseline-mannwhitney")
+
     # Figure 1: stacked bar of Python-side decomposition, AI tiers only
     ai_order = [t for t in order if t != "mock"]
     if ai_order:
@@ -434,6 +470,23 @@ def analyze_scan(df, output_dir):
                caption="Between-run consistency of mean end-to-end latency across independent, "
                        "clean-slate repetitions of the concurrency scan.",
                label="tab:scan-between-run")
+
+    # Table 6: Pairwise significance between adjacent concurrency levels per tier.
+    # Evaluates whether each incremental concurrency increase significantly degrades latency.
+    table6_parts = []
+    for t in order:
+        part = pairwise_mannwhitney(
+            scan, "http_req_duration", "scan", "vus", levels,
+            lambda v: f"VUS={int(v)}", fixed_filters={"tier": t},
+        )
+        if not part.empty:
+            part.insert(0, "Tier", _tier_label(t))
+            table6_parts.append(part)
+    table6 = pd.concat(table6_parts, ignore_index=True) if table6_parts else pd.DataFrame()
+    save_table(table6, "table6_scan_adjacent_concurrency_significance", output_dir,
+               caption="Mann-Whitney U test between adjacent concurrency levels, end-to-end latency, "
+                       "per tier, pooled across all repetitions.",
+               label="tab:scan-mannwhitney")
 
     # Figure 3: P95 end-to-end latency vs. concurrency, with error bars
     # from the SD of per-rep P95 across independent repetitions.
