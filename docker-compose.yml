@@ -10,6 +10,7 @@ services:
       - FEATURE_TIERS=5,10,20,28
       - MODEL_DIR=models
       - PYTHONUNBUFFERED=1
+      - UVICORN_WORKERS=3
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
       interval: 5s

@@ -3,13 +3,17 @@ package com.audit.transaction_service.service;
 import com.audit.transaction_service.dto.AiRequestDto;
 import com.audit.transaction_service.dto.RequestDto;
 import com.audit.transaction_service.dto.ResponseDto;
+import com.audit.transaction_service.exception.UpstreamInferenceException;
 import com.audit.transaction_service.model.Transaction;
 import com.audit.transaction_service.repository.TransactionRepository;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.Mono;
 
 import java.math.BigDecimal;
@@ -34,10 +38,9 @@ public class TransactionService {
         this.webClient = webClient;
     }
 
-    public Mono<ResponseDto> processTransaction(RequestDto request) {
+    public Mono<ResponseDto> processTransaction(RequestDto request, long requestStartNanos) {
         long overallStartTime = System.nanoTime();
 
-        long parseStart = System.nanoTime();
         if (request == null || request.getAmount() == null || request.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
             String txIdStr = (request != null && request.getTransactionId() != null) ? request.getTransactionId() : "UNKNOWN";
             log.error("[Transaction ID: {}] Rejecting processing: Payload is null or amount <= 0.", txIdStr);
@@ -72,7 +75,7 @@ public class TransactionService {
         }
 
 
-        double requestParsingTimeMs = (System.nanoTime() - parseStart) / 1_000_000.0;
+        double requestParsingTimeMs = (System.nanoTime() - requestStartNanos) / 1_000_000.0;
 
         log.info("[Transaction ID: {}] Sending HTTP POST to Python endpoint {}", request.getTransactionId(), endpoint);
         long netStart = System.nanoTime();
@@ -89,30 +92,43 @@ public class TransactionService {
                 .retrieve()
                 .bodyToMono(AiRiskResponse.class)
                 .map(aiResponse -> {
-                    double networkCommunicationTimeMs = (System.nanoTime() - netStart) / 1_000_000.0;
+                    double aiCallRoundTripTimeMs = (System.nanoTime() - netStart) / 1_000_000.0;
                     double riskScore = (aiResponse != null) ? aiResponse.getRiskScore() : 0.0;
                     boolean isFraud = (aiResponse != null) && aiResponse.isFraud();
                     ResponseDto.PythonTelemetryDto pythonTelemetry = (aiResponse != null && aiResponse.getPythonTelemetry() != null)
                             ? aiResponse.getPythonTelemetry()
                             : new ResponseDto.PythonTelemetryDto();
 
-                    return new IntermediateResult(riskScore, isFraud, networkCommunicationTimeMs, pythonTelemetry);
+                    return new IntermediateResult(riskScore, isFraud, aiCallRoundTripTimeMs, pythonTelemetry);
                 })
-                .onErrorResume(e -> {
-                    double networkCommunicationTimeMs = (System.nanoTime() - netStart) / 1_000_000.0;
+
+                .onErrorMap(e -> !(e instanceof UpstreamInferenceException), e -> {
                     log.error("[Transaction ID: {}] Failed to communicate with Python endpoint {}: {}",
                             request.getTransactionId(), endpoint, e.getMessage());
-                    return Mono.just(new IntermediateResult(0.0, false, networkCommunicationTimeMs, new ResponseDto.PythonTelemetryDto()));
+
+                    // Distinguish "Python rejected the input" (4xx from Python -- surfaced
+                    // as our own 400) from "the call to Python didn't complete normally"
+                    // (unreachable, timed out, or an unexpected 5xx -- surfaced as 502).
+                    HttpStatus upstreamStatus = HttpStatus.BAD_GATEWAY;
+                    if (e instanceof WebClientResponseException wcre) {
+                        HttpStatusCode sc = wcre.getStatusCode();
+                        if (sc.is4xxClientError()) {
+                            upstreamStatus = HttpStatus.BAD_REQUEST;
+                        }
+                    }
+
+                    return new UpstreamInferenceException(
+                            String.format("[Transaction ID: %s] Upstream call to %s failed: %s",
+                                    request.getTransactionId(), endpoint, e.getMessage()),
+                            e, upstreamStatus);
                 })
                 .flatMap(intermediate -> {
                     double riskScore = intermediate.riskScore;
                     boolean isFraud = intermediate.isFraud;
-                    double networkCommunicationTimeMs = intermediate.networkTimeMs;
+                    double aiCallRoundTripTimeMs = intermediate.aiCallRoundTripTimeMs;
                     ResponseDto.PythonTelemetryDto pythonTelemetry = intermediate.pythonTelemetry;
 
                     String status = isFraud ? "FLAGGED" : "APPROVED";
-                    long dbStart = System.nanoTime();
-                    double currentExecutionTimeMs = (System.nanoTime() - overallStartTime) / 1_000_000.0;
 
                     if (dbSaveEnabled) {
                         Transaction entity = new Transaction();
@@ -129,17 +145,20 @@ public class TransactionService {
                         entity.setRiskScore(riskScore);
                         entity.setTransactionStatus(status);
                         entity.setEvaluationStrategy(strategy);
-                        entity.setExecutionTimeMs(currentExecutionTimeMs);
 
+                        long dbStart = System.nanoTime();
                         return transactionRepository.save(entity)
                                 .doOnSuccess(saved -> log.debug("[Transaction ID: {}] Saved to H2 database.", request.getTransactionId()))
-                                .map(savedEntity -> buildResponse(request, riskScore, status, strategy, overallStartTime,
-                                        requestParsingTimeMs, networkCommunicationTimeMs,
-                                        (System.nanoTime() - dbStart) / 1_000_000.0, pythonTelemetry));
+                                .map(savedEntity -> {
+                                    double dbWriteTimeMs = (System.nanoTime() - dbStart) / 1_000_000.0;
+                                    return buildResponse(request, riskScore, status, strategy,
+                                            overallStartTime, requestParsingTimeMs, aiCallRoundTripTimeMs,
+                                            dbWriteTimeMs, pythonTelemetry);
+                                });
                     } else {
                         log.debug("[Transaction ID: {}] DB persistence bypassed via configuration flag.", request.getTransactionId());
                         return Mono.fromCallable(() -> buildResponse(request, riskScore, status, strategy, overallStartTime,
-                                requestParsingTimeMs, networkCommunicationTimeMs, 0.0, pythonTelemetry));
+                                requestParsingTimeMs, aiCallRoundTripTimeMs, 0.0, pythonTelemetry));
                     }
                 });
     }
@@ -164,9 +183,11 @@ public class TransactionService {
         response.setAmount(request.getAmount());
         response.setTransactionType(request.getTransactionType());
         response.setFeatureTier(request.getFeatureTier());
-
         response.setRequestParsingTimeMs(parseTime);
-        response.setNetworkCommunicationTimeMs(netTime);
+        response.setAiCallRoundTripTimeMs(netTime);
+
+        double estimatedNetworkOverheadMs = netTime - pythonTelemetry.getTotalPythonExecutionTimeMs();
+        response.setEstimatedNetworkOverheadMs(estimatedNetworkOverheadMs);
         response.setDbWriteTimeMs(dbTime);
         response.setPythonTelemetry(pythonTelemetry);
         response.setResponseSerializationTimeMs((System.nanoTime() - responseBuildStart) / 1_000_000.0);
@@ -177,13 +198,13 @@ public class TransactionService {
     private static class IntermediateResult {
         double riskScore;
         boolean isFraud;
-        double networkTimeMs;
+        double aiCallRoundTripTimeMs;
         ResponseDto.PythonTelemetryDto pythonTelemetry;
 
-        public IntermediateResult(double riskScore, boolean isFraud, double networkTimeMs, ResponseDto.PythonTelemetryDto pythonTelemetry) {
+        public IntermediateResult(double riskScore, boolean isFraud, double aiCallRoundTripTimeMs, ResponseDto.PythonTelemetryDto pythonTelemetry) {
             this.riskScore = riskScore;
             this.isFraud = isFraud;
-            this.networkTimeMs = networkTimeMs;
+            this.aiCallRoundTripTimeMs = aiCallRoundTripTimeMs;
             this.pythonTelemetry = pythonTelemetry;
         }
     }

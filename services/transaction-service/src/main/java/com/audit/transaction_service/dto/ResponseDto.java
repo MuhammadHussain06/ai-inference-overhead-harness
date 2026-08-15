@@ -13,7 +13,8 @@ public class ResponseDto {
 
     private double executionTimeMs;
     private double requestParsingTimeMs;
-    private double networkCommunicationTimeMs;
+    private double aiCallRoundTripTimeMs;
+    private double estimatedNetworkOverheadMs;
     private double dbWriteTimeMs;
     private double responseSerializationTimeMs;
 
@@ -59,8 +60,11 @@ public class ResponseDto {
     public double getRequestParsingTimeMs() { return requestParsingTimeMs; }
     public void setRequestParsingTimeMs(double requestParsingTimeMs) { this.requestParsingTimeMs = requestParsingTimeMs; }
 
-    public double getNetworkCommunicationTimeMs() { return networkCommunicationTimeMs; }
-    public void setNetworkCommunicationTimeMs(double networkCommunicationTimeMs) { this.networkCommunicationTimeMs = networkCommunicationTimeMs; }
+    public double getAiCallRoundTripTimeMs() { return aiCallRoundTripTimeMs; }
+    public void setAiCallRoundTripTimeMs(double aiCallRoundTripTimeMs) { this.aiCallRoundTripTimeMs = aiCallRoundTripTimeMs; }
+
+    public double getEstimatedNetworkOverheadMs() { return estimatedNetworkOverheadMs; }
+    public void setEstimatedNetworkOverheadMs(double estimatedNetworkOverheadMs) { this.estimatedNetworkOverheadMs = estimatedNetworkOverheadMs; }
 
     public double getDbWriteTimeMs() { return dbWriteTimeMs; }
     public void setDbWriteTimeMs(double dbWriteTimeMs) { this.dbWriteTimeMs = dbWriteTimeMs; }

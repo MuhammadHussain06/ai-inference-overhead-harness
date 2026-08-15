@@ -5,14 +5,12 @@ set -euo pipefail
 #
 # Variance & Isolation:
 #   - WITHIN-RUN  : Request noise in a single k6 run.
-#   - BETWEEN-RUN : Session effects (JIT, GC, OS state) isolated by
-#                   restarting docker-compose between reps.
-#   - SHUFFLING   : Target/concurrency order randomized per rep to prevent
-#                   drift (thermal, GC, memory) from biasing specific cells.
+#   - BETWEEN-RUN : Session effects (JIT, GC, OS state) isolated via stack restarts.
+#   - SHUFFLING   : Target/concurrency order randomized per rep to prevent drift.
 #                   Execution sequence logged to run_order_log.txt.
 #
 # Suite Strategy:
-#   - Repetitions restart stack clean-slate; cells within a rep run sequentially.
+#   - Clean-slate stack restart per rep; sequential cell runs within reps.
 #   - Rep Counts: E1 (baseline) = REPS_BASELINE | E2 (concurrency scan) = REPS_SCAN.
 #
 # Prerequisite: Set APP_DB_SAVE_ENABLED=false in ../docker-compose.yml.
@@ -26,7 +24,7 @@ ORDER_LOG="${RESULTS_DIR}/run_order_log.txt"
 TARGETS=(mock 5 10 20 28)
 CONCURRENCY_LEVELS=(1 2 4 8 16 32 64)
 BASELINE_ITERATIONS=500
-SCAN_ITERATIONS=500
+SCAN_ITERATIONS_PER_VU=100
 COOLDOWN_S=10
 REPS_BASELINE=5
 REPS_SCAN=3
@@ -46,7 +44,7 @@ wait_for_ready() {
   for i in $(seq 1 "$max_attempts"); do
     status=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$url" \
       -H "Content-Type: application/json" \
-      -d '{"transactionId":"readiness-check","accountId":"ACC-0","amount":1.0,"transactionType":"PURCHASE","features":[],"strategy":"DISTRIBUTED_MOCK_GATEWAY"}' \
+      -d '{"transactionId":"00000000-0000-0000-0000-000000000000","accountId":"ACC-0000","amount":1.0,"transactionType":"PURCHASE","features":[],"strategy":"DISTRIBUTED_MOCK_GATEWAY"}'   \
       2>/dev/null) || status="000"
     if [ "$status" = "200" ]; then
       echo "  [ready] transaction-service responded 200 after ${i} attempt(s)."
@@ -105,7 +103,7 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   for target in "${TARGETS_THIS_REP[@]}"; do
     for vus in "${CONCURRENCY_THIS_REP[@]}"; do
       echo "  -> target=${target} vus=${vus} rep=${rep}"
-      TARGET="$target" VUS="$vus" ITERATIONS=$SCAN_ITERATIONS PHASE=scan REP="$rep" \
+      TARGET="$target" VUS="$vus" ITERATIONS_PER_VU=$SCAN_ITERATIONS_PER_VU PHASE=scan REP="$rep" \
         k6 run run-target.js \
         --out "json=${RESULTS_DIR}/scan_${target}_vus${vus}_rep${rep}.json"
       sleep "$COOLDOWN_S"

@@ -1,15 +1,16 @@
 # Java
 services/transaction-service/target/
-services/transaction-service/.mvn/wrapper/maven-wrapper.jar
 
 # Python
 services/fraud-ml-service/**/__pycache__/
+services/fraud-ml-service/training/venv/
 services/fraud-ml-service/training/data/
-venv/
 
-# Benchmark output
-results/*.json
-results/*.png
+# Benchmark raw output
+results/
+
+# Analysis output
+analysis/output/
 
 # OS/editor noise
 .DS_Store

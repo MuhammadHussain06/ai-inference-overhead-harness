@@ -43,6 +43,24 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
     }
 
+    @ExceptionHandler(UpstreamInferenceException.class)
+    public ResponseEntity<ErrorResponseDto> handleUpstreamInferenceException(UpstreamInferenceException ex) {
+        HttpStatus status = ex.getUpstreamStatus();
+
+        String errorLabel = (status == HttpStatus.BAD_REQUEST)
+                ? "Upstream Validation Failure"
+                : "Upstream Inference Failure";
+
+        ErrorResponseDto response = new ErrorResponseDto(
+                LocalDateTime.now(),
+                status.value(),
+                errorLabel,
+                ex.getMessage(),
+                null
+        );
+        return ResponseEntity.status(status).body(response);
+    }
+
     @ExceptionHandler(RuntimeException.class)
     public ResponseEntity<ErrorResponseDto> handleRuntimeException(RuntimeException ex) {
         ErrorResponseDto response = new ErrorResponseDto(
