@@ -8,6 +8,9 @@ set -euo pipefail
 #   - BETWEEN-RUN : Session effects (JIT, GC, OS state) isolated via stack restarts.
 #   - SHUFFLING   : Target/concurrency order randomized per rep to prevent drift.
 #                   Execution sequence logged to run_order_log.txt.
+#   - PROVENANCE  : Host/toolchain fingerprint captured once per suite run to
+#                   run_metadata.json, so results are traceable to the exact
+#                   environment that produced them.
 #
 # Suite Strategy:
 #   - Clean-slate stack restart per rep; sequential cell runs within reps.
@@ -20,6 +23,7 @@ RESULTS_DIR="../results"
 mkdir -p "$RESULTS_DIR"
 ORDER_LOG="${RESULTS_DIR}/run_order_log.txt"
 : > "$ORDER_LOG"   # truncate/create fresh each suite run
+METADATA_FILE="${RESULTS_DIR}/run_metadata.json"
 
 TARGETS=(mock 5 10 20 28)
 CONCURRENCY_LEVELS=(1 2 4 8 16 32 64)
@@ -28,6 +32,80 @@ SCAN_ITERATIONS_PER_VU=100
 COOLDOWN_S=10
 REPS_BASELINE=5
 REPS_SCAN=3
+
+
+capture_run_metadata() {
+  echo "[*] Capturing run metadata to ${METADATA_FILE}..."
+
+  local timestamp
+  timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  local host_uname
+  host_uname=$(uname -a 2>/dev/null || echo "unknown")
+
+  local docker_version
+  docker_version=$(docker --version 2>/dev/null || echo "unknown")
+
+  local compose_version
+  compose_version=$(docker compose version 2>/dev/null || echo "unknown")
+
+  local git_commit git_dirty
+  if command -v git >/dev/null 2>&1 && git -C .. rev-parse HEAD >/dev/null 2>&1; then
+    git_commit=$(git -C .. rev-parse HEAD)
+    if [ -n "$(git -C .. status --porcelain 2>/dev/null)" ]; then
+      git_dirty="true"
+    else
+      git_dirty="false"
+    fi
+  else
+    git_commit="unknown"
+    git_dirty="unknown"
+  fi
+
+  local cpu_model cpu_count
+  if [ -r /proc/cpuinfo ]; then
+    cpu_model=$(grep -m1 "model name" /proc/cpuinfo | sed 's/.*: //' || echo "unknown")
+    cpu_count=$(nproc 2>/dev/null || echo "unknown")
+  else
+    cpu_model="unknown"
+    cpu_count="unknown"
+  fi
+
+  local total_mem_kb
+  if [ -r /proc/meminfo ]; then
+    total_mem_kb=$(grep -m1 "MemTotal" /proc/meminfo | grep -o '[0-9]*' || echo "unknown")
+  else
+    total_mem_kb="unknown"
+  fi
+
+  # Escape backslashes/quotes in free-text fields before embedding in JSON.
+  json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+  cat > "$METADATA_FILE" <<EOF
+{
+  "timestamp_utc": "$(json_escape "$timestamp")",
+  "host_uname": "$(json_escape "$host_uname")",
+  "docker_version": "$(json_escape "$docker_version")",
+  "docker_compose_version": "$(json_escape "$compose_version")",
+  "git_commit": "$(json_escape "$git_commit")",
+  "git_dirty": "$(json_escape "$git_dirty")",
+  "cpu_model": "$(json_escape "$cpu_model")",
+  "cpu_count": "$(json_escape "$cpu_count")",
+  "total_mem_kb": "$(json_escape "$total_mem_kb")",
+  "suite_config": {
+    "targets": [$(printf '"%s",' "${TARGETS[@]}" | sed 's/,$//')],
+    "concurrency_levels": [$(printf '%s,' "${CONCURRENCY_LEVELS[@]}" | sed 's/,$//')],
+    "baseline_iterations": ${BASELINE_ITERATIONS},
+    "scan_iterations_per_vu": ${SCAN_ITERATIONS_PER_VU},
+    "cooldown_s": ${COOLDOWN_S},
+    "reps_baseline": ${REPS_BASELINE},
+    "reps_scan": ${REPS_SCAN}
+  }
+}
+EOF
+
+  echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} git=${git_commit:0:12}"
+}
 
 restart_stack() {
   echo "  [restart] tearing down stack for a clean slate..."
@@ -59,6 +137,8 @@ wait_for_ready() {
 shuffled() {
   printf '%s\n' "$@" | shuf | tr '\n' ' '
 }
+
+capture_run_metadata
 
 echo "[*] E1: baseline decomposition x ${REPS_BASELINE} independent repetitions"
 for rep in $(seq 1 "$REPS_BASELINE"); do
@@ -113,4 +193,5 @@ done
 
 echo "[+] Suite complete. Raw results in ${RESULTS_DIR}/"
 echo "    Per-rep cell order logged to ${ORDER_LOG}"
+echo "    Host/toolchain fingerprint logged to ${METADATA_FILE}"
 echo "    Run: python3 ../analysis/analyze-results.py"
