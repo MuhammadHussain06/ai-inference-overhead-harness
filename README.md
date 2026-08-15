@@ -1,25 +1,33 @@
-# Fraud Evaluation Harness — Containerized Testbed
+# AI Inference Overhead Harness
 
 Containerized benchmark that measures the real latency/throughput cost of a
-live AI fraud-inference call against a network-equivalent mock baseline.
-`docker compose up` reproduces the setup used for the accompanying thesis.
+synchronous AI inference call in a microservice request path, against a
+network-equivalent mock baseline. `docker compose up` reproduces the setup
+used for the accompanying empirical paper.
+
+The workload used to generate load is a fraud classifier, but the paper
+isn't about fraud detection — it's about what a synchronous AI call costs a
+request path, and how that cost scales with input complexity. Fraud
+classification just gives a realistic, variable-input-size ML workload to
+measure that with.
 
 Integrates two services:
 
 - **transaction-service** (Java / Spring Boot, WebFlux + R2DBC) — validates
-  and routes transactions, records latency telemetry.
+  and routes requests, records latency telemetry.
   Originally [`MuhammadHussain06/fraud-eval-harness`](https://github.com/MuhammadHussain06/fraud-eval-harness).
 - **fraud-ml-service** (Python / FastAPI) — wraps a trained XGBoost fraud
-  classifier.
+  classifier used as the inference workload.
   Originally [`MianBao-07/fraud-detection-microservice`](https://github.com/MianBao-07/fraud-detection-microservice).
 
 This repo containerizes both, adds a mock baseline endpoint to isolate AI
-overhead, pins CPUs per service, and ships k6 load testing plus result
+overhead, pins CPUs per service, disables DB persistence by default to keep
+extra I/O out of the measurement, and ships k6 load testing plus result
 analysis.
 
 ## How it works
 
-Every transaction routes through one of two strategies, selected per-request:
+Every request routes through one of two strategies, selected per-request:
 
 - `DISTRIBUTED_AI_SYNCHRONOUS` — scored by a real XGBoost model at a chosen
   feature-count tier: `V5`, `V10`, `V20`, or `V28`.
@@ -91,7 +99,8 @@ directory (`--results-dir` / `--output-dir` are overridable, both default to
 `results/` and `analysis/output/`).
 
 `run-suite.sh` requires `APP_DB_SAVE_ENABLED=false` in `docker-compose.yml`
-(already set) so DB writes don't skew the measured latency.
+(already set) — DB persistence is off by design so DB write I/O doesn't
+confound the mock-vs-model and tier-scaling comparisons.
 
 ### Requirements
 
@@ -231,4 +240,5 @@ via `depends_on`.
 
 - Transaction orchestrator originally by [MuhammadHussain06](https://github.com/MuhammadHussain06/fraud-eval-harness).
 - Fraud inference microservice originally by [MianBao-07](https://github.com/MianBao-07/fraud-detection-microservice).
-- Containerization, mock routing, load testing, and telemetry/concurrency fixes integrate and extend both.
+- Containerization, mock routing, load testing, DB-persistence isolation, and
+  telemetry/concurrency fixes integrate and extend both for this harness.
