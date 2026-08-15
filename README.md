@@ -1,120 +1,106 @@
-# AI Inference Overhead Harness
+# Fraud Evaluation Harness — Containerized Testbed
 
-Containerized benchmark that measures the real latency/throughput cost of a
-synchronous AI inference call in a microservice request path, against a
-network-equivalent mock baseline. `docker compose up` reproduces the setup
-used for the accompanying empirical paper.
+Containerized benchmarking testbed that measures the real latency/throughput
+cost of a live AI fraud-inference call vs. a network-equivalent mock
+baseline. One `docker compose up` reproduces the load-test results used in
+the accompanying thesis.
 
-The workload used to generate load is a fraud classifier, but the paper
-isn't about fraud detection — it's about what a synchronous AI call costs a
-request path, and how that cost scales with input complexity. Fraud
-classification just gives a realistic, variable-input-size ML workload to
-measure that with.
+Integrates two previously separate services:
 
-Integrates two services:
+- **transaction-service** (Java / Spring Boot) — [`MuhammadHussain06/fraud-eval-harness`](https://github.com/MuhammadHussain06/fraud-eval-harness) — reactive REST API, validates and routes transactions, records latency telemetry.
+- **fraud-ml-service** (Python / FastAPI) — [`MianBao-07/fraud-detection-microservice`](https://github.com/MianBao-07/fraud-detection-microservice) — wraps a trained XGBoost fraud classifier.
 
-- **transaction-service** (Java / Spring Boot, WebFlux + R2DBC) — validates
-  and routes requests, records latency telemetry.
-  Originally [`MuhammadHussain06/fraud-eval-harness`](https://github.com/MuhammadHussain06/fraud-eval-harness).
-- **fraud-ml-service** (Python / FastAPI) — wraps a trained XGBoost fraud
-  classifier used as the inference workload.
-  Originally [`MianBao-07/fraud-detection-microservice`](https://github.com/MianBao-07/fraud-detection-microservice).
-
-This repo containerizes both, adds a mock baseline endpoint to isolate AI
-overhead, pins CPUs per service, disables DB persistence by default to keep
-extra I/O out of the measurement, and ships k6 load testing plus result
+This repo containerizes both, adds a mock baseline endpoint for isolating
+AI overhead, pins CPUs per service, and ships k6 load testing + result
 analysis.
 
-## How it works
+---
 
-Every request routes through one of two strategies, selected per-request:
+## Idea
+
+Every transaction routes through one of two strategies:
 
 - `DISTRIBUTED_AI_SYNCHRONOUS` — scored by a real XGBoost model at a chosen
-  feature-count tier: `V5`, `V10`, `V20`, or `V28`.
+  feature-count tier (see below).
 - `DISTRIBUTED_MOCK_GATEWAY` — scored by a random-value mock with the
   identical request/response shape and network path.
 
-Both paths share the same JVM, network hop, DTOs, and DB write, so the
-difference between them isolates model-inference cost from fixed costs
-(HTTP, serialization, scheduling). The AI strategy is further split across
-four input-size tiers so inference cost can be measured as a function of
-feature-vector size, not just as one fixed number.
+Since both paths share the same JVM, network hop, DTOs, and DB write, the
+*difference* between them isolates model-inference cost from fixed costs
+(HTTP, serialization, scheduling). Within the AI strategy, the model itself
+is swappable across four input-size tiers — `V5`, `V10`, `V20`, `V28` — so
+inference cost can also be measured as a function of feature-vector size,
+not just as a single fixed number.
 
-Clients always send the full `V1..V28` vector regardless of tier — each
-`/predict/v{n}` endpoint on the Python side slices the first `n` values it
-needs, so one payload shape works against any tier.
+## Architecture
 
-Request flow: k6 → `transaction-service` (`POST /api/v1/transactions`) →
-`fraud-ml-service` (`POST /predict/v{5,10,20,28}` or `POST /predict/mock`).
-Each service runs in its own container, pinned to a disjoint CPU range.
+```
+k6 load generator
+        │
+        ▼
+transaction-service (Java, Spring Boot 3 / WebFlux, Netty, H2 via R2DBC)
+        │
+        │  WebClient (non-blocking)
+        │    POST /predict/v{5,10,20,28}  → real inference, tier-selected
+        │    POST /predict/mock           → baseline
+        ▼
+fraud-ml-service (Python, FastAPI / Uvicorn, XGBoost registry)
+```
+
+Each service runs in its own container, pinned to a disjoint CPU range, so
+they never contend for the same cores during a run.
+
+## Features
+
+- Dual-strategy routing, switchable per-request via `strategy` field.
+- Four feature-count tiers for the AI strategy (`5`/`10`/`20`/`28`), selected
+  per-request via `featureTier` and routed to `/predict/v{tier}` — each tier
+  is its own XGBoost model, loaded once at startup and held in memory
+  alongside the others.
+- Stage-by-stage latency: parsing, network, DB-write, serialization (Java)
+  + parsing, computation (split into DataFrame construction and model
+  inference), serialization (Python), nested in one response.
+- Reactive Java stack end-to-end (WebFlux + R2DBC).
+- CPU-pinned, resource-limited containers.
+- `run-suite.sh`: orchestrates a full baseline + concurrency-scan suite
+  across clean-slate stack restarts, with per-rep target/concurrency
+  shuffling and a captured host/toolchain provenance fingerprint.
+- `warm-up.js`: JIT/connection-pool warm-up, run once per stack restart
+  before measurement begins.
+- `analyze-results.py`: percentile tables (P50/P95/P99) + latency histogram,
+  split by strategy.
+- In-memory H2 — every run starts from a clean slate.
 
 ## Dataset
 
 [Kaggle Credit Card Fraud dataset](https://www.kaggle.com/mlg-ulb/creditcardfraud)
 (anonymized European transactions, Sept 2013).
 
-- Each tier uses the first `n` of the 28 `V` PCA components (`V1..Vn`) plus
-  `Amount`, in original column order — `V10` is a strict superset of `V5`,
-  and so on.
+- Each tier uses the first `n` of the 28 `V` PCA components (`V1..Vn`) +
+  `Amount`, where `n` is `5`, `10`, `20`, or `28` — columns stay in original
+  order across tiers, so `V10` is a strict superset of `V5`, and so on.
 - `Amount` is `log1p`-transformed at train and inference time.
 - Highly imbalanced (~0.17% fraud) — trained with SMOTE oversampling on the
   training split, then `XGBClassifier`, independently per tier.
-- `creditcard.csv` isn't bundled (Kaggle license). Place it at
-  `services/fraud-ml-service/training/data/creditcard.csv` to train for real,
-  or pass `--synthetic` for a structural smoke test only.
+- `creditcard.csv` isn't bundled (Kaggle license) — place it at
+  `services/fraud-ml-service/training/data/creditcard.csv` to train, or use
+  `--synthetic` for a structural smoke test only.
 
-```bash
-# from services/fraud-ml-service/training/
-python train_model.py --n-features 10   # single tier
-python train_model.py                   # all four tiers (5, 10, 20, 28)
-```
+`training/train_model.py --n-features {5,10,20,28}` trains a single tier;
+omitting the flag trains all four in one pass, writing
+`models/fraud_model_v{n}.joblib` for each. The Python service loads
+whichever tiers are listed in `FEATURE_TIERS` (default `5,10,20,28`) at
+startup — a run will fail to come up if a listed tier's `.joblib` file is
+missing, so train before compose-ing up.
 
-Writes `models/fraud_model_v{n}.joblib` for each tier trained. The Python
-service loads whichever tiers are listed in `FEATURE_TIERS` (default
-`5,10,20,28`) at startup and fails to come up if a listed tier's `.joblib`
-file is missing — train before `compose up`.
+## Client Payload Shape
 
-## Running
+Clients send the full `V1..V28` vector regardless of which tier they're
+targeting — each `/predict/v{n}` endpoint slices the first `n` values it
+needs, so the same request body works against any tier without the client
+needing to know each model's exact input size.
 
-```bash
-docker compose build
-docker compose up --wait                             # waits on python-service health check
-k6 run load-testing/warm-up.js                        # JIT / connection-pool warm-up
-k6 run --out json=results/results.json your-test.js   # single ad hoc load test
-python3 analysis/analyze-results.py                   # percentile tables + histograms
-```
-
-For the full reproducible suite used in the thesis (clean stack restart per
-repetition, shuffled target/concurrency order, baseline + concurrency-scan
-phases):
-
-```bash
-cd load-testing
-./run-suite.sh
-```
-
-Writes one JSON file per (target, concurrency, rep) cell to `../results/`,
-plus `run_order_log.txt`. Then run `analyze-results.py` against that
-directory (`--results-dir` / `--output-dir` are overridable, both default to
-`results/` and `analysis/output/`).
-
-`run-suite.sh` requires `APP_DB_SAVE_ENABLED=false` in `docker-compose.yml`
-(already set) — DB persistence is off by design so DB write I/O doesn't
-confound the mock-vs-model and tier-scaling comparisons.
-
-### Requirements
-
-- **6+ logical cores** — `cpuset` is hardcoded to `0-2` / `3-5` in
-  `docker-compose.yml`; adjust or remove it on smaller machines. Results
-  aren't comparable across different core counts/SMT settings without
-  matching `cpuset`.
-- **~6GB free RAM** for both services' resource limits plus Docker/k6
-  overhead.
-- **Docker Compose v2** (`docker compose`) — verify `deploy.resources`
-  limits actually apply with `docker inspect` before trusting a run.
-- No GPU needed.
-
-## Example request
+## Example Request
 
 ```
 POST /api/v1/transactions
@@ -133,31 +119,24 @@ Content-Type: application/json
 }
 ```
 
-- `strategy` — `DISTRIBUTED_AI_SYNCHRONOUS` or `DISTRIBUTED_MOCK_GATEWAY`.
-- `featureTier` — one of `5`/`10`/`20`/`28`; required for
-  `DISTRIBUTED_AI_SYNCHRONOUS`, ignored for `DISTRIBUTED_MOCK_GATEWAY`.
-  `features` must contain at least `featureTier` values.
-- `transactionId` must be a UUID, `accountId` must match `ACC-\d{4,10}` —
-  both validated before reaching the AI layer; invalid requests return `400`
-  with per-field errors.
+`featureTier` selects which model (`V5`/`V10`/`V20`/`V28`) scores the
+request and is required when `strategy` is `DISTRIBUTED_AI_SYNCHRONOUS`
+(ignored for `DISTRIBUTED_MOCK_GATEWAY`); `features` must contain at least
+`featureTier` values.
 
-### Example response
+Response:
 
 ```json
 {
   "transactionId": "062e5e0e-398d-4e59-a29b-63175c8e345e",
-  "accountId": "ACC-12345",
-  "amount": 12500.50,
-  "transactionType": "WIRE_TRANSFER",
   "riskScore": 0.9123,
   "transactionStatus": "FLAGGED",
   "strategy": "DISTRIBUTED_AI_SYNCHRONOUS",
   "featureTier": 10,
   "executionTimeMs": 14.7,
   "requestParsingTimeMs": 0.03,
-  "aiCallRoundTripTimeMs": 8.9,
-  "estimatedNetworkOverheadMs": 6.59,
-  "dbWriteTimeMs": 0.0,
+  "networkCommunicationTimeMs": 8.9,
+  "dbWriteTimeMs": 2.1,
   "responseSerializationTimeMs": 0.4,
   "pythonTelemetry": {
     "parsingRequestTimeMs": 0.21,
@@ -170,75 +149,114 @@ Content-Type: application/json
 }
 ```
 
-- `executionTimeMs` — total time inside `transaction-service`, start to finish.
-- `aiCallRoundTripTimeMs` — full WebClient round trip to `fraud-ml-service`.
-- `estimatedNetworkOverheadMs` — `aiCallRoundTripTimeMs` minus
-  `pythonTelemetry.totalPythonExecutionTimeMs`; the portion of the round
-  trip not accounted for by Python-side execution.
-- `dbWriteTimeMs` — `0.0` when `APP_DB_SAVE_ENABLED=false`.
-- `pythonTelemetry.computationTimeMs` is the sum of
-  `dataframeConstructionTimeMs` (building the single-row pandas `DataFrame`
-  the model expects) and `modelInferenceTimeMs` (the `predict_proba` call
-  itself), split out to separate pandas overhead from tree-traversal cost.
-  For `DISTRIBUTED_MOCK_GATEWAY` responses, both sub-fields are `0.0`.
+`computationTimeMs` is the sum of `dataframeConstructionTimeMs` (building the
+single-row pandas `DataFrame` the model expects) and `modelInferenceTimeMs`
+(the `model.predict_proba` call itself) — split out to separate pandas
+overhead from actual tree-traversal cost. For `DISTRIBUTED_MOCK_GATEWAY`
+responses both sub-fields are `0.0`, since the mock does neither.
 
+`transactionId` must be a UUID, `accountId` must match `ACC-\d{4,10}` —
+both validated before reaching the AI layer; invalid requests return `400`
+with per-field errors.
+
+## Containerization & Hardware
+
+**python-service:** `python:3.11-slim` · port `8000` · cores `0-2` · 3.0 CPU / 3G RAM limit (1.0 / 1G reserved)
+
+**transaction-service:** `eclipse-temurin:21-jdk-alpine` build → `21-jre-alpine` run · port `8080` · cores `3-5` · 3.0 CPU / 3G RAM limit (1.0 / 1G reserved)
+
+Requirements:
+- **6+ logical cores** — `cpuset` is hardcoded to `0-2`/`3-5`; adjust or
+  remove it on smaller machines.
+- **~6GB free RAM** for both services' limits plus Docker/k6 overhead.
+- **Docker Compose v2** (`docker compose`) — verify `deploy.resources`
+  limits actually apply with `docker inspect` before trusting a run.
+- No GPU needed.
+
+## Running
+
+Full suite (recommended — restarts the stack per rep, shuffles order, logs
+provenance):
+
+```bash
+docker compose build
+cd load-testing
+./run-suite.sh                                      # baseline + concurrency scan, all reps
+python3 ../analysis/analyze-results.py               # percentile tables + histogram
+```
+
+`run-suite.sh` runs `warm-up.js` once at the start of every stack restart,
+then drives `run-target.js` per target/concurrency cell, writing one JSON
+file per cell to `results/`, plus `run_order_log.txt` (shuffle order per
+rep) and `run_metadata.json` (timestamp, Docker/Compose versions, git
+commit + dirty flag, CPU/RAM — so results stay traceable to the environment
+that produced them). Requires `APP_DB_SAVE_ENABLED=false` in
+`docker-compose.yml`.
+
+Manual / one-off run:
+
+```bash
+docker compose up                                   # waits for python health check
+k6 run load-testing/warm-up.js                       # JIT warm-up
+k6 run --out json=results/results.json your-test.js  # real load test
+python analysis/analyze-results.py                   # percentile tables + histogram
+```
+
+`warm-up.js` warms each target (mock + all four AI tiers) sequentially,
+each in its own dedicated time window, so every code path gets its full
+request budget before measurement starts. Tunable via
+`WARMUP_ITERATIONS_PER_TARGET`, `WARMUP_VUS`, `WARMUP_MAX_DURATION_S` env
+vars. Telemetry metrics are recorded separately, in `run-target.js` (via
+the shared `sendTransaction` helper in `lib/common.js`) during the actual
+measured runs.
+
+## Limitations
+
+- **Single-node only** — no multi-region/network-hop simulation.
+- **Reduced feature space even at the largest tier** (`V1`–`V28` + `Amount`
+  is the full PCA set the dataset provides, but the dataset itself is a
+  reduced anonymized representation) — benchmarks latency, not
+  production-grade fraud detection accuracy.
+- **In-memory H2** — wiped on restart; export `results/` before tearing down.
+- **`run_metadata.json`** records the CPU/RAM/Docker/git fingerprint of the
+  *last* suite run only — it's overwritten each time `run-suite.sh` runs,
+  so archive it alongside that run's `results/` before starting another.
+- **Mock endpoint** is a latency baseline only, never a real fraud check.
+- **`--synthetic` training data** is a smoke test, not a benchmark source.
+- **Resource limits** depend on Compose version — verify before trusting results.
+- **6-core CPU pinning** is host-specific; results aren't comparable across
+  different core counts/SMT settings without adjusting `cpuset`.
+  
 ## Structure
 
 ```
 .
 ├── docker-compose.yml
-├── analysis/
-│   ├── analyze-results.py     # percentile tables, histograms, Mann-Whitney U tests
-│   └── requirements.txt
+├── analysis/analyze-results.py
 ├── load-testing/
-│   ├── run-suite.sh           # full baseline + concurrency-scan reproduction suite
-│   ├── run-target.js          # single (target, concurrency, rep) cell
-│   ├── warm-up.js             # JIT / connection-pool warm-up
-│   └── lib/common.js          # shared k6 request/metric helpers
-├── results/                   # k6 JSON output (created at run time)
+│   ├── run-suite.sh              # full baseline + concurrency-scan orchestrator
+│   ├── warm-up.js                # per-target sequential JIT/pool warm-up
+│   ├── run-target.js             # single (target, concurrency, rep) cell runner
+│   └── lib/common.js             # shared sendTransaction() + telemetry Trends
 └── services/
-    ├── fraud-ml-service/              # Python FastAPI inference service
+    ├── fraud-ml-service/            # Python FastAPI inference service
     │   ├── app/
-    │   │   ├── main.py                # entrypoint, TimingMiddleware, /health
-    │   │   ├── model.py                # FraudModelRegistry: one FraudMLTier per tier
-    │   │   ├── config.py               # FEATURE_TIERS, MODEL_DIR, FRAUD_THRESHOLD
+    │   │   ├── main.py              # entrypoint + TimingMiddleware
+    │   │   ├── model.py             # FraudModelRegistry: one FraudMLTier per tier
+    │   │   ├── config.py            # FEATURE_TIERS, MODEL_DIR
     │   │   ├── schemas.py
-    │   │   ├── responses.py            # shared response/telemetry builder
-    │   │   └── routers/                # predict.py (POST /predict/v{n}), mock.py
+    │   │   ├── responses.py         # shared response/telemetry builder
+    │   │   └── routers/predict.py (POST /predict/v{n}), mock.py
     │   ├── models/fraud_model_v{5,10,20,28}.joblib
-    │   └── training/train_model.py     # --n-features {5,10,20,28}, omit for all four
-    └── transaction-service/            # Java Spring Boot orchestrator
+    │   └── training/train_model.py  # --n-features {5,10,20,28}, omit for all four
+    └── transaction-service/         # Java Spring Boot orchestrator
         └── src/main/java/.../{controller,service,model,repository,dto,exception}/
 ```
 
-## Containerization
-
-| | image | port | cores | limit | reserved |
-|---|---|---|---|---|---|
-| **python-service** | `python:3.11-slim` | `8000` | `0-2` | 3.0 CPU / 3G RAM | 1.0 CPU / 1G RAM |
-| **transaction-service** | `eclipse-temurin:21-jdk-alpine` → `21-jre-alpine` | `8080` | `3-5` | 3.0 CPU / 3G RAM | 1.0 CPU / 1G RAM |
-
-`python-service` runs `UVICORN_WORKERS=3` (overridable via env) and gates
-readiness on `GET /health`; `transaction-service` waits on that health check
-via `depends_on`.
-
-## Limitations
-
-- **Single-node only** — no multi-region/network-hop simulation.
-- **Reduced feature space even at the largest tier** — `V1`–`V28` + `Amount`
-  is the full PCA set the dataset provides, but the dataset itself is a
-  reduced anonymized representation. This benchmarks latency, not
-  production-grade fraud detection accuracy.
-- **In-memory H2** — wiped on restart; export `results/` before tearing down.
-- **Mock endpoint** is a latency baseline only, never a real fraud check.
-- **`--synthetic` training data** is a smoke test, not a benchmark source.
-- **Resource limits** depend on Compose version — verify before trusting results.
-- **6-core CPU pinning** is host-specific; not comparable across different
-  core counts/SMT settings without adjusting `cpuset`.
+---
 
 ## Credits
 
 - Transaction orchestrator originally by [MuhammadHussain06](https://github.com/MuhammadHussain06/fraud-eval-harness).
 - Fraud inference microservice originally by [MianBao-07](https://github.com/MianBao-07/fraud-detection-microservice).
-- Containerization, mock routing, load testing, DB-persistence isolation, and
-  telemetry/concurrency fixes integrate and extend both for this harness.
+- Containerization, mock routing, load testing, and telemetry/concurrency fixes integrate and extend both.
