@@ -17,7 +17,7 @@ def predict_mock(payload: TransactionPayload, request: Request):
     parsing_time_ms = (time.perf_counter() - start_total) * 1000
 
     comp_start = time.perf_counter()
-    risk_score = round(random.uniform(0.0, 1.0), 4)
+    risk_score = random.uniform(0.0, 1.0)
     is_fraud = risk_score >= settings.FRAUD_THRESHOLD
     computation_time_ms = (time.perf_counter() - comp_start) * 1000.0
 

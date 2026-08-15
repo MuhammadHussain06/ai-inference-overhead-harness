@@ -75,6 +75,8 @@ public class TransactionService {
         }
 
 
+        final Integer resolvedFeatureTier = featureTier;
+
         double requestParsingTimeMs = (System.nanoTime() - requestStartNanos) / 1_000_000.0;
 
         log.info("[Transaction ID: {}] Sending HTTP POST to Python endpoint {}", request.getTransactionId(), endpoint);
@@ -106,9 +108,6 @@ public class TransactionService {
                     log.error("[Transaction ID: {}] Failed to communicate with Python endpoint {}: {}",
                             request.getTransactionId(), endpoint, e.getMessage());
 
-                    // Distinguish "Python rejected the input" (4xx from Python -- surfaced
-                    // as our own 400) from "the call to Python didn't complete normally"
-                    // (unreachable, timed out, or an unexpected 5xx -- surfaced as 502).
                     HttpStatus upstreamStatus = HttpStatus.BAD_GATEWAY;
                     if (e instanceof WebClientResponseException wcre) {
                         HttpStatusCode sc = wcre.getStatusCode();
@@ -136,7 +135,7 @@ public class TransactionService {
                         entity.setAccountId(request.getAccountId());
                         entity.setTransactionAmount(request.getAmount());
                         entity.setTransactionType(request.getTransactionType());
-                        entity.setFeatureTier(request.getFeatureTier());
+                        entity.setFeatureTier(resolvedFeatureTier);
                         if (request.getFeatures() != null) {
                             entity.setFeaturesCsv(request.getFeatures().stream()
                                     .map(String::valueOf)
@@ -151,20 +150,20 @@ public class TransactionService {
                                 .doOnSuccess(saved -> log.debug("[Transaction ID: {}] Saved to H2 database.", request.getTransactionId()))
                                 .map(savedEntity -> {
                                     double dbWriteTimeMs = (System.nanoTime() - dbStart) / 1_000_000.0;
-                                    return buildResponse(request, riskScore, status, strategy,
+                                    return buildResponse(request, riskScore, status, strategy, resolvedFeatureTier,
                                             overallStartTime, requestParsingTimeMs, aiCallRoundTripTimeMs,
                                             dbWriteTimeMs, pythonTelemetry);
                                 });
                     } else {
                         log.debug("[Transaction ID: {}] DB persistence bypassed via configuration flag.", request.getTransactionId());
-                        return Mono.fromCallable(() -> buildResponse(request, riskScore, status, strategy, overallStartTime,
-                                requestParsingTimeMs, aiCallRoundTripTimeMs, 0.0, pythonTelemetry));
+                        return Mono.fromCallable(() -> buildResponse(request, riskScore, status, strategy, resolvedFeatureTier,
+                                overallStartTime, requestParsingTimeMs, aiCallRoundTripTimeMs, 0.0, pythonTelemetry));
                     }
                 });
     }
 
     private ResponseDto buildResponse(RequestDto request, double riskScore, String status, String strategy,
-                                      long overallStartTime, double parseTime, double netTime,
+                                      Integer featureTier, long overallStartTime, double parseTime, double netTime,
                                       double dbTime, ResponseDto.PythonTelemetryDto pythonTelemetry) {
         long responseBuildStart = System.nanoTime();
         double executionTimeMs = (System.nanoTime() - overallStartTime) / 1_000_000.0;
@@ -182,7 +181,7 @@ public class TransactionService {
         response.setAccountId(request.getAccountId());
         response.setAmount(request.getAmount());
         response.setTransactionType(request.getTransactionType());
-        response.setFeatureTier(request.getFeatureTier());
+        response.setFeatureTier(featureTier);
         response.setRequestParsingTimeMs(parseTime);
         response.setAiCallRoundTripTimeMs(netTime);
 

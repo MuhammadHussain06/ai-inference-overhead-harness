@@ -24,6 +24,8 @@ mkdir -p "$RESULTS_DIR"
 ORDER_LOG="${RESULTS_DIR}/run_order_log.txt"
 : > "$ORDER_LOG"   # truncate/create fresh each suite run
 METADATA_FILE="${RESULTS_DIR}/run_metadata.json"
+FAILURES_LOG="${RESULTS_DIR}/run_failures_log.txt"
+: > "$FAILURES_LOG"   # truncate/create fresh each suite run
 
 TARGETS=(mock 5 10 20 28)
 CONCURRENCY_LEVELS=(1 2 4 8 16 32 64)
@@ -138,6 +140,14 @@ shuffled() {
   printf '%s\n' "$@" | shuf | tr '\n' ' '
 }
 
+run_cell() {
+  local label="$1"
+  shift
+  if ! "$@"; then
+    echo "[!] FAILED: ${label}" | tee -a "$FAILURES_LOG"
+  fi
+}
+
 capture_run_metadata
 
 echo "[*] E1: baseline decomposition x ${REPS_BASELINE} independent repetitions"
@@ -156,7 +166,8 @@ for rep in $(seq 1 "$REPS_BASELINE"); do
 
   for target in "${TARGETS_THIS_REP[@]}"; do
     echo "  -> target=${target} rep=${rep}"
-    TARGET="$target" VUS=1 ITERATIONS=$BASELINE_ITERATIONS PHASE=baseline REP="$rep" \
+    run_cell "baseline target=${target} rep=${rep}" \
+      env TARGET="$target" VUS=1 ITERATIONS=$BASELINE_ITERATIONS PHASE=baseline REP="$rep" \
       k6 run run-target.js \
       --out "json=${RESULTS_DIR}/baseline_${target}_rep${rep}.json"
     sleep "$COOLDOWN_S"
@@ -183,7 +194,8 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   for target in "${TARGETS_THIS_REP[@]}"; do
     for vus in "${CONCURRENCY_THIS_REP[@]}"; do
       echo "  -> target=${target} vus=${vus} rep=${rep}"
-      TARGET="$target" VUS="$vus" ITERATIONS_PER_VU=$SCAN_ITERATIONS_PER_VU PHASE=scan REP="$rep" \
+      run_cell "scan target=${target} vus=${vus} rep=${rep}" \
+        env TARGET="$target" VUS="$vus" ITERATIONS_PER_VU=$SCAN_ITERATIONS_PER_VU PHASE=scan REP="$rep" \
         k6 run run-target.js \
         --out "json=${RESULTS_DIR}/scan_${target}_vus${vus}_rep${rep}.json"
       sleep "$COOLDOWN_S"
@@ -194,4 +206,10 @@ done
 echo "[+] Suite complete. Raw results in ${RESULTS_DIR}/"
 echo "    Per-rep cell order logged to ${ORDER_LOG}"
 echo "    Host/toolchain fingerprint logged to ${METADATA_FILE}"
+if [ -s "$FAILURES_LOG" ]; then
+  echo "    [!] Some cells failed and were skipped -- see ${FAILURES_LOG}"
+  echo "        Re-run just those cells manually before treating results as complete."
+else
+  echo "    No cell failures logged."
+fi
 echo "    Run: python3 ../analysis/analyze-results.py"
