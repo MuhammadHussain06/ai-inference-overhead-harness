@@ -129,13 +129,17 @@ Response:
 ```json
 {
   "transactionId": "062e5e0e-398d-4e59-a29b-63175c8e345e",
+  "accountId": "ACC-12345",
+  "amount": 12500.50,
+  "transactionType": "WIRE_TRANSFER",
   "riskScore": 0.9123,
   "transactionStatus": "FLAGGED",
   "strategy": "DISTRIBUTED_AI_SYNCHRONOUS",
   "featureTier": 10,
   "executionTimeMs": 14.7,
   "requestParsingTimeMs": 0.03,
-  "networkCommunicationTimeMs": 8.9,
+  "aiCallRoundTripTimeMs": 8.9,
+  "estimatedNetworkOverheadMs": 6.59,
   "dbWriteTimeMs": 2.1,
   "responseSerializationTimeMs": 0.4,
   "pythonTelemetry": {
@@ -148,6 +152,13 @@ Response:
   }
 }
 ```
+
+`aiCallRoundTripTimeMs` is the full Java-side timing of the call to
+`fraud-ml-service`, start to finish. `estimatedNetworkOverheadMs` is that
+figure minus Python's own `totalPythonExecutionTimeMs` — i.e. everything
+outside Python's self-reported work: network transit, FastAPI/Uvicorn
+routing, and any queuing under load. `executionTimeMs` is the full
+transaction, start to finish, on the Java side.
 
 `computationTimeMs` is the sum of `dataframeConstructionTimeMs` (building the
 single-row pandas `DataFrame` the model expects) and `modelInferenceTimeMs`
@@ -193,6 +204,14 @@ commit + dirty flag, CPU/RAM — so results stay traceable to the environment
 that produced them). Requires `APP_DB_SAVE_ENABLED=false` in
 `docker-compose.yml`.
 
+A failed cell (dropped connection, transient error under load) is logged
+to `run_failures_log.txt` and skipped — it does not abort the rest of the
+suite. Stack-level setup failures (the containers not coming up, the
+readiness check timing out) still abort immediately, since every cell in
+that rep would otherwise be measuring a broken environment. Check
+`run_failures_log.txt` after a run and re-run any listed cells manually
+before treating the results as complete.
+
 Manual / one-off run:
 
 ```bash
@@ -218,9 +237,10 @@ measured runs.
   reduced anonymized representation) — benchmarks latency, not
   production-grade fraud detection accuracy.
 - **In-memory H2** — wiped on restart; export `results/` before tearing down.
-- **`run_metadata.json`** records the CPU/RAM/Docker/git fingerprint of the
-  *last* suite run only — it's overwritten each time `run-suite.sh` runs,
-  so archive it alongside that run's `results/` before starting another.
+- **`run_metadata.json`, `run_order_log.txt`, and `run_failures_log.txt`**
+  all reflect the *last* suite run only — each is truncated fresh at the
+  start of `run-suite.sh`, so archive them alongside that run's `results/`
+  before starting another.
 - **Mock endpoint** is a latency baseline only, never a real fraud check.
 - **`--synthetic` training data** is a smoke test, not a benchmark source.
 - **Resource limits** depend on Compose version — verify before trusting results.
