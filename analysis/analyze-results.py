@@ -1,11 +1,11 @@
 """
-Analyze k6 load-testing results from load-testing/run-suite.sh.
+Analyzes k6 load-test results from load-testing/run-suite.sh.
 
-Evaluates latency distributions, scaling performance, and reproducibility across
-baseline (E1) and concurrency scan (E2) experiments. Separates within-run request
-noise (bootstrapped CIs) from between-run session variance (CoV% across clean stack
-restarts), and performs non-parametric Mann-Whitney U tests between adjacent
-tier/concurrency steps.
+Computes latency distributions, scaling behavior, and run-to-run reproducibility
+for the baseline (E1) and concurrency scan (E2) experiments. Significance tests
+run on rep-level means (Holm-Bonferroni corrected, with rank-biserial effect
+size) to avoid pseudoreplication. Latency tables cover HTTP 200 requests only,
+each paired with an error-rate table.
 
 Usage:
     python3 analyze-results.py [--results-dir ../results] [--output-dir ./output]
@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.stats import mannwhitneyu
+from statsmodels.stats.multitest import multipletests
 
 DEFAULT_RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
@@ -83,6 +84,8 @@ def load_results(results_dir):
                     "vus": tags.get("vus"),
                     "phase": tags.get("phase"),
                     "rep": tags.get("rep"),
+                    # HTTP status code; "0" means no response was received
+                    "status": tags.get("status"),
                     "time": data.get("time"),
                     "source_file": os.path.basename(fp),
                 })
@@ -139,6 +142,40 @@ def summarize(values, label, n_boot=2000):
     }
 
 
+def error_summary(df, phase, group_cols, label_fn):
+    """
+    Per-cell breakdown of successful, HTTP-error, and timeout/network-error
+    requests, computed from http_req_duration points (one per attempted
+    request, regardless of outcome).
+    """
+    sub = df[(df["metric"] == "http_req_duration") & (df["phase"] == phase)].copy()
+    if sub.empty:
+        return pd.DataFrame()
+
+    sub["status"] = sub["status"].fillna("0")
+    is_timeout = sub["status"] == "0"
+    is_success = sub["status"] == "200"
+    is_http_error = (~is_timeout) & (~is_success)
+    sub["_is_timeout"] = is_timeout
+    sub["_is_success"] = is_success
+    sub["_is_http_error"] = is_http_error
+
+    rows = []
+    for key, g in sub.groupby(group_cols):
+        key_tuple = key if isinstance(key, tuple) else (key,)
+        total = len(g)
+        n_success = int(g["_is_success"].sum())
+        rows.append({
+            "Group": label_fn(key_tuple),
+            "Total Requests": total,
+            "Successful (200)": n_success,
+            "HTTP Errors (non-200 response)": int(g["_is_http_error"].sum()),
+            "Timeouts / Network Errors (no response)": int(g["_is_timeout"].sum()),
+            "Error Rate (%)": round(100 * (1 - n_success / total), 2) if total else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
 def _throughput_reqs_per_s(subset_df):
 
     times = subset_df["time"].dropna()
@@ -152,51 +189,109 @@ def _throughput_reqs_per_s(subset_df):
 
 # Stats — significance
 
-def pairwise_mannwhitney(df, metric, phase, group_col, order, label_fn, fixed_filters=None):
+def rank_biserial_effect_size(U, n1, n2):
     """
-  Mann-Whitney U test between adjacent pairs in `order` using pooled request values.
+    Rank-biserial correlation from a Mann-Whitney U statistic (equivalent to
+    Cliff's delta). Ranges [-1, 1]; 0 = no separation between groups.
+    """
+    return 1 - (2 * U) / (n1 * n2)
 
-  Evaluates if step-wise tier/concurrency increases significantly impact latency.
-  Uses non-parametric Mann-Whitney U due to right-skewed latency distributions.
-  Pools requests across repetitions for statistical power (noting within-rep correlation
-  as a known limitation, complemented by between-run CoV% analysis).
 
-  fixed_filters: Dict of column constraints (e.g., {"vus": 64}) applied during comparison.
-  """
+def _effect_magnitude(delta):
+    d = abs(delta)
+    if d < 0.147:
+        return "negligible"
+    elif d < 0.33:
+        return "small"
+    elif d < 0.474:
+        return "medium"
+    else:
+        return "large"
+
+
+def _fmt_p(p):
+    if p is None or (isinstance(p, float) and np.isnan(p)):
+        return np.nan
+    return f"{p:.2e}" if p < 0.001 else round(float(p), 4)
+
+
+def pairwise_mannwhitney(df, metric, phase, group_col, order, label_fn, fixed_filters=None, rep_col="rep"):
+    """
+    Mann-Whitney U test between adjacent pairs in `order`, computed on
+    rep-level means to avoid pseudoreplication from correlated within-run
+    requests. Applies Holm-Bonferroni correction across the comparison
+    family and reports rank-biserial effect size alongside each p-value.
+    Also reports a pooled-request p-value, for reference only.
+
+    fixed_filters: column constraints (e.g., {"vus": 64}) applied before
+        comparison.
+    """
     sub = df[(df["metric"] == metric) & (df["phase"] == phase) & df["value"].notna()]
     if fixed_filters:
         for col, val in fixed_filters.items():
             sub = sub[sub[col] == val]
 
-    rows = []
+    raw_rows = []
     for a, b in zip(order, order[1:]):
-        vals_a = sub[sub[group_col] == a]["value"].to_numpy()
-        vals_b = sub[sub[group_col] == b]["value"].to_numpy()
-        if len(vals_a) < 2 or len(vals_b) < 2:
+        pooled_a = sub[sub[group_col] == a]["value"].to_numpy()
+        pooled_b = sub[sub[group_col] == b]["value"].to_numpy()
+
+        rep_means_a = sub[sub[group_col] == a].groupby(rep_col)["value"].mean().to_numpy()
+        rep_means_b = sub[sub[group_col] == b].groupby(rep_col)["value"].mean().to_numpy()
+
+        # Requires >=2 reps per side for a valid rep-level test
+        if len(rep_means_a) < 2 or len(rep_means_b) < 2:
             continue
-        stat, p = mannwhitneyu(vals_a, vals_b, alternative="two-sided")
-        rows.append({
+
+        stat, p_rep = mannwhitneyu(rep_means_a, rep_means_b, alternative="two-sided")
+        effect = rank_biserial_effect_size(stat, len(rep_means_a), len(rep_means_b))
+
+        p_pooled = np.nan
+        if len(pooled_a) >= 2 and len(pooled_b) >= 2:
+            _, p_pooled = mannwhitneyu(pooled_a, pooled_b, alternative="two-sided")
+
+        raw_rows.append({
             "Comparison": f"{label_fn(a)} vs {label_fn(b)}",
-            "N (A)": len(vals_a),
-            "N (B)": len(vals_b),
-            "Median A (ms)": round(float(np.median(vals_a)), 3),
-            "Median B (ms)": round(float(np.median(vals_b)), 3),
+            "N reps (A)": len(rep_means_a),
+            "N reps (B)": len(rep_means_b),
+            "Median of rep-means A (ms)": round(float(np.median(rep_means_a)), 3),
+            "Median of rep-means B (ms)": round(float(np.median(rep_means_b)), 3),
             "U statistic": round(float(stat), 1),
-            "p-value": f"{p:.2e}" if p < 0.001 else round(float(p), 4),
-            "Significant (p<0.05)": "Yes" if p < 0.05 else "No",
+            "_p_rep_raw": p_rep,
+            "Effect size (rank-biserial r)": round(float(effect), 3),
+            "Effect magnitude": _effect_magnitude(effect),
+            "Pooled N (A)": len(pooled_a),
+            "Pooled N (B)": len(pooled_b),
+            "p-value (pooled, diagnostic only)": _fmt_p(p_pooled),
         })
-    return pd.DataFrame(rows)
+
+    if not raw_rows:
+        return pd.DataFrame()
+
+    pvals = [r["_p_rep_raw"] for r in raw_rows]
+    reject, pvals_holm, _, _ = multipletests(pvals, alpha=0.05, method="holm")
+
+    for r, p_holm, sig in zip(raw_rows, pvals_holm, reject):
+        r["p-value (rep-level, uncorrected)"] = _fmt_p(r.pop("_p_rep_raw"))
+        r["p-value (Holm-corrected)"] = _fmt_p(p_holm)
+        r["Significant (Holm, alpha=0.05)"] = "Yes" if sig else "No"
+
+    # Primary (corrected, rep-level) result first; pooled diagnostic last
+    cols = ["Comparison", "N reps (A)", "N reps (B)",
+            "Median of rep-means A (ms)", "Median of rep-means B (ms)",
+            "U statistic", "p-value (rep-level, uncorrected)",
+            "p-value (Holm-corrected)", "Significant (Holm, alpha=0.05)",
+            "Effect size (rank-biserial r)", "Effect magnitude",
+            "Pooled N (A)", "Pooled N (B)", "p-value (pooled, diagnostic only)"]
+    return pd.DataFrame(raw_rows)[cols]
 
 
 # Stats — between-run
 
 def between_run_consistency(df, metric, phase, group_cols, label_fn):
     """
-    Compute between-run metrics (Mean, SD, CoV%) across independent repetitions.
-
-    Aggregates per-repetition means to measure true session-to-session reproducibility,
-    avoiding pooled statistics that mask run-level shifts. Uses direct summary statistics
-    (Mean, SD, CoV%) to accommodate small repetition sample sizes (3–5 reps).
+    Computes between-run Mean, SD, and CoV% across independent repetitions,
+    using per-repetition means rather than pooled requests.
     """
 
     sub = df[(df["metric"] == metric) & (df["phase"] == phase) & df["value"].notna()].copy()
@@ -286,19 +381,29 @@ def analyze_baseline(df, output_dir):
     n_reps = base["rep"].nunique()
     print(f"[*] E1 baseline: {n_reps} independent repetition(s) detected.")
 
-    e2e = base[(base["metric"] == "http_req_duration") & base["value"].notna()]
+    # Latency computed on successful (200) requests only; see Table 1c for error rates
+    e2e = base[(base["metric"] == "http_req_duration") & base["value"].notna() & (base["status"] == "200")]
 
-    # Table 1: pooled within-run end-to-end latency per target (all reps combined)
+    # Table 1: pooled within-run end-to-end latency per target (all reps combined, successful requests only)
     rows = [summarize(e2e[e2e["tier"] == t]["value"], _tier_label(t)) for t in order]
     table1 = pd.DataFrame([r for r in rows if r])
     save_table(table1, "table1_baseline_e2e_latency_pooled", output_dir,
-               caption="End-to-end request latency by strategy/tier at VUS=1, pooled across all repetitions "
-                       "(within-run bootstrap CIs; see Table 1b for between-run reproducibility).",
+               caption="End-to-end request latency by strategy/tier at VUS=1, pooled across all repetitions, "
+                       "computed over successful (HTTP 200) requests only (within-run bootstrap CIs; see Table 1b "
+                       "for between-run reproducibility and Table 1c for the error rate this excludes).",
                label="tab:baseline-e2e-pooled")
+
+    # Table 1c: error/timeout breakdown per target
+    table1c = error_summary(base, "baseline", ["tier"], lambda k: _tier_label(k[0]))
+    save_table(table1c, "table1c_baseline_error_rates", output_dir,
+               caption="Request outcome breakdown by target at VUS=1, pooled across all repetitions. "
+                       "HTTP errors received a non-200 response; timeouts/network errors received no response "
+                       "at all. Table 1's latency statistics are computed on the 'Successful (200)' subset only.",
+               label="tab:baseline-error-rates")
 
     # Table 1b: between-run (clean-slate) reproducibility of end-to-end latency
     table1b = between_run_consistency(base, "http_req_duration", "baseline", ["tier"],
-                                       lambda k: _tier_label(k[0]))
+                                      lambda k: _tier_label(k[0]))
     save_table(table1b, "table1b_baseline_between_run_consistency", output_dir,
                caption="Between-run consistency of mean end-to-end latency across independent, "
                        "clean-slate repetitions of the baseline phase.",
@@ -341,13 +446,14 @@ def analyze_baseline(df, output_dir):
                        "(pooled across all repetitions).",
                label="tab:df-share")
 
-    # Table 5: pairwise significance between adjacent tiers (mock vs v5,
-    # v5 vs v10, v10 vs v20, v20 vs v28) -- answers "is the next tier
-    # actually slower, or could that gap be noise" for each step.
+    # Table 5: significance between adjacent tiers (mock vs v5, v5 vs v10, ...)
     table5 = pairwise_mannwhitney(base, "http_req_duration", "baseline", "tier", order, _tier_label)
     save_table(table5, "table5_baseline_adjacent_tier_significance", output_dir,
                caption="Mann-Whitney U test between adjacent feature-count tiers, end-to-end latency "
-                       "at VUS=1, pooled across all repetitions.",
+                       "at VUS=1. Tested on rep-level means (one independent observation per repetition) "
+                       "to avoid pseudoreplication from correlated within-run requests; Holm-Bonferroni "
+                       "corrected across the tier-comparison family. Rank-biserial effect size reported "
+                       "alongside significance. Pooled-request p-value included for reference only.",
                label="tab:baseline-mannwhitney")
 
     # Figure 1: stacked bar of Python-side decomposition, AI tiers only
@@ -393,9 +499,7 @@ def analyze_baseline(df, output_dir):
     ax.grid(True, linestyle="--", alpha=0.4)
     save_figure(fig, "figure2_baseline_latency_distribution", output_dir)
 
-    # Figure 6: Between-run reproducibility (mean latency ± SD across independent reps).
-    # Demonstrates session-to-session variance across clean-slate restarts.
-
+    # Figure 6: mean latency ± SD across independent reps
     per_rep = e2e.groupby(["tier", "rep"])["value"].mean().reset_index()
     means, stds, labels = [], [], []
     for t in order:
@@ -411,7 +515,7 @@ def analyze_baseline(df, output_dir):
         ax.set_xlabel("Target")
         ax.set_ylabel("Mean End-to-End Latency (ms)")
         ax.set_title(f"Between-Run Reproducibility, N={n_reps} Independent Runs "
-                      f"(error bars = SD across runs)", fontweight="bold")
+                     f"(error bars = SD across runs)", fontweight="bold")
         ax.grid(True, axis="y", linestyle="--", alpha=0.4)
         save_figure(fig, "figure6_between_run_reproducibility_baseline", output_dir)
 
@@ -434,9 +538,21 @@ def analyze_scan(df, output_dir):
     n_reps = scan["rep"].nunique()
     print(f"[*] E2 scan: {n_reps} independent repetition(s) detected.")
 
-    e2e = scan[(scan["metric"] == "http_req_duration") & scan["value"].notna()]
-    failed = scan[scan["metric"] == "http_req_failed"]
+    # Latency computed on successful (200) requests only; see Table 4c for error rates
+    e2e = scan[(scan["metric"] == "http_req_duration") & scan["value"].notna() & (scan["status"] == "200")]
 
+    # Table 4c: error/timeout breakdown per (tier, concurrency) cell;
+    # reused for the "Error Rate (%)" column in Table 4 below.
+    table4c = error_summary(scan, "scan", ["tier", "vus"],
+                            lambda k: f"{_tier_label(k[0])} @ VUS={int(k[1])}")
+    save_table(table4c, "table4c_scan_error_rates", output_dir,
+               caption="Request outcome breakdown by tier and concurrency level, pooled across all "
+                       "repetitions. HTTP errors received a non-200 response; timeouts/network errors "
+                       "received no response at all. Table 4's latency statistics are computed on the "
+                       "'Successful (200)' subset only -- no run was truncated or excluded based on "
+                       "error thresholds.",
+               label="tab:scan-error-rates")
+    error_rate_lookup = dict(zip(table4c.get("Group", []), table4c.get("Error Rate (%)", [])))
 
     rows = []
     for t in order:
@@ -447,8 +563,8 @@ def analyze_scan(df, output_dir):
             s = summarize(cell["value"], f"{_tier_label(t)} @ VUS={vus}")
             if not s:
                 continue
-            fail_cell = failed[(failed["tier"] == t) & (failed["vus"] == vus)]["value"]
-            error_rate = round(100 * float(fail_cell.mean()), 2) if not fail_cell.empty else 0.0
+            group_label = f"{_tier_label(t)} @ VUS={vus}"
+            error_rate = error_rate_lookup.get(group_label, 0.0)
             throughput = _throughput_reqs_per_s(cell)
             rows.append({
                 "Tier": _tier_label(t),
@@ -459,20 +575,20 @@ def analyze_scan(df, output_dir):
             })
     table4 = pd.DataFrame(rows)
     save_table(table4, "table4_concurrency_scan_summary_pooled", output_dir,
-               caption="Latency, throughput, and error rate across the concurrency sweep, by tier, "
-                       "pooled across all repetitions (see Table 4b for between-run reproducibility).",
+               caption="Latency (successful requests only), throughput, and error rate across the "
+                       "concurrency sweep, by tier, pooled across all repetitions (see Table 4b for "
+                       "between-run reproducibility and Table 4c for the full error/timeout breakdown).",
                label="tab:scan-summary-pooled")
 
     # Table 4b: between-run consistency per (tier, concurrency) cell
     table4b = between_run_consistency(scan, "http_req_duration", "scan", ["tier", "vus"],
-                                       lambda k: f"{_tier_label(k[0])} @ VUS={int(k[1])}")
+                                      lambda k: f"{_tier_label(k[0])} @ VUS={int(k[1])}")
     save_table(table4b, "table4b_scan_between_run_consistency", output_dir,
                caption="Between-run consistency of mean end-to-end latency across independent, "
                        "clean-slate repetitions of the concurrency scan.",
                label="tab:scan-between-run")
 
-    # Table 6: Pairwise significance between adjacent concurrency levels per tier.
-    # Evaluates whether each incremental concurrency increase significantly degrades latency.
+    # Table 6: significance between adjacent concurrency levels, per tier
     table6_parts = []
     for t in order:
         part = pairwise_mannwhitney(
@@ -485,11 +601,12 @@ def analyze_scan(df, output_dir):
     table6 = pd.concat(table6_parts, ignore_index=True) if table6_parts else pd.DataFrame()
     save_table(table6, "table6_scan_adjacent_concurrency_significance", output_dir,
                caption="Mann-Whitney U test between adjacent concurrency levels, end-to-end latency, "
-                       "per tier, pooled across all repetitions.",
+                       "per tier. Tested on rep-level means to avoid pseudoreplication; Holm-Bonferroni "
+                       "corrected within each tier's family of concurrency-level comparisons. "
+                       "Rank-biserial effect size reported alongside significance.",
                label="tab:scan-mannwhitney")
 
-    # Figure 3: P95 end-to-end latency vs. concurrency, with error bars
-    # from the SD of per-rep P95 across independent repetitions.
+    # Figure 3: P95 latency vs. concurrency; error bars = SD of per-rep P95
     fig, ax = plt.subplots(figsize=(7, 4.5), dpi=300)
     for i, t in enumerate(order):
         xs, ys, yerrs = [], [], []
@@ -505,7 +622,7 @@ def analyze_scan(df, output_dir):
             yerrs.append(per_rep_p95.std(ddof=1) if len(per_rep_p95) > 1 else 0.0)
         if xs:
             ax.errorbar(xs, ys, yerr=yerrs, marker="o", capsize=3, label=_tier_label(t),
-                         color=COLOR_CYCLE[i % len(COLOR_CYCLE)])
+                        color=COLOR_CYCLE[i % len(COLOR_CYCLE)])
     ax.set_xscale("log", base=2)
     ax.set_xlabel("Concurrency (VUs, log scale)")
     ax.set_ylabel("P95 End-to-End Latency (ms)")
@@ -538,8 +655,7 @@ def analyze_scan(df, output_dir):
     ax.grid(True, which="both", linestyle="--", alpha=0.4)
     save_figure(fig, "figure4_throughput_vs_concurrency", output_dir)
 
-    # Figure 5: how the compute decomposition itself shifts under load,
-    # for the heaviest tier (v28)
+    # Figure 5: compute decomposition under load, heaviest tier only
     heaviest = "28" if "28" in order else next((t for t in reversed(order) if t != "mock"), None)
     if heaviest:
         stages = [
@@ -570,9 +686,9 @@ def analyze_scan(df, output_dir):
 def main():
     parser = argparse.ArgumentParser(description="Analyze k6 results for the fraud-eval-harness testbed.")
     parser.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR,
-                         help="Directory containing k6 JSON-lines output files (default: ../results).")
+                        help="Directory containing k6 JSON-lines output files (default: ../results).")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR,
-                         help="Directory to write tables/ and figures/ into (default: ./output).")
+                        help="Directory to write tables/ and figures/ into (default: ./output).")
     args = parser.parse_args()
 
     print(f"[*] Loading results from {args.results_dir} ...")

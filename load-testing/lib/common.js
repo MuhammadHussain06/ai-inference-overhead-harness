@@ -1,5 +1,6 @@
 import http from 'k6/http';
-import { Trend } from 'k6/metrics';
+import { check } from 'k6';
+import { Trend, Rate, Counter } from 'k6/metrics';
 import { uuidv4 } from 'https://jslib.k6.io/k6-utils/1.4.0/index.js';
 
 export const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080/api/v1/transactions';
@@ -13,12 +14,22 @@ export const TARGETS = {
   '28': { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 28 },
 };
 
+// Overrides default k6 `http_req_failed` handling to mark non-200 responses as failures,
+// ensuring application-level errors (4xx/5xx) are accurately tracked alongside network drops.
+http.setResponseCallback(http.expectedStatuses(200));
+
 const parsingTime = new Trend('python_parsing_time_ms', true);
 const computationTime = new Trend('python_computation_time_ms', true);
 const dataframeConstructionTime = new Trend('python_dataframe_construction_time_ms', true);
 const modelInferenceTime = new Trend('python_model_inference_time_ms', true);
 const serializationTime = new Trend('python_serialization_time_ms', true);
 const totalPythonTime = new Trend('python_total_time_ms', true);
+
+// Distinguishes application-level HTTP errors (non-200 responses like 400s/500s) from network-level
+// timeouts (no response received, status 0) to report structural outages separately from application rejections.
+const requestSuccess = new Rate('request_success');
+const requestHttpError = new Counter('request_http_error');
+const requestTimeoutError = new Counter('request_timeout_error');
 
 // Sends a static V1..V28 payload; /predict/v{n} endpoints slice required features.
 export function randomFeatures(n) {
@@ -52,6 +63,11 @@ export function sendTransaction(target, extraTags) {
 
   const res = http.post(BASE_URL, JSON.stringify(body), params);
 
+  // Explicit check for k6's built-in `checks` metric to align default k6 pass/fail output
+// with the custom analysis script metrics, independent of Rate and Counter counters.
+  const ok = check(res, { 'status is 200': (r) => r.status === 200 }, tags);
+  requestSuccess.add(ok, tags);
+
   if (res.status === 200) {
     const responseBody = JSON.parse(res.body);
     const telemetry = responseBody.pythonTelemetry;
@@ -63,8 +79,17 @@ export function sendTransaction(target, extraTags) {
       serializationTime.add(telemetry.serializationResponseTimeMs, tags);
       totalPythonTime.add(telemetry.totalPythonExecutionTimeMs, tags);
     }
+  } else if (res.status === 0) {
+// Handles network-level drops (connection reset, DNS/TLS failure, or client timeout)
+    // where no response was received, using res.error and res.error_code for classification.
+    requestTimeoutError.add(1, tags);
+    console.error(`Timeout/network error [${target.strategy}/${tierLabel}]: ` +
+        `error_code=${res.error_code} error=${res.error}`);
   } else {
-    console.error(`Request failed [${target.strategy}/${tierLabel}]: ${res.status} ${res.body}`);
+// Tracks non-200 application responses (e.g., 400s/500s) as a distinct category,
+// separating explicit application rejections from network-level timeouts.
+    requestHttpError.add(1, tags);
+    console.error(`HTTP error [${target.strategy}/${tierLabel}]: ${res.status} ${res.body}`);
   }
 
   return res;

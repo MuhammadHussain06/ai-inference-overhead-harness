@@ -11,6 +11,11 @@ set -euo pipefail
 #   - PROVENANCE  : Host/toolchain fingerprint captured once per suite run to
 #                   run_metadata.json, so results are traceable to the exact
 #                   environment that produced them.
+#   - CPU PINNING : Verified (not assumed) once per rep via `docker inspect`
+#                   against the running containers' actual cgroup cpuset,
+#                   logged to cpu_pin_check_log.txt -- the compose file's
+#                   `cpuset` directive states what was requested, this states
+#                   what was actually applied.
 #
 # Suite Strategy:
 #   - Clean-slate stack restart per rep; sequential cell runs within reps.
@@ -26,6 +31,8 @@ ORDER_LOG="${RESULTS_DIR}/run_order_log.txt"
 METADATA_FILE="${RESULTS_DIR}/run_metadata.json"
 FAILURES_LOG="${RESULTS_DIR}/run_failures_log.txt"
 : > "$FAILURES_LOG"   # truncate/create fresh each suite run
+CPU_PIN_LOG="${RESULTS_DIR}/cpu_pin_check_log.txt"
+: > "$CPU_PIN_LOG"   # truncate/create fresh each suite run
 
 TARGETS=(mock 5 10 20 28)
 CONCURRENCY_LEVELS=(1 2 4 8 16 32 64)
@@ -109,6 +116,32 @@ EOF
   echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} git=${git_commit:0:12}"
 }
 
+# Verifies docker-compose.yml CPU pinning directly on running container cgroups rather
+# than assuming the cpuset directive was honored, logging per rep to catch quiet driver overrides.
+verify_cpu_pinning() {
+  local label="$1"
+  local py_container java_container py_cpuset java_cpuset
+  py_container=$(docker compose -f "$COMPOSE_FILE" ps -q python-service 2>/dev/null || echo "")
+  java_container=$(docker compose -f "$COMPOSE_FILE" ps -q transaction-service 2>/dev/null || echo "")
+
+  if [ -z "$py_container" ] || [ -z "$java_container" ]; then
+    echo "  [!] [cpu-pin] could not resolve container IDs -- skipping verification for ${label}." | tee -a "$FAILURES_LOG"
+    return
+  fi
+
+  py_cpuset=$(docker inspect --format '{{.HostConfig.CpusetCpus}}' "$py_container" 2>/dev/null || echo "")
+  java_cpuset=$(docker inspect --format '{{.HostConfig.CpusetCpus}}' "$java_container" 2>/dev/null || echo "")
+
+  echo "  [cpu-pin] ${label}: python-service=cpuset(${py_cpuset:-EMPTY}) transaction-service=cpuset(${java_cpuset:-EMPTY})"
+  echo "cpu_pin_check label=${label} python_cpuset=${py_cpuset:-EMPTY} java_cpuset=${java_cpuset:-EMPTY}" >> "$CPU_PIN_LOG"
+
+  if [ -z "$py_cpuset" ] || [ -z "$java_cpuset" ]; then
+    echo "  [!] [cpu-pin] one or both containers report an EMPTY cpuset for ${label} -- pinning may not be" \
+         "honored on this Docker/cgroup driver version; results from this rep should not be assumed" \
+         "core-isolated. See README CPU pinning caveat." | tee -a "$FAILURES_LOG"
+  fi
+}
+
 restart_stack() {
   echo "  [restart] tearing down stack for a clean slate..."
   docker compose -f "$COMPOSE_FILE" down
@@ -155,6 +188,7 @@ for rep in $(seq 1 "$REPS_BASELINE"); do
   echo "[*] --- Baseline repetition ${rep}/${REPS_BASELINE} ---"
   restart_stack
   wait_for_ready
+  verify_cpu_pinning "baseline rep=${rep}"
   echo "[*] Warming up JIT / connection pools..."
   k6 run warm-up.js
   sleep "$COOLDOWN_S"
@@ -179,6 +213,7 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   echo "[*] --- Scan repetition ${rep}/${REPS_SCAN} ---"
   restart_stack
   wait_for_ready
+  verify_cpu_pinning "scan rep=${rep}"
   echo "[*] Warming up JIT / connection pools..."
   k6 run warm-up.js
   sleep "$COOLDOWN_S"
@@ -206,6 +241,10 @@ done
 echo "[+] Suite complete. Raw results in ${RESULTS_DIR}/"
 echo "    Per-rep cell order logged to ${ORDER_LOG}"
 echo "    Host/toolchain fingerprint logged to ${METADATA_FILE}"
+echo "    CPU pinning verification (per-rep cgroup check) logged to ${CPU_PIN_LOG}"
+if grep -q "EMPTY" "$CPU_PIN_LOG" 2>/dev/null; then
+  echo "    [!] One or more reps showed an EMPTY cpuset -- see ${CPU_PIN_LOG} and ${FAILURES_LOG}"
+fi
 if [ -s "$FAILURES_LOG" ]; then
   echo "    [!] Some cells failed and were skipped -- see ${FAILURES_LOG}"
   echo "        Re-run just those cells manually before treating results as complete."
