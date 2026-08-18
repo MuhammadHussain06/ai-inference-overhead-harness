@@ -1,9 +1,11 @@
-# Fraud Evaluation Harness — Containerized Testbed
+# AI Inference Overhead Harness — Containerized Testbed
 
 Containerized benchmarking testbed that measures the real latency/throughput
 cost of a live AI fraud-inference call vs. a network-equivalent mock
-baseline. One `docker compose up` reproduces the load-test results used in
-the accompanying thesis.
+baseline. `docker compose up` brings the stack up; `run-suite.sh` +
+`analyze-results.py` reproduce the load-test results used in the
+accompanying thesis (see [Running](#running) for the full toolchain
+required).
 
 Integrates two previously separate services:
 
@@ -25,12 +27,14 @@ Every transaction routes through one of two strategies:
 - `DISTRIBUTED_MOCK_GATEWAY` — scored by a random-value mock with the
   identical request/response shape and network path.
 
-Since both paths share the same JVM, network hop, DTOs, and DB write, the
-*difference* between them isolates model-inference cost from fixed costs
-(HTTP, serialization, scheduling). Within the AI strategy, the model itself
-is swappable across four input-size tiers — `V5`, `V10`, `V20`, `V28` — so
-inference cost can also be measured as a function of feature-vector size,
-not just as a single fixed number.
+Both paths share the same JVM, network hop, and DTOs, so the *difference*
+between them isolates model-inference cost from those fixed costs (HTTP,
+serialization, scheduling). Note that DB persistence (`APP_DB_SAVE_ENABLED`)
+is disabled for benchmark runs (see [Running](#running)), so the DB write is
+*not* part of either path's measured cost — it's skipped on both. Within the
+AI strategy, the model itself is swappable across four input-size tiers —
+`V5`, `V10`, `V20`, `V28` — so inference cost can also be measured as a
+function of feature-vector size, not just as a single fixed number.
 
 ## Architecture
 
@@ -61,14 +65,23 @@ they never contend for the same cores during a run.
   + parsing, computation (split into DataFrame construction and model
   inference), serialization (Python), nested in one response.
 - Reactive Java stack end-to-end (WebFlux + R2DBC).
-- CPU-pinned, resource-limited containers.
+- CPU-pinned, resource-limited containers, with pinning verified (not just
+  assumed) against each container's live cgroup during a full suite run.
 - `run-suite.sh`: orchestrates a full baseline + concurrency-scan suite
   across clean-slate stack restarts, with per-rep target/concurrency
-  shuffling and a captured host/toolchain provenance fingerprint.
+  shuffling, per-rep CPU-pinning verification, and a captured
+  host/toolchain provenance fingerprint.
 - `warm-up.js`: JIT/connection-pool warm-up, run once per stack restart
   before measurement begins.
-- `analyze-results.py`: percentile tables (P50/P95/P99) + latency histogram,
-  split by strategy.
+- `analyze-results.py`: full statistical analysis of a suite run —
+  bootstrapped-CI latency tables (mean/median/P95/P99) split by strategy
+  and tier, matching error/timeout-rate tables, a Python-side latency
+  decomposition, between-run (session-to-session) reproducibility tables
+  with CoV%, and Holm-Bonferroni-corrected Mann-Whitney significance tests
+  (with rank-biserial effect size) between adjacent tiers and concurrency
+  levels — plus latency-distribution, P95-vs-concurrency, throughput, and
+  decomposition figures. Outputs CSV/Markdown/LaTeX tables and PNG/PDF
+  figures.
 - In-memory H2 — every run starts from a clean slate.
 
 ## Dataset
@@ -82,16 +95,20 @@ they never contend for the same cores during a run.
 - `Amount` is `log1p`-transformed at train and inference time.
 - Highly imbalanced (~0.17% fraud) — trained with SMOTE oversampling on the
   training split, then `XGBClassifier`, independently per tier.
-- `creditcard.csv` isn't bundled (Kaggle license) — place it at
-  `services/fraud-ml-service/training/data/creditcard.csv` to train, or use
+- **Pretrained models for all four tiers are already committed** under
+  `services/fraud-ml-service/models/` — `docker compose up` works out of
+  the box without training anything.
+- `creditcard.csv` isn't bundled (Kaggle license), so retraining/regenerating
+  the shipped models requires placing it at
+  `services/fraud-ml-service/training/data/creditcard.csv`, or using
   `--synthetic` for a structural smoke test only.
 
 `training/train_model.py --n-features {5,10,20,28}` trains a single tier;
 omitting the flag trains all four in one pass, writing
-`models/fraud_model_v{n}.joblib` for each. The Python service loads
-whichever tiers are listed in `FEATURE_TIERS` (default `5,10,20,28`) at
-startup — a run will fail to come up if a listed tier's `.joblib` file is
-missing, so train before compose-ing up.
+`models/fraud_model_v{n}.joblib` for each (overwriting the shipped ones).
+The Python service loads whichever tiers are listed in `FEATURE_TIERS`
+(default `5,10,20,28`) at startup — a run will fail to come up if a listed
+tier's `.joblib` file is missing.
 
 ## Client Payload Shape
 
@@ -158,7 +175,9 @@ Response:
 figure minus Python's own `totalPythonExecutionTimeMs` — i.e. everything
 outside Python's self-reported work: network transit, FastAPI/Uvicorn
 routing, and any queuing under load. `executionTimeMs` is the full
-transaction, start to finish, on the Java side.
+transaction, start to finish, on the Java side. `dbWriteTimeMs` is `0.0`
+whenever `APP_DB_SAVE_ENABLED=false` (the required setting for benchmark
+runs — see [Running](#running)), since no write occurs.
 
 `computationTimeMs` is the sum of `dataframeConstructionTimeMs` (building the
 single-row pandas `DataFrame` the model expects) and `modelInferenceTimeMs`
@@ -177,11 +196,18 @@ with per-field errors.
 **transaction-service:** `eclipse-temurin:21-jdk-alpine` build → `21-jre-alpine` run · port `8080` · cores `3-5` · 3.0 CPU / 3G RAM limit (1.0 / 1G reserved)
 
 Requirements:
+- **Docker + Docker Compose v2** (`docker compose`) — verify `deploy.resources`
+  limits and `cpuset` actually apply with `docker inspect` before trusting a
+  run (`run-suite.sh` does this automatically per rep — see
+  [CPU pinning verification](#cpu-pinning-verification)).
 - **6+ logical cores** — `cpuset` is hardcoded to `0-2`/`3-5`; adjust or
   remove it on smaller machines.
 - **~6GB free RAM** for both services' limits plus Docker/k6 overhead.
-- **Docker Compose v2** (`docker compose`) — verify `deploy.resources`
-  limits actually apply with `docker inspect` before trusting a run.
+- **[k6](https://k6.io/docs/get-started/installation/)** installed locally,
+  to run the load-testing scripts.
+- **Python 3 + `pip install -r analysis/requirements.txt`** (pandas, numpy,
+  matplotlib, scipy, statsmodels, tabulate) locally, to run
+  `analyze-results.py`.
 - No GPU needed.
 
 ## Running
@@ -191,18 +217,33 @@ provenance):
 
 ```bash
 docker compose build
+pip install -r analysis/requirements.txt
 cd load-testing
 ./run-suite.sh                                      # baseline + concurrency scan, all reps
-python3 ../analysis/analyze-results.py               # percentile tables + histogram
+python3 ../analysis/analyze-results.py               # tables + figures
 ```
 
 `run-suite.sh` runs `warm-up.js` once at the start of every stack restart,
 then drives `run-target.js` per target/concurrency cell, writing one JSON
-file per cell to `results/`, plus `run_order_log.txt` (shuffle order per
-rep) and `run_metadata.json` (timestamp, Docker/Compose versions, git
-commit + dirty flag, CPU/RAM — so results stay traceable to the environment
-that produced them). Requires `APP_DB_SAVE_ENABLED=false` in
-`docker-compose.yml`.
+file per cell to `results/`, plus:
+
+- `run_order_log.txt` — shuffle order per rep.
+- `run_metadata.json` — timestamp, Docker/Compose versions, git commit +
+  dirty flag, CPU/RAM, so results stay traceable to the environment that
+  produced them.
+- `cpu_pin_check_log.txt` — per-rep CPU-pinning verification (see below).
+
+Requires `APP_DB_SAVE_ENABLED=false` in `docker-compose.yml`.
+
+### CPU pinning verification
+
+`docker-compose.yml`'s `cpuset` directive states what pinning was
+*requested*; it isn't guaranteed to be honored on every Docker/cgroup
+driver version. Each rep, `run-suite.sh` inspects the running containers'
+actual cgroup `cpuset` and logs it to `cpu_pin_check_log.txt`. If either
+container reports an empty cpuset, that's flagged in both
+`cpu_pin_check_log.txt` and `run_failures_log.txt` — treat that rep's
+results as **not** core-isolated.
 
 A failed cell (dropped connection, transient error under load) is logged
 to `run_failures_log.txt` and skipped — it does not abort the rest of the
@@ -218,7 +259,7 @@ Manual / one-off run:
 docker compose up                                   # waits for python health check
 k6 run load-testing/warm-up.js                       # JIT warm-up
 k6 run --out json=results/results.json your-test.js  # real load test
-python analysis/analyze-results.py                   # percentile tables + histogram
+python3 analysis/analyze-results.py                  # tables + figures
 ```
 
 `warm-up.js` warms each target (mock + all four AI tiers) sequentially,
@@ -227,7 +268,8 @@ request budget before measurement starts. Tunable via
 `WARMUP_ITERATIONS_PER_TARGET`, `WARMUP_VUS`, `WARMUP_MAX_DURATION_S` env
 vars. Telemetry metrics are recorded separately, in `run-target.js` (via
 the shared `sendTransaction` helper in `lib/common.js`) during the actual
-measured runs.
+measured runs. Note `warm-up.js` always targets `localhost:8080` directly
+(it does not honor `BASE_URL`, unlike `run-target.js`).
 
 ## Limitations
 
@@ -237,22 +279,26 @@ measured runs.
   reduced anonymized representation) — benchmarks latency, not
   production-grade fraud detection accuracy.
 - **In-memory H2** — wiped on restart; export `results/` before tearing down.
-- **`run_metadata.json`, `run_order_log.txt`, and `run_failures_log.txt`**
-  all reflect the *last* suite run only — each is truncated fresh at the
-  start of `run-suite.sh`, so archive them alongside that run's `results/`
-  before starting another.
+- **`run_metadata.json`, `run_order_log.txt`, `run_failures_log.txt`, and
+  `cpu_pin_check_log.txt`** all reflect the *last* suite run only — each is
+  truncated fresh at the start of `run-suite.sh`, so archive them alongside
+  that run's `results/` before starting another.
 - **Mock endpoint** is a latency baseline only, never a real fraud check.
 - **`--synthetic` training data** is a smoke test, not a benchmark source.
-- **Resource limits** depend on Compose version — verify before trusting results.
+- **Resource limits and CPU pinning** depend on the Docker/Compose version —
+  `run-suite.sh` verifies both automatically per rep, but check
+  `cpu_pin_check_log.txt` before trusting a run's core isolation.
 - **6-core CPU pinning** is host-specific; results aren't comparable across
   different core counts/SMT settings without adjusting `cpuset`.
-  
+
 ## Structure
 
 ```
 .
 ├── docker-compose.yml
-├── analysis/analyze-results.py
+├── analysis/
+│   ├── analyze-results.py        # tables, figures, significance tests
+│   └── requirements.txt
 ├── load-testing/
 │   ├── run-suite.sh              # full baseline + concurrency-scan orchestrator
 │   ├── warm-up.js                # per-target sequential JIT/pool warm-up
@@ -267,7 +313,7 @@ measured runs.
     │   │   ├── schemas.py
     │   │   ├── responses.py         # shared response/telemetry builder
     │   │   └── routers/predict.py (POST /predict/v{n}), mock.py
-    │   ├── models/fraud_model_v{5,10,20,28}.joblib
+    │   ├── models/fraud_model_v{5,10,20,28}.joblib   # pretrained, committed
     │   └── training/train_model.py  # --n-features {5,10,20,28}, omit for all four
     └── transaction-service/         # Java Spring Boot orchestrator
         └── src/main/java/.../{controller,service,model,repository,dto,exception}/
