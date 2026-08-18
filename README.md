@@ -350,4 +350,4 @@ it identically.
 
 - Transaction orchestrator originally by [MuhammadHussain06](https://github.com/MuhammadHussain06/fraud-eval-harness).
 - Fraud inference microservice originally by [MianBao-07](https://github.com/MianBao-07/fraud-detection-microservice).
-- Containerization, mock routing, load testing, and telemetry/concurrency fixes integrate and extend both.
+- Containerization, mock routing, load testing, and telemetry/concurrency fixes by [MuhammadHussain06](https://github.com/MuhammadHussain06), integrating and extending both.
