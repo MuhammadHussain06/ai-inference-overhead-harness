@@ -28,7 +28,11 @@ app.add_middleware(TimingMiddleware)
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "loadedTiers": list(model_registry.tiers.keys())}
+    return {
+        "status": "ok",
+        "loadedTiers": list(model_registry.tiers.keys()),
+        "nJobsVerified": {n: tier.n_jobs_verified for n, tier in model_registry.tiers.items()},
+    }
 
 
 app.include_router(predict.router)

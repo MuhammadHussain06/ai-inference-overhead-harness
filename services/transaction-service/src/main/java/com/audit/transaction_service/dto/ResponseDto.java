@@ -16,7 +16,7 @@ public class ResponseDto {
     private double aiCallRoundTripTimeMs;
     private double estimatedNetworkOverheadMs;
     private double dbWriteTimeMs;
-    private double responseSerializationTimeMs;
+    private double responseObjectBuildTimeMs;
 
     private PythonTelemetryDto pythonTelemetry = new PythonTelemetryDto();
 
@@ -69,8 +69,8 @@ public class ResponseDto {
     public double getDbWriteTimeMs() { return dbWriteTimeMs; }
     public void setDbWriteTimeMs(double dbWriteTimeMs) { this.dbWriteTimeMs = dbWriteTimeMs; }
 
-    public double getResponseSerializationTimeMs() { return responseSerializationTimeMs; }
-    public void setResponseSerializationTimeMs(double responseSerializationTimeMs) { this.responseSerializationTimeMs = responseSerializationTimeMs; }
+    public double getResponseObjectBuildTimeMs() { return responseObjectBuildTimeMs; }
+    public void setResponseObjectBuildTimeMs(double responseObjectBuildTimeMs) { this.responseObjectBuildTimeMs = responseObjectBuildTimeMs; }
 
     public PythonTelemetryDto getPythonTelemetry() { return pythonTelemetry; }
     public void setPythonTelemetry(PythonTelemetryDto pythonTelemetry) { this.pythonTelemetry = pythonTelemetry; }

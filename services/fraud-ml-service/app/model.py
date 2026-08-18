@@ -15,6 +15,7 @@ class FraudMLTier:
         self.n_features = n_features
         self.model = None
         self.column_names = [f"V{i}" for i in range(1, n_features + 1)] + ["Amount"]
+        self.n_jobs_verified = False
 
     def load(self):
         path = settings.model_path(self.n_features)
@@ -33,6 +34,14 @@ class FraudMLTier:
             self.model.set_params(n_jobs=1)
         except Exception as e:
             print(f"[fraud-ml-service] Warning: could not pin n_jobs=1 on v{self.n_features} model: {e}")
+
+        actual_n_jobs = getattr(self.model, "n_jobs", None)
+        self.n_jobs_verified = (actual_n_jobs == 1)
+        if self.n_jobs_verified:
+            print(f"[fraud-ml-service] Verified v{self.n_features} model n_jobs={actual_n_jobs}.")
+        else:
+            print(f"[fraud-ml-service] WARNING: v{self.n_features} model reports n_jobs={actual_n_jobs} "
+                  f"after pinning attempt, expected 1. Inference may not be single-threaded.")
 
     def predict(self, payload):
         if self.model is None:

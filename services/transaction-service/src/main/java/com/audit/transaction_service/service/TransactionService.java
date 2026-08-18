@@ -39,7 +39,7 @@ public class TransactionService {
     }
 
     public Mono<ResponseDto> processTransaction(RequestDto request, long requestStartNanos) {
-        long overallStartTime = System.nanoTime();
+        long overallStartTime = requestStartNanos;
 
         if (request == null || request.getAmount() == null || request.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
             String txIdStr = (request != null && request.getTransactionId() != null) ? request.getTransactionId() : "UNKNOWN";
@@ -189,7 +189,7 @@ public class TransactionService {
         response.setEstimatedNetworkOverheadMs(estimatedNetworkOverheadMs);
         response.setDbWriteTimeMs(dbTime);
         response.setPythonTelemetry(pythonTelemetry);
-        response.setResponseSerializationTimeMs((System.nanoTime() - responseBuildStart) / 1_000_000.0);
+        response.setResponseObjectBuildTimeMs((System.nanoTime() - responseBuildStart) / 1_000_000.0);
 
         return response;
     }

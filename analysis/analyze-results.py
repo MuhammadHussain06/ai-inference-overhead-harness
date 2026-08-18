@@ -102,30 +102,37 @@ def load_results(results_dir):
 
 # Stats — within-run
 
-def bootstrap_ci(values, stat_fn, n_boot=2000, ci=0.95, seed=42):
-
-    values = np.asarray(values, dtype=float)
-    n = len(values)
-    if n < 2:
+def cluster_bootstrap_ci(sub_df, stat_fn, rep_col="rep", n_boot=2000, ci=0.95, seed=42):
+    """
+    Resamples whole repetitions (clusters) with replacement to pool requests, preserving
+    internal request correlation and avoiding pseudoreplication from correlated within-run data.
+    """
+    reps = sub_df[rep_col].unique()
+    if len(reps) < 2:
         return (np.nan, np.nan)
+    rep_values = {r: sub_df.loc[sub_df[rep_col] == r, "value"].to_numpy() for r in reps}
     rng = np.random.default_rng(seed)
-    idx = rng.integers(0, n, size=(n_boot, n))
-    samples = values[idx]
-    boot_stats = stat_fn(samples, axis=1)
+    boot_stats = np.empty(n_boot)
+    for i in range(n_boot):
+        chosen = rng.choice(reps, size=len(reps), replace=True)
+        pooled = np.concatenate([rep_values[r] for r in chosen])
+        boot_stats[i] = stat_fn(pooled)
     alpha = (1 - ci) / 2
     lo, hi = np.quantile(boot_stats, [alpha, 1 - alpha])
     return (float(lo), float(hi))
 
 
-def summarize(values, label, n_boot=2000):
+def summarize(sub_df, label, n_boot=2000):
 
-    values = pd.to_numeric(pd.Series(values), errors="coerce").dropna().to_numpy()
+    sub_df = sub_df[pd.to_numeric(sub_df["value"], errors="coerce").notna()].copy()
+    sub_df["value"] = pd.to_numeric(sub_df["value"], errors="coerce")
+    values = sub_df["value"].to_numpy()
     n = len(values)
     if n == 0:
         return None
 
-    mean_lo, mean_hi = bootstrap_ci(values, lambda s, axis: np.mean(s, axis=axis), n_boot=n_boot)
-    p95_lo, p95_hi = bootstrap_ci(values, lambda s, axis: np.percentile(s, 95, axis=axis), n_boot=n_boot)
+    mean_lo, mean_hi = cluster_bootstrap_ci(sub_df, lambda s: np.mean(s), n_boot=n_boot)
+    p95_lo, p95_hi = cluster_bootstrap_ci(sub_df, lambda s: np.percentile(s, 95), n_boot=n_boot)
 
     return {
         "Group": label,
@@ -385,7 +392,7 @@ def analyze_baseline(df, output_dir):
     e2e = base[(base["metric"] == "http_req_duration") & base["value"].notna() & (base["status"] == "200")]
 
     # Table 1: pooled within-run end-to-end latency per target (all reps combined, successful requests only)
-    rows = [summarize(e2e[e2e["tier"] == t]["value"], _tier_label(t)) for t in order]
+    rows = [summarize(e2e[e2e["tier"] == t], _tier_label(t)) for t in order]
     table1 = pd.DataFrame([r for r in rows if r])
     save_table(table1, "table1_baseline_e2e_latency_pooled", output_dir,
                caption="End-to-end request latency by strategy/tier at VUS=1, pooled across all repetitions, "
@@ -560,7 +567,7 @@ def analyze_scan(df, output_dir):
             cell = e2e[(e2e["tier"] == t) & (e2e["vus"] == vus)]
             if cell.empty:
                 continue
-            s = summarize(cell["value"], f"{_tier_label(t)} @ VUS={vus}")
+            s = summarize(cell, f"{_tier_label(t)} @ VUS={vus}")
             if not s:
                 continue
             group_label = f"{_tier_label(t)} @ VUS={vus}"
