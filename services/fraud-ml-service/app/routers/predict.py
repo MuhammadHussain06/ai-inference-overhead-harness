@@ -2,7 +2,7 @@ import time
 
 from fastapi import APIRouter, Request
 
-from ..model import FraudModel
+from ..model import model_registry
 from ..responses import build_response
 from ..schemas import TransactionPayload, TransactionResponse
 
@@ -15,7 +15,7 @@ def predict(n_features: int, payload: TransactionPayload, request: Request):
 
     parsing_time_ms = (time.perf_counter() - start_total) * 1000
 
-    tier = FraudModel.get(n_features)
+    tier = model_registry.get(n_features)
     is_fraud, risk_score, comp_time_ms, df_time_ms, infer_time_ms = tier.predict(payload)
 
     return build_response(

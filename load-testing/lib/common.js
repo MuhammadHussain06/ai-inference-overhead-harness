@@ -63,8 +63,8 @@ export function sendTransaction(target, extraTags) {
 
   const res = http.post(BASE_URL, JSON.stringify(body), params);
 
-  // Explicit check for k6's built-in `checks` metric to align default k6 pass/fail output
-// with the custom analysis script metrics, independent of Rate and Counter counters.
+  // Explicit check for k6's built-in `checks` metric, to align default k6
+  // pass/fail output with the custom Rate/Counter metrics above.
   const ok = check(res, { 'status is 200': (r) => r.status === 200 }, tags);
   requestSuccess.add(ok, tags);
 
@@ -80,14 +80,15 @@ export function sendTransaction(target, extraTags) {
       totalPythonTime.add(telemetry.totalPythonExecutionTimeMs, tags);
     }
   } else if (res.status === 0) {
-// Handles network-level drops (connection reset, DNS/TLS failure, or client timeout)
-    // where no response was received, using res.error and res.error_code for classification.
+    // status === 0: no response was received (connection reset, DNS/TLS
+    // failure, or client timeout). res.error/res.error_code are logged
+    // for diagnostics only; classification itself is by status code.
     requestTimeoutError.add(1, tags);
     console.error(`Timeout/network error [${target.strategy}/${tierLabel}]: ` +
         `error_code=${res.error_code} error=${res.error}`);
   } else {
-// Tracks non-200 application responses (e.g., 400s/500s) as a distinct category,
-// separating explicit application rejections from network-level timeouts.
+    // Non-200 application response (e.g., 400s/500s), tracked separately
+    // from network-level timeouts above.
     requestHttpError.add(1, tags);
     console.error(`HTTP error [${target.strategy}/${tierLabel}]: ${res.status} ${res.body}`);
   }

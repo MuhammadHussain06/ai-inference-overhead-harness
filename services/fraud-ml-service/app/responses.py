@@ -7,8 +7,6 @@ from .schemas import PythonTelemetryDto, TransactionResponse
 
 def build_response(payload, is_fraud, risk_score, parsing_time_ms, comp_time_ms, start_total,
                    dataframe_construction_time_ms=0.0, model_inference_time_ms=0.0):
-    message = "Fraud detected" if is_fraud else "Transaction approved"
-
     telemetry = PythonTelemetryDto(
         parsingRequestTimeMs=parsing_time_ms,
         computationTimeMs=comp_time_ms,
@@ -22,7 +20,6 @@ def build_response(payload, is_fraud, risk_score, parsing_time_ms, comp_time_ms,
         transactionId=payload.transactionId,
         isFraud=is_fraud,
         riskScore=risk_score,
-        message=message,
         pythonTelemetry=telemetry,
     )
 

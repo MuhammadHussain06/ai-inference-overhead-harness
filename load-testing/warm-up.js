@@ -15,6 +15,9 @@ import { uuidv4 } from 'https://jslib.k6.io/k6-utils/1.4.0/index.js';
 //   WARMUP_ITERATIONS_PER_TARGET : Requests sent per target window [Default: 1500]
 //   WARMUP_VUS                   : Concurrent VUs per target window [Default: 5]
 //   WARMUP_MAX_DURATION_S        : Hard per-target timeout ceiling (seconds) [Default: 60]
+//   BASE_URL                     : Target API endpoint [Default: http://localhost:8080/api/v1/transactions]
+
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080/api/v1/transactions';
 
 const ITERATIONS_PER_TARGET = parseInt(__ENV.WARMUP_ITERATIONS_PER_TARGET || '1500', 10);
 const VUS = parseInt(__ENV.WARMUP_VUS || '5', 10);
@@ -81,7 +84,7 @@ function sendWarmupRequest(key) {
     tags: { strategy: target.strategy, tier: key },
   };
 
-  const res = http.post('http://localhost:8080/api/v1/transactions', JSON.stringify(body), params);
+  const res = http.post(BASE_URL, JSON.stringify(body), params);
 
   if (res.status !== 200) {
     console.error(`Warm-up request failed [${target.strategy}/${key}]: ${res.status} ${res.body}`);

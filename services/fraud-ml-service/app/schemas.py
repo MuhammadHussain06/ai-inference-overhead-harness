@@ -29,5 +29,4 @@ class TransactionResponse(BaseModel):
     transactionId: str
     isFraud: bool = Field(..., alias="isFraud")
     riskScore: float = Field(..., alias="riskScore")
-    message: str
     pythonTelemetry: PythonTelemetryDto

@@ -218,8 +218,8 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   k6 run warm-up.js
   sleep "$COOLDOWN_S"
 
-# Randomizes target and concurrency order per rep (shuffled independently)
-# to decorrelate within-rep drift from individual test factors.
+  # Randomizes target and concurrency order per rep (shuffled independently)
+  # to decorrelate within-rep drift from individual test factors.
   read -ra TARGETS_THIS_REP <<< "$(shuffled "${TARGETS[@]}")"
   read -ra CONCURRENCY_THIS_REP <<< "$(shuffled "${CONCURRENCY_LEVELS[@]}")"
   echo "scan rep=${rep} target_order=${TARGETS_THIS_REP[*]} concurrency_order=${CONCURRENCY_THIS_REP[*]}" >> "$ORDER_LOG"

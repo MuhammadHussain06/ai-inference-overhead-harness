@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from .model import FraudModel
+from .model import model_registry
 from .routers import mock, predict
 
 
@@ -17,9 +17,9 @@ class TimingMiddleware(BaseHTTPMiddleware):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
-    FraudModel.load_all()
+    model_registry.load_all()
     yield
-    FraudModel.clear()
+    model_registry.clear()
 
 
 app = FastAPI(title="Fraud Detection API", lifespan=lifespan)
@@ -28,7 +28,7 @@ app.add_middleware(TimingMiddleware)
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "loadedTiers": list(FraudModel.tiers.keys())}
+    return {"status": "ok", "loadedTiers": list(model_registry.tiers.keys())}
 
 
 app.include_router(predict.router)

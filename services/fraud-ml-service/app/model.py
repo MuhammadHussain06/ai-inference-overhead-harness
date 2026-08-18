@@ -89,4 +89,4 @@ class FraudModelRegistry:
         self.tiers = {}
 
 
-FraudModel = FraudModelRegistry()
+model_registry = FraudModelRegistry()
