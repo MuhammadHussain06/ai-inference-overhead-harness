@@ -61,12 +61,21 @@ they never contend for the same cores during a run.
   per-request via `featureTier` and routed to `/predict/v{tier}` — each tier
   is its own XGBoost model, loaded once at startup and held in memory
   alongside the others.
-- Stage-by-stage latency: parsing, network, DB-write, serialization (Java)
-  + parsing, computation (split into DataFrame construction and model
-  inference), serialization (Python), nested in one response.
+- Stage-by-stage latency: parsing, network, DB-write, response-object-build,
+  serialization (Java) + parsing, computation (split into DataFrame
+  construction and model inference), serialization (Python), nested in one
+  response.
 - Reactive Java stack end-to-end (WebFlux + R2DBC).
 - CPU-pinned, resource-limited containers, with pinning verified (not just
   assumed) against each container's live cgroup during a full suite run.
+- Model inference is pinned to `n_jobs=1` at load time, and that pinning is
+  read back and verified rather than just requested — exposed per-tier on
+  `/health` as `nJobsVerified`, so a build where the parameter silently
+  failed to apply is observable instead of assumed away.
+- Structural outages are tracked separately from application rejections:
+  `status=0` (no response — timeout/connection reset) is a distinct k6
+  metric from non-200 HTTP responses, both in the raw counters and in every
+  analysis error-rate table.
 - `run-suite.sh`: orchestrates a full baseline + concurrency-scan suite
   across clean-slate stack restarts, with per-rep target/concurrency
   shuffling, per-rep CPU-pinning verification, and a captured
@@ -158,7 +167,7 @@ Response:
   "aiCallRoundTripTimeMs": 8.9,
   "estimatedNetworkOverheadMs": 6.59,
   "dbWriteTimeMs": 2.1,
-  "responseSerializationTimeMs": 0.4,
+  "responseObjectBuildTimeMs": 0.05,
   "pythonTelemetry": {
     "parsingRequestTimeMs": 0.21,
     "computationTimeMs": 1.85,
@@ -174,10 +183,14 @@ Response:
 `fraud-ml-service`, start to finish. `estimatedNetworkOverheadMs` is that
 figure minus Python's own `totalPythonExecutionTimeMs` — i.e. everything
 outside Python's self-reported work: network transit, FastAPI/Uvicorn
-routing, and any queuing under load. `executionTimeMs` is the full
-transaction, start to finish, on the Java side. `dbWriteTimeMs` is `0.0`
-whenever `APP_DB_SAVE_ENABLED=false` (the required setting for benchmark
-runs — see [Running](#running)), since no write occurs.
+routing, and any queuing under load. `responseObjectBuildTimeMs` is the
+time to assemble the final `ResponseDto` after the AI/DB stages complete.
+`executionTimeMs` is the full transaction, start to finish, on the Java
+side — timestamped from the earliest point in the WebFlux filter chain
+(`RequestTimingWebFilter`), not from controller entry, so it also captures
+Netty/WebFlux routing overhead. `dbWriteTimeMs` is `0.0` whenever
+`APP_DB_SAVE_ENABLED=false` (the required setting for benchmark runs — see
+[Running](#running)), since no write occurs.
 
 `computationTimeMs` is the sum of `dataframeConstructionTimeMs` (building the
 single-row pandas `DataFrame` the model expects) and `modelInferenceTimeMs`
@@ -191,7 +204,13 @@ with per-field errors.
 
 ## Containerization & Hardware
 
-**python-service:** `python:3.11-slim` · port `8000` · cores `0-2` · 3.0 CPU / 3G RAM limit (1.0 / 1G reserved)
+**python-service:** `python:3.11-slim` · port `8000` · cores `0-2` · 3.0 CPU / 3G RAM limit (1.0 / 1G reserved) ·
+`UVICORN_WORKERS=3` (set in `docker-compose.yml`; the Dockerfile's own
+default is `1`, so compose's override is what actually runs at benchmark
+time). Each worker process handles requests concurrently, while `n_jobs=1`
+keeps any single `predict_proba` call single-threaded — the two settings
+control different axes (inter-request vs. intra-model parallelism) and
+aren't in tension on the pinned 3-core range.
 
 **transaction-service:** `eclipse-temurin:21-jdk-alpine` build → `21-jre-alpine` run · port `8080` · cores `3-5` · 3.0 CPU / 3G RAM limit (1.0 / 1G reserved)
 
@@ -268,8 +287,10 @@ request budget before measurement starts. Tunable via
 `WARMUP_ITERATIONS_PER_TARGET`, `WARMUP_VUS`, `WARMUP_MAX_DURATION_S` env
 vars. Telemetry metrics are recorded separately, in `run-target.js` (via
 the shared `sendTransaction` helper in `lib/common.js`) during the actual
-measured runs. Note `warm-up.js` always targets `localhost:8080` directly
-(it does not honor `BASE_URL`, unlike `run-target.js`).
+measured runs. Like `run-target.js`/`lib/common.js`, `warm-up.js` reads
+`BASE_URL` from the environment and falls back to
+`http://localhost:8080/api/v1/transactions` if unset — both scripts honor
+it identically.
 
 ## Limitations
 
@@ -288,6 +309,10 @@ measured runs. Note `warm-up.js` always targets `localhost:8080` directly
 - **Resource limits and CPU pinning** depend on the Docker/Compose version —
   `run-suite.sh` verifies both automatically per rep, but check
   `cpu_pin_check_log.txt` before trusting a run's core isolation.
+- **`n_jobs=1` verification** confirms the sklearn/XGBoost-level parameter
+  read back as expected; it doesn't independently prove zero cross-thread
+  execution at the OS level on every build (see `/health`'s
+  `nJobsVerified` per tier).
 - **6-core CPU pinning** is host-specific; results aren't comparable across
   different core counts/SMT settings without adjusting `cpuset`.
 
