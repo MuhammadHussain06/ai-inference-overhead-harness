@@ -4,8 +4,7 @@ Containerized benchmarking testbed that measures the real latency/throughput
 cost of a live AI fraud-inference call against a network-equivalent mock
 baseline and a zero-work calibration floor. `docker compose up` brings the
 stack up; `run-suite.sh` + `analyze-results.py` reproduce the load-test
-results used in the accompanying thesis (see [Running](#running) for the
-full toolchain required).
+results used in the accompanying thesis (see [Running](#running)).
 
 Integrates two previously separate services:
 
@@ -33,12 +32,11 @@ Every transaction routes through one of three strategies:
 All three paths share the same JVM, network hop, and DTOs, so the
 *difference* between them isolates model-inference cost from fixed costs
 (HTTP, serialization, scheduling) and from the harness's own measurement
-overhead. Note that DB persistence (`APP_DB_SAVE_ENABLED`) is disabled for
-benchmark runs (see [Running](#running)), so the DB write is not part of
-any path's measured cost. Within the AI strategy, the model itself is
-swappable across four input-size tiers — `V5`, `V10`, `V20`, `V28` — so
-inference cost can also be measured as a function of feature-vector size,
-not just as a single fixed number.
+overhead. DB persistence (`APP_DB_SAVE_ENABLED`) is disabled for benchmark
+runs (see [Running](#running)), so the DB write is not part of any path's
+measured cost. Within the AI strategy, the model itself is swappable across
+four input-size tiers — `V5`, `V10`, `V20`, `V28` — so inference cost can
+also be measured as a function of feature-vector size.
 
 ## Architecture
 
@@ -76,8 +74,9 @@ they never contend for the same cores during a run.
   ~one random draw, and each AI tier's marginal cost over calibration is
   its DataFrame construction plus inference.
 - Reactive Java stack end-to-end (WebFlux + R2DBC).
-- CPU-pinned, resource-limited containers, with pinning verified (not just
-  assumed) against each container's live cgroup during a full suite run.
+- CPU-pinned, resource-limited containers. Pinning is verified per rep
+  against each container's live cgroup cpuset, not just the requested
+  compose config.
 - Model inference is pinned to `n_jobs=1` at load time, read back and
   verified rather than just requested — exposed per-tier on `/health` as
   `nJobsVerified`. The Python container also pins `OMP_NUM_THREADS`,
@@ -100,9 +99,10 @@ they never contend for the same cores during a run.
 - `warm-up.js`: JIT/connection-pool warm-up, run once per stack restart
   before measurement begins, with every target (mock, calibration, and all
   four AI tiers) warmed sequentially in its own dedicated, non-overlapping
-  time window. Its own request latency is captured to disk so warm-up
-  convergence can be checked after the fact, rather than trusting the fixed
-  iteration count alone.
+  time window. Shares `sendTransaction`/`TARGETS` with `run-target.js` via
+  `lib/common.js`, so warm-up traffic is tagged and classified the same way
+  measured traffic is. Its own request latency is captured to disk so
+  warm-up convergence can be checked after the fact.
 - `analyze-results.py`: percentile tables (P50/P95/P99) and latency
   histograms per strategy/tier, significance testing (Mann-Whitney U on
   rep-level means, Holm-Bonferroni corrected, with rank-biserial effect
@@ -218,7 +218,10 @@ single-row pandas `DataFrame` the model expects) and `modelInferenceTimeMs`
 overhead from actual tree-traversal cost. For `DISTRIBUTED_MOCK_GATEWAY` and
 `DISTRIBUTED_CALIBRATION_ONLY` responses, both sub-fields (and
 `computationTimeMs` itself) are `0.0`, since neither performs any
-computation.
+computation. `serializationResponseTimeMs` and `totalPythonExecutionTimeMs`
+are estimates: a response body can't report the exact cost of producing
+itself without being serialized twice, so both are derived from one
+serialization pass rather than the literal final one.
 
 `transactionId` must be a UUID, `accountId` must match `ACC-\d{4,10}` —
 both validated before reaching the AI layer; invalid requests return `400`
@@ -238,10 +241,9 @@ tension on the pinned 3-core range.
 **transaction-service:** `eclipse-temurin:21-jdk-alpine` build → `21-jre-alpine` run · port `8080` · cores `3-5` · 3.0 CPU / 3G RAM limit (1.0 / 1G reserved)
 
 Requirements:
-- **Docker + Docker Compose v2** (`docker compose`) — verify `deploy.resources`
-  limits and `cpuset` actually apply with `docker inspect` before trusting a
-  run (`run-suite.sh` does this automatically per rep — see
-  [CPU pinning verification](#cpu-pinning-verification)).
+- **Docker + Docker Compose v2** (`docker compose`) — see
+  [CPU pinning verification](#cpu-pinning-verification); `run-suite.sh`
+  checks this automatically per rep.
 - **6+ logical cores** — `cpuset` is hardcoded to `0-2`/`3-5`; adjust or
   remove it on smaller machines.
 - **~6GB free RAM** for both services' limits plus Docker/k6 overhead.
@@ -272,23 +274,29 @@ then drives `run-target.js` per target/concurrency cell across `mock`,
 
 - `run_order_log.txt` — shuffle order per rep.
 - `run_metadata.json` — timestamp, Docker/Compose versions, git commit +
-  dirty flag, CPU/RAM, and a CPU governor/frequency snapshot, so results
-  stay traceable to the environment that produced them.
-- `cpu_pin_check_log.txt` — per-rep CPU-pinning verification (see below).
+  dirty flag, CPU/RAM, and a CPU governor/frequency snapshot.
+- `cpu_pin_check_log.txt` — per-rep requested-vs-live cpuset (see below).
 - `warmup_baseline_rep{N}.json` / `warmup_scan_rep{N}.json` — warm-up
   request latency, tagged `phase=warmup`, used by `analyze-results.py` to
-  check warm-up convergence rather than trusting the fixed iteration
-  count.
+  check warm-up convergence.
 
 Requires `APP_DB_SAVE_ENABLED=false` in `docker-compose.yml`.
 
 ### CPU pinning verification
 
 `docker-compose.yml`'s `cpuset` directive states what pinning was
-*requested*; it isn't guaranteed to be honored on every Docker/cgroup
-driver version. Each rep, `run-suite.sh` inspects the running containers'
-actual cgroup `cpuset` and logs it to `cpu_pin_check_log.txt`. If either
-container reports an empty cpuset, that's flagged in both
+*requested*; a compose file being accepted doesn't guarantee the cgroup
+driver actually confines the process to those cores. Each rep,
+`run-suite.sh` reads both sides per container and logs them to
+`cpu_pin_check_log.txt`:
+
+- **Requested** — `docker inspect --format '{{.HostConfig.CpusetCpus}}'`,
+  the config Docker was given at container creation.
+- **Live** — `docker exec <container> cat /sys/fs/cgroup/cpuset.cpus.effective`
+  (cgroup v2), falling back to `/sys/fs/cgroup/cpuset/cpuset.cpus` (v1) —
+  what the kernel actually assigned the running container.
+
+If either side is empty, or the two don't match, that's flagged in both
 `cpu_pin_check_log.txt` and `run_failures_log.txt` — treat that rep's
 results as **not** core-isolated.
 
@@ -313,18 +321,16 @@ python3 analysis/analyze-results.py                  # tables + figures
 sequentially, each in its own dedicated time window, so every code path
 gets its full request budget before measurement starts. Tunable via
 `WARMUP_ITERATIONS_PER_TARGET`, `WARMUP_VUS`, `WARMUP_MAX_DURATION_S` env
-vars. Telemetry metrics are recorded separately, in `run-target.js` (via
-the shared `sendTransaction` helper in `lib/common.js`) during the actual
-measured runs. Like `run-target.js`/`lib/common.js`, `warm-up.js` reads
-`BASE_URL` from the environment and falls back to
-`http://localhost:8080/api/v1/transactions` if unset.
+vars. It reads `BASE_URL` the same way `run-target.js`/`lib/common.js` do,
+falling back to `http://localhost:8080/api/v1/transactions` if unset.
 
 ## Limitations
 
 - **Single-node only** — no multi-region/network-hop simulation.
 - **"Network overhead" is Docker bridge-network overhead specifically** —
   `estimatedNetworkOverheadMs` reflects Docker's bridge/NAT path between
-  two containers on one host, not a real network hop.
+  two containers on one host, not a real network hop, and includes a
+  small serialization-estimation error (see the response-fields note above).
 - **k6 shares cores with the services under test.** The documented minimum
   host spec is 6 logical cores, exactly matching the two pinned service
   ranges — k6, the Docker daemon, and the host OS all run on those same
@@ -339,8 +345,8 @@ measured runs. Like `run-target.js`/`lib/common.js`, `warm-up.js` reads
   as a floor; it doesn't remove that cost from the AI/mock numbers, which
   still include it.
 - **No verification that the two `cpuset` ranges are on distinct physical
-  cores rather than SMT siblings of each other** — pinning is verified as
-  configured (via `docker inspect`), not confirmed as physically isolated.
+  cores rather than SMT siblings of each other** — pinning is confirmed
+  live at the cgroup level, not confirmed as physically isolated.
 - **CPU governor/frequency is a single snapshot per suite run**, not a
   per-rep or per-cell trace — it can flag a run as suspect but won't catch
   thermal throttling that only appears mid-run under sustained load.
@@ -363,9 +369,6 @@ measured runs. Like `run-target.js`/`lib/common.js`, `warm-up.js` reads
 - **Mock and calibration are latency baselines only**, never real fraud
   checks.
 - **`--synthetic` training data** is a smoke test, not a benchmark source.
-- **Resource limits and CPU pinning** depend on the Docker/Compose version —
-  `run-suite.sh` verifies both automatically per rep, but check
-  `cpu_pin_check_log.txt` before trusting a run's core isolation.
 - **`n_jobs=1` verification** confirms the sklearn/XGBoost-level parameter
   read back as expected; combined with the BLAS-level env vars, it's a
   strong but not absolute guarantee of single-threaded inference on every
@@ -385,7 +388,7 @@ measured runs. Like `run-target.js`/`lib/common.js`, `warm-up.js` reads
 │   ├── run-suite.sh              # full baseline + concurrency-scan orchestrator
 │   ├── warm-up.js                # per-target sequential JIT/pool warm-up
 │   ├── run-target.js             # single (target, concurrency, rep) cell runner
-│   └── lib/common.js             # shared sendTransaction() + telemetry Trends
+│   └── lib/common.js             # shared sendTransaction()/TARGETS + telemetry Trends
 └── services/
     ├── fraud-ml-service/            # Python FastAPI inference service
     │   ├── app/
