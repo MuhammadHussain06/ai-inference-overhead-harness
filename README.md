@@ -1,40 +1,44 @@
 # AI Inference Overhead Harness — Containerized Testbed
 
 Containerized benchmarking testbed that measures the real latency/throughput
-cost of a live AI fraud-inference call vs. a network-equivalent mock
-baseline. `docker compose up` brings the stack up; `run-suite.sh` +
-`analyze-results.py` reproduce the load-test results used in the
-accompanying thesis (see [Running](#running) for the full toolchain
-required).
+cost of a live AI fraud-inference call against a network-equivalent mock
+baseline and a zero-work calibration floor. `docker compose up` brings the
+stack up; `run-suite.sh` + `analyze-results.py` reproduce the load-test
+results used in the accompanying thesis (see [Running](#running) for the
+full toolchain required).
 
 Integrates two previously separate services:
 
 - **transaction-service** (Java / Spring Boot) — [`MuhammadHussain06/fraud-eval-harness`](https://github.com/MuhammadHussain06/fraud-eval-harness) — reactive REST API, validates and routes transactions, records latency telemetry.
 - **fraud-ml-service** (Python / FastAPI) — [`MianBao-07/fraud-detection-microservice`](https://github.com/MianBao-07/fraud-detection-microservice) — wraps a trained XGBoost fraud classifier.
 
-This repo containerizes both, adds a mock baseline endpoint for isolating
-AI overhead, pins CPUs per service, and ships k6 load testing + result
-analysis.
+This repo containerizes both, adds mock and calibration baseline endpoints
+for isolating AI overhead, pins CPUs per service, and ships k6 load testing
+plus statistical result analysis.
 
 ---
 
 ## Idea
 
-Every transaction routes through one of two strategies:
+Every transaction routes through one of three strategies:
 
 - `DISTRIBUTED_AI_SYNCHRONOUS` — scored by a real XGBoost model at a chosen
   feature-count tier (see below).
 - `DISTRIBUTED_MOCK_GATEWAY` — scored by a random-value mock with the
-  identical request/response shape and network path.
+  identical request/response shape and network path as the real model call.
+- `DISTRIBUTED_CALIBRATION_ONLY` — does no business logic at all (not even
+  the mock's random draw). Isolates the harness's own instrumentation and
+  serialization overhead as a measurable floor.
 
-Both paths share the same JVM, network hop, and DTOs, so the *difference*
-between them isolates model-inference cost from those fixed costs (HTTP,
-serialization, scheduling). Note that DB persistence (`APP_DB_SAVE_ENABLED`)
-is disabled for benchmark runs (see [Running](#running)), so the DB write is
-*not* part of either path's measured cost — it's skipped on both. Within the
-AI strategy, the model itself is swappable across four input-size tiers —
-`V5`, `V10`, `V20`, `V28` — so inference cost can also be measured as a
-function of feature-vector size, not just as a single fixed number.
+All three paths share the same JVM, network hop, and DTOs, so the
+*difference* between them isolates model-inference cost from fixed costs
+(HTTP, serialization, scheduling) and from the harness's own measurement
+overhead. Note that DB persistence (`APP_DB_SAVE_ENABLED`) is disabled for
+benchmark runs (see [Running](#running)), so the DB write is not part of
+any path's measured cost. Within the AI strategy, the model itself is
+swappable across four input-size tiers — `V5`, `V10`, `V20`, `V28` — so
+inference cost can also be measured as a function of feature-vector size,
+not just as a single fixed number.
 
 ## Architecture
 
@@ -47,6 +51,7 @@ transaction-service (Java, Spring Boot 3 / WebFlux, Netty, H2 via R2DBC)
         │  WebClient (non-blocking)
         │    POST /predict/v{5,10,20,28}  → real inference, tier-selected
         │    POST /predict/mock           → baseline
+        │    POST /predict/calibrate      → zero-work floor
         ▼
 fraud-ml-service (Python, FastAPI / Uvicorn, XGBoost registry)
 ```
@@ -56,7 +61,8 @@ they never contend for the same cores during a run.
 
 ## Features
 
-- Dual-strategy routing, switchable per-request via `strategy` field.
+- Three-way strategy routing (`AI` / `mock` / `calibration`), switchable
+  per-request via the `strategy` field.
 - Four feature-count tiers for the AI strategy (`5`/`10`/`20`/`28`), selected
   per-request via `featureTier` and routed to `/predict/v{tier}` — each tier
   is its own XGBoost model, loaded once at startup and held in memory
@@ -65,32 +71,45 @@ they never contend for the same cores during a run.
   serialization (Java) + parsing, computation (split into DataFrame
   construction and model inference), serialization (Python), nested in one
   response.
+- A `calibration` target that runs the full request/response pipeline with
+  no computation behind it, so mock's marginal cost over calibration is
+  ~one random draw, and each AI tier's marginal cost over calibration is
+  its DataFrame construction plus inference.
 - Reactive Java stack end-to-end (WebFlux + R2DBC).
 - CPU-pinned, resource-limited containers, with pinning verified (not just
   assumed) against each container's live cgroup during a full suite run.
-- Model inference is pinned to `n_jobs=1` at load time, and that pinning is
-  read back and verified rather than just requested — exposed per-tier on
-  `/health` as `nJobsVerified`, so a build where the parameter silently
-  failed to apply is observable instead of assumed away.
+- Model inference is pinned to `n_jobs=1` at load time, read back and
+  verified rather than just requested — exposed per-tier on `/health` as
+  `nJobsVerified`. The Python container also pins `OMP_NUM_THREADS`,
+  `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, and `NUMEXPR_NUM_THREADS` to 1
+  as a second, independent guard against BLAS-level thread contention
+  underneath the sklearn/XGBoost wrapper.
 - Structural outages are tracked separately from application rejections:
   `status=0` (no response — timeout/connection reset) is a distinct k6
   metric from non-200 HTTP responses, both in the raw counters and in every
   analysis error-rate table.
+- Client-side (k6) connection contention is surfaced as its own diagnostic,
+  via k6's built-in `http_req_blocked` metric, so a throughput plateau at
+  high concurrency can be checked against the load generator itself before
+  it's attributed to the server.
 - `run-suite.sh`: orchestrates a full baseline + concurrency-scan suite
   across clean-slate stack restarts, with per-rep target/concurrency
-  shuffling, per-rep CPU-pinning verification, and a captured
-  host/toolchain provenance fingerprint.
+  shuffling, per-rep CPU-pinning verification, a host/toolchain provenance
+  fingerprint (including a CPU governor/frequency snapshot), and a failures
+  log so a broken cell doesn't abort the rest of the suite.
 - `warm-up.js`: JIT/connection-pool warm-up, run once per stack restart
-  before measurement begins.
-- `analyze-results.py`: full statistical analysis of a suite run —
-  bootstrapped-CI latency tables (mean/median/P95/P99) split by strategy
-  and tier, matching error/timeout-rate tables, a Python-side latency
-  decomposition, between-run (session-to-session) reproducibility tables
-  with CoV%, and Holm-Bonferroni-corrected Mann-Whitney significance tests
-  (with rank-biserial effect size) between adjacent tiers and concurrency
-  levels — plus latency-distribution, P95-vs-concurrency, throughput, and
-  decomposition figures. Outputs CSV/Markdown/LaTeX tables and PNG/PDF
-  figures.
+  before measurement begins, with every target (mock, calibration, and all
+  four AI tiers) warmed sequentially in its own dedicated, non-overlapping
+  time window. Its own request latency is captured to disk so warm-up
+  convergence can be checked after the fact, rather than trusting the fixed
+  iteration count alone.
+- `analyze-results.py`: percentile tables (P50/P95/P99) and latency
+  histograms per strategy/tier, significance testing (Mann-Whitney U on
+  rep-level means, Holm-Bonferroni corrected, with rank-biserial effect
+  sizes) to avoid pseudoreplication, cluster-level bootstrap confidence
+  intervals, between-run reproducibility (CoV% across independent reps),
+  paired error/timeout-rate tables, client-contention diagnostics, a
+  warm-up convergence check, and throughput-vs-concurrency figures.
 - In-memory H2 — every run starts from a clean slate.
 
 ## Dataset
@@ -124,7 +143,8 @@ tier's `.joblib` file is missing.
 Clients send the full `V1..V28` vector regardless of which tier they're
 targeting — each `/predict/v{n}` endpoint slices the first `n` values it
 needs, so the same request body works against any tier without the client
-needing to know each model's exact input size.
+needing to know each model's exact input size. Mock and calibration ignore
+`features` entirely.
 
 ## Example Request
 
@@ -147,8 +167,8 @@ Content-Type: application/json
 
 `featureTier` selects which model (`V5`/`V10`/`V20`/`V28`) scores the
 request and is required when `strategy` is `DISTRIBUTED_AI_SYNCHRONOUS`
-(ignored for `DISTRIBUTED_MOCK_GATEWAY`); `features` must contain at least
-`featureTier` values.
+(ignored for `DISTRIBUTED_MOCK_GATEWAY` and `DISTRIBUTED_CALIBRATION_ONLY`);
+`features` must contain at least `featureTier` values.
 
 Response:
 
@@ -195,8 +215,10 @@ Netty/WebFlux routing overhead. `dbWriteTimeMs` is `0.0` whenever
 `computationTimeMs` is the sum of `dataframeConstructionTimeMs` (building the
 single-row pandas `DataFrame` the model expects) and `modelInferenceTimeMs`
 (the `model.predict_proba` call itself) — split out to separate pandas
-overhead from actual tree-traversal cost. For `DISTRIBUTED_MOCK_GATEWAY`
-responses both sub-fields are `0.0`, since the mock does neither.
+overhead from actual tree-traversal cost. For `DISTRIBUTED_MOCK_GATEWAY` and
+`DISTRIBUTED_CALIBRATION_ONLY` responses, both sub-fields (and
+`computationTimeMs` itself) are `0.0`, since neither performs any
+computation.
 
 `transactionId` must be a UUID, `accountId` must match `ACC-\d{4,10}` —
 both validated before reaching the AI layer; invalid requests return `400`
@@ -208,9 +230,10 @@ with per-field errors.
 `UVICORN_WORKERS=3` (set in `docker-compose.yml`; the Dockerfile's own
 default is `1`, so compose's override is what actually runs at benchmark
 time). Each worker process handles requests concurrently, while `n_jobs=1`
-keeps any single `predict_proba` call single-threaded — the two settings
-control different axes (inter-request vs. intra-model parallelism) and
-aren't in tension on the pinned 3-core range.
+(plus the BLAS-level thread-count env vars in the Dockerfile) keeps any
+single `predict_proba` call single-threaded — the two settings control
+different axes (inter-request vs. intra-model parallelism) and aren't in
+tension on the pinned 3-core range.
 
 **transaction-service:** `eclipse-temurin:21-jdk-alpine` build → `21-jre-alpine` run · port `8080` · cores `3-5` · 3.0 CPU / 3G RAM limit (1.0 / 1G reserved)
 
@@ -243,14 +266,19 @@ python3 ../analysis/analyze-results.py               # tables + figures
 ```
 
 `run-suite.sh` runs `warm-up.js` once at the start of every stack restart,
-then drives `run-target.js` per target/concurrency cell, writing one JSON
-file per cell to `results/`, plus:
+then drives `run-target.js` per target/concurrency cell across `mock`,
+`calibration`, and the four AI tiers, writing one JSON file per cell to
+`results/`, plus:
 
 - `run_order_log.txt` — shuffle order per rep.
 - `run_metadata.json` — timestamp, Docker/Compose versions, git commit +
-  dirty flag, CPU/RAM, so results stay traceable to the environment that
-  produced them.
+  dirty flag, CPU/RAM, and a CPU governor/frequency snapshot, so results
+  stay traceable to the environment that produced them.
 - `cpu_pin_check_log.txt` — per-rep CPU-pinning verification (see below).
+- `warmup_baseline_rep{N}.json` / `warmup_scan_rep{N}.json` — warm-up
+  request latency, tagged `phase=warmup`, used by `analyze-results.py` to
+  check warm-up convergence rather than trusting the fixed iteration
+  count.
 
 Requires `APP_DB_SAVE_ENABLED=false` in `docker-compose.yml`.
 
@@ -281,20 +309,48 @@ k6 run --out json=results/results.json your-test.js  # real load test
 python3 analysis/analyze-results.py                  # tables + figures
 ```
 
-`warm-up.js` warms each target (mock + all four AI tiers) sequentially,
-each in its own dedicated time window, so every code path gets its full
-request budget before measurement starts. Tunable via
+`warm-up.js` warms each target (mock, calibration, and all four AI tiers)
+sequentially, each in its own dedicated time window, so every code path
+gets its full request budget before measurement starts. Tunable via
 `WARMUP_ITERATIONS_PER_TARGET`, `WARMUP_VUS`, `WARMUP_MAX_DURATION_S` env
 vars. Telemetry metrics are recorded separately, in `run-target.js` (via
 the shared `sendTransaction` helper in `lib/common.js`) during the actual
 measured runs. Like `run-target.js`/`lib/common.js`, `warm-up.js` reads
 `BASE_URL` from the environment and falls back to
-`http://localhost:8080/api/v1/transactions` if unset — both scripts honor
-it identically.
+`http://localhost:8080/api/v1/transactions` if unset.
 
 ## Limitations
 
 - **Single-node only** — no multi-region/network-hop simulation.
+- **"Network overhead" is Docker bridge-network overhead specifically** —
+  `estimatedNetworkOverheadMs` reflects Docker's bridge/NAT path between
+  two containers on one host, not a real network hop.
+- **k6 shares cores with the services under test.** The documented minimum
+  host spec is 6 logical cores, exactly matching the two pinned service
+  ranges — k6, the Docker daemon, and the host OS all run on those same
+  cores, unpinned. On a minimum-spec host, the load generator is not
+  isolated from the system it's measuring.
+- **No independent verification that k6 wasn't the bottleneck itself.**
+  The client-diagnostics tables (`http_req_blocked`) are a partial check,
+  not a guarantee — a throughput plateau at high concurrency should be
+  read alongside them before being attributed purely to server capacity.
+- **Instrumentation overhead is measured, not eliminated.** The
+  `calibration` target bounds the harness's own timing/serialization cost
+  as a floor; it doesn't remove that cost from the AI/mock numbers, which
+  still include it.
+- **No verification that the two `cpuset` ranges are on distinct physical
+  cores rather than SMT siblings of each other** — pinning is verified as
+  configured (via `docker inspect`), not confirmed as physically isolated.
+- **CPU governor/frequency is a single snapshot per suite run**, not a
+  per-rep or per-cell trace — it can flag a run as suspect but won't catch
+  thermal throttling that only appears mid-run under sustained load.
+- **Synthetic, uniformly-random feature vectors**, not samples from the
+  real transaction distribution — the licensed dataset can't be bundled,
+  so `randomFeatures()` draws in a rough PCA-shaped range instead.
+- **Rep counts (5 baseline / 3 scan) aren't power-justified** — each rep is
+  a full clean-slate stack restart, so the count is a wall-clock-cost
+  tradeoff, with the achieved N always shown alongside each statistical
+  result.
 - **Reduced feature space even at the largest tier** (`V1`–`V28` + `Amount`
   is the full PCA set the dataset provides, but the dataset itself is a
   reduced anonymized representation) — benchmarks latency, not
@@ -304,15 +360,16 @@ it identically.
   `cpu_pin_check_log.txt`** all reflect the *last* suite run only — each is
   truncated fresh at the start of `run-suite.sh`, so archive them alongside
   that run's `results/` before starting another.
-- **Mock endpoint** is a latency baseline only, never a real fraud check.
+- **Mock and calibration are latency baselines only**, never real fraud
+  checks.
 - **`--synthetic` training data** is a smoke test, not a benchmark source.
 - **Resource limits and CPU pinning** depend on the Docker/Compose version —
   `run-suite.sh` verifies both automatically per rep, but check
   `cpu_pin_check_log.txt` before trusting a run's core isolation.
 - **`n_jobs=1` verification** confirms the sklearn/XGBoost-level parameter
-  read back as expected; it doesn't independently prove zero cross-thread
-  execution at the OS level on every build (see `/health`'s
-  `nJobsVerified` per tier).
+  read back as expected; combined with the BLAS-level env vars, it's a
+  strong but not absolute guarantee of single-threaded inference on every
+  possible build.
 - **6-core CPU pinning** is host-specific; results aren't comparable across
   different core counts/SMT settings without adjusting `cpuset`.
 
@@ -332,16 +389,16 @@ it identically.
 └── services/
     ├── fraud-ml-service/            # Python FastAPI inference service
     │   ├── app/
-    │   │   ├── main.py              # entrypoint + TimingMiddleware
+    │   │   ├── main.py              # entrypoint, TimingMiddleware, /health
     │   │   ├── model.py             # FraudModelRegistry: one FraudMLTier per tier
     │   │   ├── config.py            # FEATURE_TIERS, MODEL_DIR
     │   │   ├── schemas.py
     │   │   ├── responses.py         # shared response/telemetry builder
-    │   │   └── routers/predict.py (POST /predict/v{n}), mock.py
+    │   │   └── routers/predict.py (POST /predict/v{n}), mock.py, calibration.py
     │   ├── models/fraud_model_v{5,10,20,28}.joblib   # pretrained, committed
     │   └── training/train_model.py  # --n-features {5,10,20,28}, omit for all four
     └── transaction-service/         # Java Spring Boot orchestrator
-        └── src/main/java/.../{controller,service,model,repository,dto,exception}/
+        └── src/main/java/.../{controller,service,model,repository,dto,exception,filter}/
 ```
 
 ---
@@ -350,4 +407,4 @@ it identically.
 
 - Transaction orchestrator originally by [MuhammadHussain06](https://github.com/MuhammadHussain06/fraud-eval-harness).
 - Fraud inference microservice originally by [MianBao-07](https://github.com/MianBao-07/fraud-detection-microservice).
-- Containerization, mock routing, load testing, and telemetry/concurrency fixes by [MuhammadHussain06](https://github.com/MuhammadHussain06), integrating and extending both.
+- Containerization, mock/calibration routing, load testing, and telemetry/concurrency work by [MuhammadHussain06](https://github.com/MuhammadHussain06), integrating and extending both.
