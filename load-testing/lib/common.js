@@ -5,13 +5,15 @@ import { uuidv4 } from 'https://jslib.k6.io/k6-utils/1.4.0/index.js';
 
 export const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080/api/v1/transactions';
 
-// Maps TARGET env vars / filenames ('mock' | '5' | '10' | '20' | '28') to tier config.
+// Maps TARGET env vars / filenames ('mock' | 'calibration' | '5' | '10' | '20' | '28') to tier config.
+// label is explicit so calibration (featureTier: null) can't collide with mock.
 export const TARGETS = {
-  mock: { strategy: 'DISTRIBUTED_MOCK_GATEWAY', featureTier: null },
-  '5': { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 5 },
-  '10': { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 10 },
-  '20': { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 20 },
-  '28': { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 28 },
+  mock: { strategy: 'DISTRIBUTED_MOCK_GATEWAY', featureTier: null, label: 'mock' },
+  calibration: { strategy: 'DISTRIBUTED_CALIBRATION_ONLY', featureTier: null, label: 'calibration' },
+  '5': { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 5, label: '5' },
+  '10': { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 10, label: '10' },
+  '20': { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 20, label: '20' },
+  '28': { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 28, label: '28' },
 };
 
 // Overrides default k6 `http_req_failed` handling to mark non-200 responses as failures,
@@ -44,7 +46,7 @@ export function randomFeatures(n) {
 // nested Python telemetry (via Trend.add). Attaches extraTags
 // (e.g., vus/phase) for analyze-results.py grouping.
 export function sendTransaction(target, extraTags) {
-  const tierLabel = target.featureTier !== null ? String(target.featureTier) : 'mock';
+  const tierLabel = target.label;
 
   const body = {
     transactionId: uuidv4(),

@@ -25,7 +25,7 @@ from statsmodels.stats.multitest import multipletests
 DEFAULT_RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 
-TIER_ORDER = ["mock", "5", "10", "20", "28"]
+TIER_ORDER = ["calibration", "mock", "5", "10", "20", "28"]
 CONCURRENCY_ORDER = [1, 2, 4, 8, 16, 32, 64]
 
 PYTHON_TELEMETRY_METRICS = [
@@ -41,7 +41,11 @@ COLOR_CYCLE = ['#2b5c8f', '#c0392b', '#27ae60', '#8e44ad', '#e67e22', '#16a085']
 
 
 def _tier_label(tier):
-    return "mock" if tier in (None, "", "mock") else f"v{tier}"
+    if tier in (None, "", "mock"):
+        return "mock"
+    if tier == "calibration":
+        return "calibration"
+    return f"v{tier}"
 
 
 def _rep_sort_key(r):
@@ -192,6 +196,30 @@ def _throughput_reqs_per_s(subset_df):
     if span_s <= 0:
         return np.nan
     return len(times) / span_s
+
+
+def client_diagnostics_summary(df, phase, group_cols, label_fn, blocked_warn_ms=5.0):
+    """
+    k6's own http_req_blocked (time waiting for a free connection out of k6's
+    pool) as a per-cell diagnostic -- a rise correlated with concurrency
+    rather than tier points at the client, not the server under test.
+    """
+    sub = df[(df["metric"] == "http_req_blocked") & (df["phase"] == phase) & df["value"].notna()].copy()
+    if sub.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for key, g in sub.groupby(group_cols):
+        key_tuple = key if isinstance(key, tuple) else (key,)
+        mean_ms = float(g["value"].mean())
+        p95_ms = float(np.percentile(g["value"], 95))
+        rows.append({
+            "Group": label_fn(key_tuple),
+            "Mean http_req_blocked (ms)": round(mean_ms, 4),
+            "P95 http_req_blocked (ms)": round(p95_ms, 4),
+            "Possible Client Contention": "YES" if p95_ms >= blocked_warn_ms else "no",
+        })
+    return pd.DataFrame(rows)
 
 
 # Stats — significance
@@ -372,6 +400,52 @@ def save_figure(fig, name, output_dir):
     print(f"[+] Figure -> {png_path} / .pdf")
 
 
+# warm-up convergence (post-hoc steady-state check)
+
+def analyze_warmup(df, output_dir, window_size=100):
+    """
+    Post-hoc check of whether the fixed warm-up iteration budget reached a
+    stable state, comparing P50 latency in the first vs. last window_size
+    requests of each target's warm-up window per rep. Coarse, not a formal
+    changepoint detector.
+    """
+    warm = df[(df["phase"] == "warmup") & (df["metric"] == "http_req_duration") &
+              df["value"].notna() & (df["status"] == "200")].copy()
+    if warm.empty:
+        print("[!] No phase='warmup' data found (older results, or warm-up.js run without "
+              "--out json=...); skipping warm-up convergence check.")
+        return
+
+    rows = []
+    for (tier, source_file), g in warm.groupby(["tier", "source_file"]):
+        g = g.sort_values("time")
+        if len(g) < 2 * window_size:
+            # Too few requests in this window to split cleanly; skip rather
+            # than report a misleading number from an undersized sample.
+            continue
+        first_window = g["value"].iloc[:window_size]
+        last_window = g["value"].iloc[-window_size:]
+        p50_first = float(np.percentile(first_window, 50))
+        p50_last = float(np.percentile(last_window, 50))
+        pct_change = 100 * (p50_last - p50_first) / p50_first if p50_first else np.nan
+        rows.append({
+            "Tier": _tier_label(tier),
+            "Source File": source_file,
+            "N Requests": len(g),
+            f"First {window_size} P50 (ms)": round(p50_first, 3),
+            f"Last {window_size} P50 (ms)": round(p50_last, 3),
+            "Change (%)": round(pct_change, 1) if not np.isnan(pct_change) else np.nan,
+            "Stabilized (<10% drift)": "YES" if not np.isnan(pct_change) and abs(pct_change) < 10 else "no",
+        })
+
+    table = pd.DataFrame(rows)
+    save_table(table, "table0_warmup_convergence_check", output_dir,
+               caption=f"Per-rep, per-target warm-up convergence check: P50 latency in the first vs. "
+                       f"last {window_size} requests of each target's warm-up window. Large drift "
+                       f"suggests WARMUP_ITERATIONS_PER_TARGET may need to be increased for that target.",
+               label="tab:warmup-convergence")
+
+
 # baseline decomposition (VUS=1)
 
 def analyze_baseline(df, output_dir):
@@ -408,6 +482,13 @@ def analyze_baseline(df, output_dir):
                        "at all. Table 1's latency statistics are computed on the 'Successful (200)' subset only.",
                label="tab:baseline-error-rates")
 
+    # Table 1d: client-side (k6) contention diagnostic
+    table1d = client_diagnostics_summary(base, "baseline", ["tier"], lambda k: _tier_label(k[0]))
+    save_table(table1d, "table1d_baseline_client_diagnostics", output_dir,
+               caption="k6-side http_req_blocked per target at VUS=1 -- a diagnostic for client-side "
+                       "connection contention, not a server-side latency measurement.",
+               label="tab:baseline-client-diagnostics")
+
     # Table 1b: between-run (clean-slate) reproducibility of end-to-end latency
     table1b = between_run_consistency(base, "http_req_duration", "baseline", ["tier"],
                                       lambda k: _tier_label(k[0]))
@@ -432,7 +513,7 @@ def analyze_baseline(df, output_dir):
     # Table 3: DataFrame-construction share of measured computation time
     share_rows = []
     for t in order:
-        if t == "mock":
+        if t in ("mock", "calibration"):
             continue
         df_t = base[(base["metric"] == "python_dataframe_construction_time_ms") & (base["tier"] == t)]["value"]
         inf_t = base[(base["metric"] == "python_model_inference_time_ms") & (base["tier"] == t)]["value"]
@@ -464,7 +545,7 @@ def analyze_baseline(df, output_dir):
                label="tab:baseline-mannwhitney")
 
     # Figure 1: stacked bar of Python-side decomposition, AI tiers only
-    ai_order = [t for t in order if t != "mock"]
+    ai_order = [t for t in order if t not in ("mock", "calibration")]
     if ai_order:
         stages = [
             ("python_parsing_time_ms", "Request Parsing"),
@@ -560,6 +641,15 @@ def analyze_scan(df, output_dir):
                        "error thresholds.",
                label="tab:scan-error-rates")
     error_rate_lookup = dict(zip(table4c.get("Group", []), table4c.get("Error Rate (%)", [])))
+
+    # Table 4d: client-side (k6) contention diagnostic, most relevant at the top of the concurrency sweep
+    table4d = client_diagnostics_summary(scan, "scan", ["tier", "vus"],
+                                         lambda k: f"{_tier_label(k[0])} @ VUS={int(k[1])}")
+    save_table(table4d, "table4d_scan_client_diagnostics", output_dir,
+               caption="k6-side http_req_blocked per (tier, concurrency) cell -- a diagnostic for "
+                       "client-side connection contention, checked before a throughput plateau at "
+                       "high VUS is attributed to server-side capacity.",
+               label="tab:scan-client-diagnostics")
 
     rows = []
     for t in order:
@@ -663,7 +753,7 @@ def analyze_scan(df, output_dir):
     save_figure(fig, "figure4_throughput_vs_concurrency", output_dir)
 
     # Figure 5: compute decomposition under load, heaviest tier only
-    heaviest = "28" if "28" in order else next((t for t in reversed(order) if t != "mock"), None)
+    heaviest = "28" if "28" in order else next((t for t in reversed(order) if t not in ("mock", "calibration")), None)
     if heaviest:
         stages = [
             ("python_dataframe_construction_time_ms", "DataFrame Construction"),
@@ -702,6 +792,7 @@ def main():
     df = load_results(args.results_dir)
     print(f"[*] Loaded {len(df)} metric points from {df['source_file'].nunique()} file(s).")
 
+    analyze_warmup(df, args.output_dir)
     analyze_baseline(df, args.output_dir)
     analyze_scan(df, args.output_dir)
 

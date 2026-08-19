@@ -70,6 +70,10 @@ public class TransactionService {
             case "DISTRIBUTED_MOCK_GATEWAY":
                 endpoint = "/predict/mock";
                 break;
+            case "DISTRIBUTED_CALIBRATION_ONLY":
+                // Zero business logic on the Python side; isolates instrumentation overhead.
+                endpoint = "/predict/calibrate";
+                break;
             default:
                 return Mono.error(new IllegalArgumentException("Invalid evaluation strategy topology provided: " + strategy));
         }

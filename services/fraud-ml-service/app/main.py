@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .model import model_registry
-from .routers import mock, predict
+from .routers import calibration, mock, predict
 
 
 class TimingMiddleware(BaseHTTPMiddleware):
@@ -37,3 +37,4 @@ def health():
 
 app.include_router(predict.router)
 app.include_router(mock.router)
+app.include_router(calibration.router)

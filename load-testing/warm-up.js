@@ -31,12 +31,13 @@ const SLOT_S = MAX_DURATION_S + 5;
 
 const TARGETS = {
   mock: { strategy: 'DISTRIBUTED_MOCK_GATEWAY', featureTier: null },
+  calibration: { strategy: 'DISTRIBUTED_CALIBRATION_ONLY', featureTier: null },
   v5: { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 5 },
   v10: { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 10 },
   v20: { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 20 },
   v28: { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 28 },
 };
-const ORDER = ['mock', 'v5', 'v10', 'v20', 'v28'];
+const ORDER = ['mock', 'calibration', 'v5', 'v10', 'v20', 'v28'];
 
 export const options = {
   scenarios: Object.fromEntries(
@@ -81,7 +82,7 @@ function sendWarmupRequest(key) {
 
   const params = {
     headers: { 'Content-Type': 'application/json' },
-    tags: { strategy: target.strategy, tier: key },
+    tags: { strategy: target.strategy, tier: key, phase: 'warmup' },
   };
 
   const res = http.post(BASE_URL, JSON.stringify(body), params);
@@ -95,6 +96,7 @@ function sendWarmupRequest(key) {
 // k6 scenarios select behavior via `exec`, so each target's dedicated
 // window runs its own isolated warm-up function.
 export function warm_mock() { sendWarmupRequest('mock'); }
+export function warm_calibration() { sendWarmupRequest('calibration'); }
 export function warm_v5() { sendWarmupRequest('v5'); }
 export function warm_v10() { sendWarmupRequest('v10'); }
 export function warm_v20() { sendWarmupRequest('v20'); }

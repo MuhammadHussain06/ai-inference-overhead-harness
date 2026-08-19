@@ -34,7 +34,7 @@ FAILURES_LOG="${RESULTS_DIR}/run_failures_log.txt"
 CPU_PIN_LOG="${RESULTS_DIR}/cpu_pin_check_log.txt"
 : > "$CPU_PIN_LOG"   # truncate/create fresh each suite run
 
-TARGETS=(mock 5 10 20 28)
+TARGETS=(mock calibration 5 10 20 28)
 CONCURRENCY_LEVELS=(1 2 4 8 16 32 64)
 BASELINE_ITERATIONS=500
 SCAN_ITERATIONS_PER_VU=100
@@ -87,6 +87,20 @@ capture_run_metadata() {
     total_mem_kb="unknown"
   fi
 
+  # Single snapshot at capture time, not a per-rep trace -- can flag a rep as
+  # suspect but can't catch mid-run throttling under sustained load.
+  local cpu_governor cpu_freq_khz
+  if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
+    cpu_governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")
+  else
+    cpu_governor="unknown (cpufreq not exposed on this host)"
+  fi
+  if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then
+    cpu_freq_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo "unknown")
+  else
+    cpu_freq_khz="unknown (cpufreq not exposed on this host)"
+  fi
+
   # Escape backslashes/quotes in free-text fields before embedding in JSON.
   json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
@@ -100,6 +114,8 @@ capture_run_metadata() {
   "git_dirty": "$(json_escape "$git_dirty")",
   "cpu_model": "$(json_escape "$cpu_model")",
   "cpu_count": "$(json_escape "$cpu_count")",
+  "cpu_governor_at_start": "$(json_escape "$cpu_governor")",
+  "cpu_freq_khz_at_start": "$(json_escape "$cpu_freq_khz")",
   "total_mem_kb": "$(json_escape "$total_mem_kb")",
   "suite_config": {
     "targets": [$(printf '"%s",' "${TARGETS[@]}" | sed 's/,$//')],
@@ -113,7 +129,7 @@ capture_run_metadata() {
 }
 EOF
 
-  echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} git=${git_commit:0:12}"
+  echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} governor=${cpu_governor} freq_khz=${cpu_freq_khz} git=${git_commit:0:12}"
 }
 
 # Verifies docker-compose.yml CPU pinning directly on running container cgroups rather
@@ -190,7 +206,7 @@ for rep in $(seq 1 "$REPS_BASELINE"); do
   wait_for_ready
   verify_cpu_pinning "baseline rep=${rep}"
   echo "[*] Warming up JIT / connection pools..."
-  k6 run warm-up.js
+  k6 run warm-up.js --out "json=${RESULTS_DIR}/warmup_baseline_rep${rep}.json"
   sleep "$COOLDOWN_S"
 
   # Independent per-rep shuffle of target order.
@@ -215,7 +231,7 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   wait_for_ready
   verify_cpu_pinning "scan rep=${rep}"
   echo "[*] Warming up JIT / connection pools..."
-  k6 run warm-up.js
+  k6 run warm-up.js --out "json=${RESULTS_DIR}/warmup_scan_rep${rep}.json"
   sleep "$COOLDOWN_S"
 
   # Randomizes target and concurrency order per rep (shuffled independently)
@@ -240,8 +256,10 @@ done
 
 echo "[+] Suite complete. Raw results in ${RESULTS_DIR}/"
 echo "    Per-rep cell order logged to ${ORDER_LOG}"
-echo "    Host/toolchain fingerprint logged to ${METADATA_FILE}"
+echo "    Host/toolchain fingerprint (incl. CPU governor/freq snapshot) logged to ${METADATA_FILE}"
 echo "    CPU pinning verification (per-rep cgroup check) logged to ${CPU_PIN_LOG}"
+echo "    Warm-up JSON output (for post-hoc convergence check) saved as warmup_{baseline,scan}_rep*.json"
+echo "    'calibration' target included alongside mock/5/10/20/28 -- isolates instrumentation overhead"
 if grep -q "EMPTY" "$CPU_PIN_LOG" 2>/dev/null; then
   echo "    [!] One or more reps showed an EMPTY cpuset -- see ${CPU_PIN_LOG} and ${FAILURES_LOG}"
 fi
