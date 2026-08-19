@@ -558,7 +558,7 @@ def analyze_baseline(df, output_dir):
         x_labels = [f"v{t}" for t in ai_order]
         for i, (metric, label) in enumerate(stages):
             vals = np.array([
-                base[(base["metric"] == metric) & (base["tier"] == t)]["value"].mean() or 0.0
+                base[(base["metric"] == metric) & (base["tier"] == t)]["value"].mean()
                 for t in ai_order
             ])
             vals = np.nan_to_num(vals)
@@ -764,7 +764,7 @@ def analyze_scan(df, output_dir):
         x_labels = [str(v) for v in levels]
         for i, (metric, label) in enumerate(stages):
             vals = np.array([
-                scan[(scan["metric"] == metric) & (scan["tier"] == heaviest) & (scan["vus"] == vus)]["value"].mean() or 0.0
+                scan[(scan["metric"] == metric) & (scan["tier"] == heaviest) & (scan["vus"] == vus)]["value"].mean()
                 for vus in levels
             ])
             vals = np.nan_to_num(vals)

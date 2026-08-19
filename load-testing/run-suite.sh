@@ -132,11 +132,19 @@ EOF
   echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} governor=${cpu_governor} freq_khz=${cpu_freq_khz} git=${git_commit:0:12}"
 }
 
-# Verifies docker-compose.yml CPU pinning directly on running container cgroups rather
-# than assuming the cpuset directive was honored, logging per rep to catch quiet driver overrides.
+# Reads the cpuset a container was actually assigned by the kernel, not what
+# it was configured with. Tries cgroup v2 first, falls back to v1.
+read_live_cpuset() {
+  local container="$1"
+  docker exec "$container" sh -c \
+    'cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || cat /sys/fs/cgroup/cpuset/cpuset.cpus 2>/dev/null' \
+    2>/dev/null || echo ""
+}
+
+
 verify_cpu_pinning() {
   local label="$1"
-  local py_container java_container py_cpuset java_cpuset
+  local py_container java_container
   py_container=$(docker compose -f "$COMPOSE_FILE" ps -q python-service 2>/dev/null || echo "")
   java_container=$(docker compose -f "$COMPOSE_FILE" ps -q transaction-service 2>/dev/null || echo "")
 
@@ -145,16 +153,24 @@ verify_cpu_pinning() {
     return
   fi
 
-  py_cpuset=$(docker inspect --format '{{.HostConfig.CpusetCpus}}' "$py_container" 2>/dev/null || echo "")
-  java_cpuset=$(docker inspect --format '{{.HostConfig.CpusetCpus}}' "$java_container" 2>/dev/null || echo "")
+  local py_requested java_requested py_live java_live
+  py_requested=$(docker inspect --format '{{.HostConfig.CpusetCpus}}' "$py_container" 2>/dev/null || echo "")
+  java_requested=$(docker inspect --format '{{.HostConfig.CpusetCpus}}' "$java_container" 2>/dev/null || echo "")
+  py_live=$(read_live_cpuset "$py_container")
+  java_live=$(read_live_cpuset "$java_container")
 
-  echo "  [cpu-pin] ${label}: python-service=cpuset(${py_cpuset:-EMPTY}) transaction-service=cpuset(${java_cpuset:-EMPTY})"
-  echo "cpu_pin_check label=${label} python_cpuset=${py_cpuset:-EMPTY} java_cpuset=${java_cpuset:-EMPTY}" >> "$CPU_PIN_LOG"
+  echo "  [cpu-pin] ${label}: python-service requested(${py_requested:-EMPTY}) live(${py_live:-EMPTY}) |" \
+       "transaction-service requested(${java_requested:-EMPTY}) live(${java_live:-EMPTY})"
+  echo "cpu_pin_check label=${label} python_requested=${py_requested:-EMPTY} python_live=${py_live:-EMPTY}" \
+       "java_requested=${java_requested:-EMPTY} java_live=${java_live:-EMPTY}" >> "$CPU_PIN_LOG"
 
-  if [ -z "$py_cpuset" ] || [ -z "$java_cpuset" ]; then
-    echo "  [!] [cpu-pin] one or both containers report an EMPTY cpuset for ${label} -- pinning may not be" \
-         "honored on this Docker/cgroup driver version; results from this rep should not be assumed" \
-         "core-isolated. See README CPU pinning caveat." | tee -a "$FAILURES_LOG"
+  if [ -z "$py_live" ] || [ -z "$java_live" ]; then
+    echo "  [!] [cpu-pin] could not read a live cgroup cpuset for ${label} -- treat this rep as" \
+         "unverified. See README CPU pinning caveat." | tee -a "$FAILURES_LOG"
+  elif [ "$py_live" != "$py_requested" ] || [ "$java_live" != "$java_requested" ]; then
+    echo "  [!] [cpu-pin] live cgroup cpuset does not match the requested cpuset for ${label} --" \
+         "pinning was not honored on this Docker/cgroup driver version; results from this rep should" \
+         "not be assumed core-isolated. See README CPU pinning caveat." | tee -a "$FAILURES_LOG"
   fi
 }
 
