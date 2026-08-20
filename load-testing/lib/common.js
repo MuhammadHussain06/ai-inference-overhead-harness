@@ -27,6 +27,9 @@ const modelInferenceTime = new Trend('python_model_inference_time_ms', true);
 const serializationTime = new Trend('python_serialization_time_ms', true);
 const totalPythonTime = new Trend('python_total_time_ms', true);
 
+// Java-side estimate: aiCallRoundTripTimeMs minus Python's own totalPythonExecutionTimeMs.
+const javaEstimatedNetworkOverhead = new Trend('java_estimated_network_overhead_ms', true);
+
 // Distinguishes application-level HTTP errors (non-200 responses like 400s/500s) from network-level
 // timeouts (no response received, status 0) to report structural outages separately from application rejections.
 const requestSuccess = new Rate('request_success');
@@ -80,6 +83,9 @@ export function sendTransaction(target, extraTags) {
       modelInferenceTime.add(telemetry.modelInferenceTimeMs, tags);
       serializationTime.add(telemetry.serializationResponseTimeMs, tags);
       totalPythonTime.add(telemetry.totalPythonExecutionTimeMs, tags);
+    }
+    if (responseBody.estimatedNetworkOverheadMs !== undefined) {
+      javaEstimatedNetworkOverhead.add(responseBody.estimatedNetworkOverheadMs, tags);
     }
   } else if (res.status === 0) {
     // status === 0: no response was received (connection reset, DNS/TLS

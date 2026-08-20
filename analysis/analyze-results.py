@@ -37,6 +37,11 @@ PYTHON_TELEMETRY_METRICS = [
     "python_total_time_ms",
 ]
 
+# Java-side estimate: aiCallRoundTripTimeMs minus Python's own totalPythonExecutionTimeMs.
+# Not part of PYTHON_TELEMETRY_METRICS (different side of the wire, different meaning) but
+# reported alongside it in Table 2 since it fills out the same latency decomposition.
+JAVA_NETWORK_OVERHEAD_METRIC = "java_estimated_network_overhead_ms"
+
 COLOR_CYCLE = ['#2b5c8f', '#c0392b', '#27ae60', '#8e44ad', '#e67e22', '#16a085']
 
 
@@ -442,7 +447,7 @@ def analyze_warmup(df, output_dir, window_size=100):
     save_table(table, "table0_warmup_convergence_check", output_dir,
                caption=f"Per-rep, per-target warm-up convergence check: P50 latency in the first vs. "
                        f"last {window_size} requests of each target's warm-up window. Large drift "
-                       f"suggests WARMUP_ITERATIONS_PER_TARGET may need to be increased for that target.",
+                       f"indicates the warm-up period was insufficient to reach steady state for that target.",
                label="tab:warmup-convergence")
 
 
@@ -497,17 +502,24 @@ def analyze_baseline(df, output_dir):
                        "clean-slate repetitions of the baseline phase.",
                label="tab:baseline-between-run")
 
-    # Table 2: mean Python-side decomposition per target (pooled across reps)
+    # Table 2: mean Python-side decomposition per target (pooled across reps), plus the
+    # Java-side estimated network overhead alongside it (see JAVA_NETWORK_OVERHEAD_METRIC).
     decomp_rows = []
     for t in order:
         row = {"Group": _tier_label(t)}
         for metric in PYTHON_TELEMETRY_METRICS:
             vals = base[(base["metric"] == metric) & (base["tier"] == t)]["value"]
             row[metric] = round(float(vals.mean()), 3) if not vals.empty else np.nan
+        net_vals = base[(base["metric"] == JAVA_NETWORK_OVERHEAD_METRIC) & (base["tier"] == t)]["value"]
+        row[JAVA_NETWORK_OVERHEAD_METRIC] = round(float(net_vals.mean()), 3) if not net_vals.empty else np.nan
         decomp_rows.append(row)
     table2 = pd.DataFrame(decomp_rows)
     save_table(table2, "table2_baseline_python_decomposition_mean_ms", output_dir,
-               caption="Mean Python-side latency decomposition (ms) by tier at VUS=1, pooled across all repetitions.",
+               caption="Mean Python-side latency decomposition (ms) by tier at VUS=1, pooled across "
+                       "repetitions, with the estimated network overhead (round-trip time minus "
+                       "Python execution time) shown alongside. Occasional small negative values in "
+                       "that column reflect estimation noise in the serialization-time measurement, "
+                       "not a real negative transit time.",
                label="tab:baseline-decomp")
 
     # Table 3: DataFrame-construction share of measured computation time
