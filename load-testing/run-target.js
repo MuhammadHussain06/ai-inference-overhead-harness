@@ -3,7 +3,7 @@ import { sendTransaction, TARGETS } from './lib/common.js';
 // Single-target k6 script executed per (target, concurrency, rep) cell.
 //
 // Env Vars:
-//   TARGET            : Endpoint key ('mock' | '5' | '10' | '20' | '28') [Required]
+//   TARGET            : Endpoint key ('mock' | 'calibration' | '5' | '10' | '20' | '28') [Required]
 //   VUS               : Concurrent virtual users [Required]
 //   ITERATIONS_PER_VU : Requests per VU; used by the concurrency scan to keep
 //                       tail-percentile sample size constant as VUS varies [Optional]

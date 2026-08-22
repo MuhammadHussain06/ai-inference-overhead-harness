@@ -83,9 +83,13 @@ public class ResponseDto {
 
     public static class PythonTelemetryDto {
         private double parsingRequestTimeMs = 0.0;
+        private double threadDispatchTimeMs = 0.0;
         private double computationTimeMs = 0.0;
         private double dataframeConstructionTimeMs = 0.0;
         private double modelInferenceTimeMs = 0.0;
+        // Time the worker thread spends off-CPU during computation (GIL
+        // contention or OS scheduling). 0.0 for mock/calibration strategies.
+        private double computeStallMs = 0.0;
         private double serializationResponseTimeMs = 0.0;
         private double totalPythonExecutionTimeMs = 0.0;
 
@@ -93,6 +97,9 @@ public class ResponseDto {
 
         public double getParsingRequestTimeMs() { return parsingRequestTimeMs; }
         public void setParsingRequestTimeMs(double parsingRequestTimeMs) { this.parsingRequestTimeMs = parsingRequestTimeMs; }
+
+        public double getThreadDispatchTimeMs() { return threadDispatchTimeMs; }
+        public void setThreadDispatchTimeMs(double threadDispatchTimeMs) { this.threadDispatchTimeMs = threadDispatchTimeMs; }
 
         public double getComputationTimeMs() { return computationTimeMs; }
         public void setComputationTimeMs(double computationTimeMs) { this.computationTimeMs = computationTimeMs; }
@@ -102,6 +109,9 @@ public class ResponseDto {
 
         public double getModelInferenceTimeMs() { return modelInferenceTimeMs; }
         public void setModelInferenceTimeMs(double modelInferenceTimeMs) { this.modelInferenceTimeMs = modelInferenceTimeMs; }
+
+        public double getComputeStallMs() { return computeStallMs; }
+        public void setComputeStallMs(double computeStallMs) { this.computeStallMs = computeStallMs; }
 
         public double getSerializationResponseTimeMs() { return serializationResponseTimeMs; }
         public void setSerializationResponseTimeMs(double serializationResponseTimeMs) { this.serializationResponseTimeMs = serializationResponseTimeMs; }

@@ -1,5 +1,6 @@
 package com.audit.transaction_service.dto;
 
+import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import java.math.BigDecimal;
@@ -22,6 +23,7 @@ public class RequestDto {
     private String accountId;
 
     @NotNull(message = "amount is required")
+    @DecimalMin(value = "0.0", inclusive = false, message = "amount must be greater than 0")
     private BigDecimal amount;
 
     @NotNull(message = "transactionType is required")
@@ -29,7 +31,6 @@ public class RequestDto {
 
     @NotNull(message = "features is required")
     private List<Double> features;
-
 
     @NotNull(message = "strategy is required")
     private String strategy;

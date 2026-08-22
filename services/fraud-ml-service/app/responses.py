@@ -6,12 +6,15 @@ from .schemas import PythonTelemetryDto, TransactionResponse
 
 
 def build_response(payload, is_fraud, risk_score, parsing_time_ms, comp_time_ms, start_total,
-                   dataframe_construction_time_ms=0.0, model_inference_time_ms=0.0):
+                   dataframe_construction_time_ms=0.0, model_inference_time_ms=0.0,
+                   thread_dispatch_time_ms=0.0, compute_stall_time_ms=0.0):
     telemetry = PythonTelemetryDto(
         parsingRequestTimeMs=parsing_time_ms,
+        threadDispatchTimeMs=thread_dispatch_time_ms,
         computationTimeMs=comp_time_ms,
         dataframeConstructionTimeMs=dataframe_construction_time_ms,
         modelInferenceTimeMs=model_inference_time_ms,
+        computeStallMs=compute_stall_time_ms,
     )
 
     response_model = TransactionResponse(

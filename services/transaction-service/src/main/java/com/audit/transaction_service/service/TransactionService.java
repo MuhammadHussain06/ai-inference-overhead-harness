@@ -16,8 +16,8 @@ import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.Mono;
 
-import java.math.BigDecimal;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -25,6 +25,8 @@ import java.util.stream.Collectors;
 @Service
 public class TransactionService {
 
+    // MUST match FEATURE_TIERS in Python service (app/config.py).
+   // Lacks auto-sync; mismatch causes premature proxy rejection of valid tiers.
     private static final Set<Integer> VALID_FEATURE_TIERS = Set.of(5, 10, 20, 28);
 
     private final TransactionRepository transactionRepository;
@@ -41,14 +43,11 @@ public class TransactionService {
     public Mono<ResponseDto> processTransaction(RequestDto request, long requestStartNanos) {
         long overallStartTime = requestStartNanos;
 
-        if (request == null || request.getAmount() == null || request.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
-            String txIdStr = (request != null && request.getTransactionId() != null) ? request.getTransactionId() : "UNKNOWN";
-            log.error("[Transaction ID: {}] Rejecting processing: Payload is null or amount <= 0.", txIdStr);
-            return Mono.error(new IllegalArgumentException(
-                    String.format("[Transaction ID: %s] Transaction payload and amount must be present and > 0.", txIdStr)
-            ));
-        }
-        String strategy = request.getStrategy().toUpperCase();
+        // request, amount (presence + > 0), and strategy (presence) are already
+        // guaranteed by @Valid + the RequestDto bean-validation annotations by
+        // the time this method runs -- WebFlux validates before dispatch, so
+        // there's no need to re-check them here.
+        String strategy = request.getStrategy().toUpperCase(Locale.ROOT);
         String endpoint;
         Integer featureTier = null;
 

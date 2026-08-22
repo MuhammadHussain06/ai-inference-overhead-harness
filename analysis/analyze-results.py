@@ -30,9 +30,11 @@ CONCURRENCY_ORDER = [1, 2, 4, 8, 16, 32, 64]
 
 PYTHON_TELEMETRY_METRICS = [
     "python_parsing_time_ms",
+    "python_thread_dispatch_time_ms",
     "python_computation_time_ms",
     "python_dataframe_construction_time_ms",
     "python_model_inference_time_ms",
+    "python_compute_stall_time_ms",
     "python_serialization_time_ms",
     "python_total_time_ms",
 ]
@@ -561,8 +563,10 @@ def analyze_baseline(df, output_dir):
     if ai_order:
         stages = [
             ("python_parsing_time_ms", "Request Parsing"),
+            ("python_thread_dispatch_time_ms", "Thread Dispatch"),
             ("python_dataframe_construction_time_ms", "DataFrame Construction"),
             ("python_model_inference_time_ms", "Model Inference"),
+            ("python_compute_stall_time_ms", "Compute Stall (GIL/scheduling)"),
             ("python_serialization_time_ms", "Response Serialization"),
         ]
         fig, ax = plt.subplots(figsize=(7, 4.5), dpi=300)
@@ -764,12 +768,15 @@ def analyze_scan(df, output_dir):
     ax.grid(True, which="both", linestyle="--", alpha=0.4)
     save_figure(fig, "figure4_throughput_vs_concurrency", output_dir)
 
-    # Figure 5: compute decomposition under load, heaviest tier only
+    # Figure 5: Compute decomposition under load for feature tier 28. Isolate thread-pool
+    # queueing (Thread Dispatch) from invariant steps (DataFrame Construction, Inference).
     heaviest = "28" if "28" in order else next((t for t in reversed(order) if t not in ("mock", "calibration")), None)
     if heaviest:
         stages = [
+            ("python_thread_dispatch_time_ms", "Thread Dispatch"),
             ("python_dataframe_construction_time_ms", "DataFrame Construction"),
             ("python_model_inference_time_ms", "Model Inference"),
+            ("python_compute_stall_time_ms", "Compute Stall (GIL/scheduling)"),
         ]
         fig, ax = plt.subplots(figsize=(7, 4.5), dpi=300)
         bottoms = np.zeros(len(levels))

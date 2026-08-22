@@ -8,7 +8,6 @@ public class AiRequestDto {
 
     private double amount;
 
-
     private List<Double> features;
 
     public AiRequestDto() {}

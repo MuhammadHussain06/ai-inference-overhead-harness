@@ -21,9 +21,13 @@ export const TARGETS = {
 http.setResponseCallback(http.expectedStatuses(200));
 
 const parsingTime = new Trend('python_parsing_time_ms', true);
+const threadDispatchTime = new Trend('python_thread_dispatch_time_ms', true);
 const computationTime = new Trend('python_computation_time_ms', true);
 const dataframeConstructionTime = new Trend('python_dataframe_construction_time_ms', true);
 const modelInferenceTime = new Trend('python_model_inference_time_ms', true);
+// Server-side thread off-CPU time during computation (GIL/scheduling stalls),
+// distinct from threadDispatchTime (pre-execution queueing).
+const computeStallTime = new Trend('python_compute_stall_time_ms', true);
 const serializationTime = new Trend('python_serialization_time_ms', true);
 const totalPythonTime = new Trend('python_total_time_ms', true);
 
@@ -36,7 +40,7 @@ const requestSuccess = new Rate('request_success');
 const requestHttpError = new Counter('request_http_error');
 const requestTimeoutError = new Counter('request_timeout_error');
 
-// Sends a static V1..V28 payload; /predict/v{n} endpoints slice required features.
+// Generates a fixed-length (28) randomized payload; /predict/v{n} endpoints slice required features.
 export function randomFeatures(n) {
   const arr = [];
   for (let i = 0; i < n; i++) {
@@ -78,9 +82,11 @@ export function sendTransaction(target, extraTags) {
     const telemetry = responseBody.pythonTelemetry;
     if (telemetry) {
       parsingTime.add(telemetry.parsingRequestTimeMs, tags);
+      threadDispatchTime.add(telemetry.threadDispatchTimeMs, tags);
       computationTime.add(telemetry.computationTimeMs, tags);
       dataframeConstructionTime.add(telemetry.dataframeConstructionTimeMs, tags);
       modelInferenceTime.add(telemetry.modelInferenceTimeMs, tags);
+      computeStallTime.add(telemetry.computeStallMs, tags);
       serializationTime.add(telemetry.serializationResponseTimeMs, tags);
       totalPythonTime.add(telemetry.totalPythonExecutionTimeMs, tags);
     }

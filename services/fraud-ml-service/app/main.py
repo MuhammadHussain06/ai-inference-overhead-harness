@@ -9,6 +9,8 @@ from .routers import calibration, mock, predict
 
 
 class TimingMiddleware(BaseHTTPMiddleware):
+    # request.state.start_time marks early event-loop entry, allowing async routes to
+    # isolate thread-dispatch overhead from end-to-end Python latency metrics.
     async def dispatch(self, request, call_next):
         request.state.start_time = time.perf_counter()
         return await call_next(request)

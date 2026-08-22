@@ -15,13 +15,23 @@ set -euo pipefail
 #                   against the running containers' actual cgroup cpuset,
 #                   logged to cpu_pin_check_log.txt -- the compose file's
 #                   `cpuset` directive states what was requested, this states
-#                   what was actually applied.
+#                   what was actually applied. The JVM's own view of its
+#                   available processors (which sizes Netty's event-loop
+#                   thread count) is checked alongside it -- cpuset pinning
+#                   being honored doesn't guarantee the JVM detected it.
 #
 # Suite Strategy:
 #   - Clean-slate stack restart per rep; sequential cell runs within reps.
 #   - Rep Counts: E1 (baseline) = REPS_BASELINE | E2 (concurrency scan) = REPS_SCAN.
 #
-# Prerequisite: Set APP_DB_SAVE_ENABLED=false in ../docker-compose.yml.
+# Requires APP_DB_SAVE_ENABLED=false, which docker-compose.yml already sets
+# for the transaction-service container -- this script doesn't set it,
+# it just depends on it being in place.
+
+# Run from wherever this script lives, so the relative paths below (and the
+# documented `cd load-testing && ./run-suite.sh` usage) hold regardless of
+# the caller's working directory.
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
 COMPOSE_FILE="../docker-compose.yml"
 RESULTS_DIR="../results"
@@ -40,7 +50,9 @@ BASELINE_ITERATIONS=500
 SCAN_ITERATIONS_PER_VU=100
 COOLDOWN_S=10
 REPS_BASELINE=5
-REPS_SCAN=3
+# n=5 vs 5 keeps the minimum achievable two-sided Mann-Whitney p-value
+# (0.0079) below alpha=0.05, matching REPS_BASELINE's power for table5/table6.
+REPS_SCAN=5
 
 
 capture_run_metadata() {
@@ -142,6 +154,22 @@ read_live_cpuset() {
 }
 
 
+# Aborts the suite: a rep with unverified CPU pinning must not produce k6
+# output that gets pooled with clean reps. Tears the stack down and exits
+# before that rep's k6 cells run.
+abort_pin_failure() {
+  local label="$1" reason="$2"
+  echo "" | tee -a "$FAILURES_LOG"
+  echo "  [FATAL] [cpu-pin] ${label}: ${reason}" | tee -a "$FAILURES_LOG"
+  echo "  [FATAL] Aborting suite -- CPU pinning could not be verified for this rep." | tee -a "$FAILURES_LOG"
+  echo "  [FATAL] No results were written for this rep. Fix the host/Docker cgroup" | tee -a "$FAILURES_LOG"
+  echo "  [FATAL] setup (see README CPU pinning caveat) and re-run run-suite.sh from" | tee -a "$FAILURES_LOG"
+  echo "  [FATAL] the beginning -- prior reps already on disk in ${RESULTS_DIR} were" | tee -a "$FAILURES_LOG"
+  echo "  [FATAL] pin-verified and can be kept, but this suite invocation is incomplete." | tee -a "$FAILURES_LOG"
+  docker compose -f "$COMPOSE_FILE" down || true
+  exit 1
+}
+
 verify_cpu_pinning() {
   local label="$1"
   local py_container java_container
@@ -149,8 +177,7 @@ verify_cpu_pinning() {
   java_container=$(docker compose -f "$COMPOSE_FILE" ps -q transaction-service 2>/dev/null || echo "")
 
   if [ -z "$py_container" ] || [ -z "$java_container" ]; then
-    echo "  [!] [cpu-pin] could not resolve container IDs -- skipping verification for ${label}." | tee -a "$FAILURES_LOG"
-    return
+    abort_pin_failure "$label" "could not resolve container IDs -- cannot verify pinning at all."
   fi
 
   local py_requested java_requested py_live java_live
@@ -165,13 +192,32 @@ verify_cpu_pinning() {
        "java_requested=${java_requested:-EMPTY} java_live=${java_live:-EMPTY}" >> "$CPU_PIN_LOG"
 
   if [ -z "$py_live" ] || [ -z "$java_live" ]; then
-    echo "  [!] [cpu-pin] could not read a live cgroup cpuset for ${label} -- treat this rep as" \
-         "unverified. See README CPU pinning caveat." | tee -a "$FAILURES_LOG"
+    abort_pin_failure "$label" "could not read a live cgroup cpuset -- pinning is unverifiable on this host."
   elif [ "$py_live" != "$py_requested" ] || [ "$java_live" != "$java_requested" ]; then
-    echo "  [!] [cpu-pin] live cgroup cpuset does not match the requested cpuset for ${label} --" \
-         "pinning was not honored on this Docker/cgroup driver version; results from this rep should" \
-         "not be assumed core-isolated. See README CPU pinning caveat." | tee -a "$FAILURES_LOG"
+    abort_pin_failure "$label" "live cgroup cpuset (python=${py_live} java=${java_live}) does not match" \
+      "the requested cpuset (python=${py_requested} java=${java_requested}) -- pinning was not honored" \
+      "on this Docker/cgroup driver version."
   fi
+
+ # Verify the JVM correctly detected cpuset limits, as Netty sizes event-loop
+ # threads using Runtime.availableProcessors() based on cgroup auto-detection.
+  local java_cpus
+  java_cpus=$(docker exec "$java_container" sh -c \
+    'java -XshowSettings:system -version 2>&1 | grep -i "available processors" | grep -o "[0-9]*"' \
+    2>/dev/null || echo "")
+  echo "  [cpu-pin] ${label}: JVM-reported available processors(${java_cpus:-EMPTY})"
+  echo "cpu_pin_check label=${label} jvm_available_processors=${java_cpus:-EMPTY}" >> "$CPU_PIN_LOG"
+
+  if [ -z "$java_cpus" ]; then
+    abort_pin_failure "$label" "could not read JVM-reported available processors -- Netty event-loop" \
+      "sizing is unverifiable for this rep."
+  elif [ "$java_cpus" != "3" ]; then
+    abort_pin_failure "$label" "JVM reports ${java_cpus} available processors, expected 3 -- Netty's" \
+      "event-loop thread count (availableProcessors() * 2 by default) would be sized off the wrong" \
+      "core count for this rep."
+  fi
+
+  echo "  [cpu-pin] ${label}: OK -- pinning verified, proceeding."
 }
 
 restart_stack() {
