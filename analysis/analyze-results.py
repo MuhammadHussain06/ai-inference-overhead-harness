@@ -194,6 +194,42 @@ def error_summary(df, phase, group_cols, label_fn):
     return pd.DataFrame(rows)
 
 
+def crosscheck_error_counters(df, phase, group_cols, label_fn, table_from_duration):
+    """Cross-checks error_summary's http_req_duration-derived counts against k6's
+    independent request_http_error/request_timeout_error counters."""
+    counter_metrics = {
+        "request_http_error": "HTTP Errors (non-200 response)",
+        "request_timeout_error": "Timeouts / Network Errors (no response)",
+    }
+    sub = df[(df["phase"] == phase) & df["metric"].isin(counter_metrics.keys()) & df["value"].notna()].copy()
+    if sub.empty or table_from_duration is None or table_from_duration.empty:
+        return
+
+    mismatches = []
+    for metric, col in counter_metrics.items():
+        counted = sub[sub["metric"] == metric].groupby(group_cols)["value"].sum()
+        for key, group_total in counted.items():
+            key_tuple = key if isinstance(key, tuple) else (key,)
+            label = label_fn(key_tuple)
+            row = table_from_duration[table_from_duration["Group"] == label]
+            if row.empty:
+                mismatches.append(f"{label}: no matching http_req_duration-derived row for {metric}")
+                continue
+            derived = row.iloc[0][col]
+            if int(group_total) != int(derived):
+                mismatches.append(
+                    f"{label}: {metric} counter={int(group_total)} vs "
+                    f"http_req_duration-derived '{col}'={int(derived)}"
+                )
+
+    if mismatches:
+        print(f"[!] Error-count cross-check MISMATCH in phase='{phase}':")
+        for m in mismatches:
+            print(f"    - {m}")
+    else:
+        print(f"[+] Error-count cross-check OK for phase='{phase}'.")
+
+
 def _throughput_reqs_per_s(subset_df):
 
     times = subset_df["time"].dropna()
@@ -488,6 +524,7 @@ def analyze_baseline(df, output_dir):
                        "HTTP errors received a non-200 response; timeouts/network errors received no response "
                        "at all. Table 1's latency statistics are computed on the 'Successful (200)' subset only.",
                label="tab:baseline-error-rates")
+    crosscheck_error_counters(df, "baseline", ["tier"], lambda k: _tier_label(k[0]), table1c)
 
     # Table 1d: client-side (k6) contention diagnostic
     table1d = client_diagnostics_summary(base, "baseline", ["tier"], lambda k: _tier_label(k[0]))
@@ -656,6 +693,8 @@ def analyze_scan(df, output_dir):
                        "'Successful (200)' subset only -- no run was truncated or excluded based on "
                        "error thresholds.",
                label="tab:scan-error-rates")
+    crosscheck_error_counters(df, "scan", ["tier", "vus"],
+                              lambda k: f"{_tier_label(k[0])} @ VUS={int(k[1])}", table4c)
     error_rate_lookup = dict(zip(table4c.get("Group", []), table4c.get("Error Rate (%)", [])))
 
     # Table 4d: client-side (k6) contention diagnostic, most relevant at the top of the concurrency sweep

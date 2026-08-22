@@ -26,7 +26,7 @@ import java.util.stream.Collectors;
 public class TransactionService {
 
     // MUST match FEATURE_TIERS in Python service (app/config.py).
-   // Lacks auto-sync; mismatch causes premature proxy rejection of valid tiers.
+    // Lacks auto-sync; mismatch causes premature proxy rejection of valid tiers.
     private static final Set<Integer> VALID_FEATURE_TIERS = Set.of(5, 10, 20, 28);
 
     private final TransactionRepository transactionRepository;
@@ -111,7 +111,14 @@ public class TransactionService {
                     log.error("[Transaction ID: {}] Failed to communicate with Python endpoint {}: {}",
                             request.getTransactionId(), endpoint, e.getMessage());
 
-                    HttpStatus upstreamStatus = HttpStatus.BAD_GATEWAY;
+                    // timeout -> 504, distinct from generic unreachable -> 502
+                    boolean isTimeout = e instanceof java.util.concurrent.TimeoutException
+                            || e instanceof io.netty.handler.timeout.ReadTimeoutException
+                            || (e.getCause() != null
+                            && (e.getCause() instanceof java.util.concurrent.TimeoutException
+                            || e.getCause() instanceof io.netty.handler.timeout.ReadTimeoutException));
+
+                    HttpStatus upstreamStatus = isTimeout ? HttpStatus.GATEWAY_TIMEOUT : HttpStatus.BAD_GATEWAY;
                     if (e instanceof WebClientResponseException wcre) {
                         HttpStatusCode sc = wcre.getStatusCode();
                         if (sc.is4xxClientError()) {

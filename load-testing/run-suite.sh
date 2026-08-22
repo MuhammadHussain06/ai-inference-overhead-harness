@@ -3,35 +3,28 @@ set -euo pipefail
 
 # Orchestrates empirical load tests across clean-slate stack restarts.
 #
-# Variance & Isolation:
-#   - WITHIN-RUN  : Request noise in a single k6 run.
-#   - BETWEEN-RUN : Session effects (JIT, GC, OS state) isolated via stack restarts.
-#   - SHUFFLING   : Target/concurrency order randomized per rep to prevent drift.
-#                   Execution sequence logged to run_order_log.txt.
-#   - PROVENANCE  : Host/toolchain fingerprint captured once per suite run to
-#                   run_metadata.json, so results are traceable to the exact
-#                   environment that produced them.
-#   - CPU PINNING : Verified (not assumed) once per rep via `docker inspect`
-#                   against the running containers' actual cgroup cpuset,
-#                   logged to cpu_pin_check_log.txt -- the compose file's
-#                   `cpuset` directive states what was requested, this states
-#                   what was actually applied. The JVM's own view of its
-#                   available processors (which sizes Netty's event-loop
-#                   thread count) is checked alongside it -- cpuset pinning
-#                   being honored doesn't guarantee the JVM detected it.
+# Isolation & Controls:
+#   - Isolates session noise (JIT, GC, OS) via per-rep stack restarts.
+#   - Randomizes execution order per rep to prevent drift (logged to run_order_log.txt).
+#   - Captures system provenance to run_metadata.json for traceability.
+#   - Verifies runtime container cgroup cpusets and JVM thread-pool detection via
+#     `docker inspect` per rep (logged to cpu_pin_check_log.txt).
 #
-# Suite Strategy:
-#   - Clean-slate stack restart per rep; sequential cell runs within reps.
-#   - Rep Counts: E1 (baseline) = REPS_BASELINE | E2 (concurrency scan) = REPS_SCAN.
-#
-# Requires APP_DB_SAVE_ENABLED=false, which docker-compose.yml already sets
-# for the transaction-service container -- this script doesn't set it,
-# it just depends on it being in place.
+# Suite Execution:
+#   - Clean-slate stack restarts per rep; sequential cell runs within reps.
+#   - Rep counts: Baseline = REPS_BASELINE | Concurrency Scan = REPS_SCAN.
+#   - Depends on APP_DB_SAVE_ENABLED=false configured in docker-compose.yml.
 
-# Run from wherever this script lives, so the relative paths below (and the
-# documented `cd load-testing && ./run-suite.sh` usage) hold regardless of
-# the caller's working directory.
+# Anchor execution directory to the script's location for path stability.
 cd "$(dirname "${BASH_SOURCE[0]}")"
+
+# Preflight: fail fast before any containers are touched.
+for _req_cmd in docker curl shuf; do
+  if ! command -v "$_req_cmd" >/dev/null 2>&1; then
+    echo "[!] Required command not found: ${_req_cmd}. Aborting before touching any containers." >&2
+    exit 1
+  fi
+done
 
 COMPOSE_FILE="../docker-compose.yml"
 RESULTS_DIR="../results"
@@ -158,7 +151,8 @@ read_live_cpuset() {
 # output that gets pooled with clean reps. Tears the stack down and exits
 # before that rep's k6 cells run.
 abort_pin_failure() {
-  local label="$1" reason="$2"
+  local label="$1"; shift
+  local reason="$*"  # join remaining args -- callers pass the message across multiple lines
   echo "" | tee -a "$FAILURES_LOG"
   echo "  [FATAL] [cpu-pin] ${label}: ${reason}" | tee -a "$FAILURES_LOG"
   echo "  [FATAL] Aborting suite -- CPU pinning could not be verified for this rep." | tee -a "$FAILURES_LOG"

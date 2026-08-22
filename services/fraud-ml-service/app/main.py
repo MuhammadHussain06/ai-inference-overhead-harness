@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .model import model_registry
+from .responses import calibrate_serialization_estimate
 from .routers import calibration, mock, predict
 
 
@@ -20,6 +21,7 @@ class TimingMiddleware(BaseHTTPMiddleware):
 async def lifespan(app: FastAPI):
 
     model_registry.load_all()
+    calibrate_serialization_estimate()  # seed before serving traffic
     yield
     model_registry.clear()
 

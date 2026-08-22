@@ -48,6 +48,7 @@ class FraudMLTier:
             raise HTTPException(status_code=500, detail="Model not initialized.")
 
         start_comp = time.perf_counter()
+        cpu_start = time.thread_time()
         try:
             if len(payload.features) < self.n_features:
                 raise ValueError(
@@ -66,13 +67,20 @@ class FraudMLTier:
             model_inference_time_ms = (time.perf_counter() - start_infer) * 1000
 
             is_fraud = bool(risk_score >= settings.FRAUD_THRESHOLD)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid request: {e}")
+        except HTTPException:
+            raise
         except Exception as e:
-            raise HTTPException(
-                status_code=400, detail=f"Inference failed. Check data limits/type: {e}"
-            )
+            raise HTTPException(status_code=500, detail=f"Inference failed: {e}")  # server fault, not client error
 
         computation_time_ms = (time.perf_counter() - start_comp) * 1000
-        return is_fraud, risk_score, computation_time_ms, dataframe_construction_time_ms, model_inference_time_ms
+        # Off-CPU time during computation (GIL contention / OS scheduling), floored at 0.
+        cpu_time_ms = (time.thread_time() - cpu_start) * 1000
+        compute_stall_time_ms = max(0.0, computation_time_ms - cpu_time_ms)
+
+        return (is_fraud, risk_score, computation_time_ms, dataframe_construction_time_ms,
+                model_inference_time_ms, compute_stall_time_ms)
 
 
 class FraudModelRegistry:
