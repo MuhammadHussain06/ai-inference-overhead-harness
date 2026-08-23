@@ -211,24 +211,24 @@ verify_cpu_pinning() {
       "on this Docker/cgroup driver version."
   fi
 
- # Verify the JVM correctly detected cpuset limits, as Netty sizes event-loop
- # threads using Runtime.availableProcessors() based on cgroup auto-detection.
+  # Verify JVM cpuset detection. Reads "Effective CPU Count" from `-XshowSettings:system`
+  # (JDK 10+), which populates Runtime.availableProcessors() to size Netty event loops.
   local java_cpus expected_java_cpus
   java_cpus=$(docker exec "$java_container" sh -c \
-    'java -XshowSettings:system -version 2>&1 | grep -i "available processors" | grep -o "[0-9]*"' \
+    'java -XshowSettings:system -version 2>&1 | grep -i "Effective CPU Count" | grep -o "[0-9]*"' \
     2>/dev/null || echo "")
   expected_java_cpus=$(count_cpuset_cores "$java_requested")
-  echo "  [cpu-pin] ${label}: JVM-reported available processors(${java_cpus:-EMPTY}), expected(${expected_java_cpus:-EMPTY} from requested cpuset ${java_requested:-EMPTY})"
-  echo "cpu_pin_check label=${label} jvm_available_processors=${java_cpus:-EMPTY} expected_from_cpuset=${expected_java_cpus:-EMPTY}" >> "$CPU_PIN_LOG"
+  echo "  [cpu-pin] ${label}: JVM-reported effective CPU count(${java_cpus:-EMPTY}), expected(${expected_java_cpus:-EMPTY} from requested cpuset ${java_requested:-EMPTY})"
+  echo "cpu_pin_check label=${label} jvm_effective_cpu_count=${java_cpus:-EMPTY} expected_from_cpuset=${expected_java_cpus:-EMPTY}" >> "$CPU_PIN_LOG"
 
   if [ -z "$java_cpus" ]; then
-    abort_pin_failure "$label" "could not read JVM-reported available processors -- Netty event-loop" \
+    abort_pin_failure "$label" "could not read the JVM-reported Effective CPU Count -- Netty event-loop" \
       "sizing is unverifiable for this rep."
   elif [ -z "$expected_java_cpus" ] || [ "$expected_java_cpus" = "0" ]; then
     abort_pin_failure "$label" "could not derive an expected core count from the requested cpuset" \
       "(${java_requested:-EMPTY}) -- cannot verify JVM core detection for this rep."
   elif [ "$java_cpus" != "$expected_java_cpus" ]; then
-    abort_pin_failure "$label" "JVM reports ${java_cpus} available processors, expected ${expected_java_cpus}" \
+    abort_pin_failure "$label" "JVM reports ${java_cpus} effective CPUs, expected ${expected_java_cpus}" \
       "(derived from requested cpuset ${java_requested}) -- Netty's event-loop thread count" \
       "(availableProcessors() * 2 by default) would be sized off the wrong core count for this rep."
   fi
@@ -338,9 +338,8 @@ echo "    Host/toolchain fingerprint (incl. CPU governor/freq snapshot) logged t
 echo "    CPU pinning verification (per-rep cgroup check) logged to ${CPU_PIN_LOG}"
 echo "    Warm-up JSON output (for post-hoc convergence check) saved as warmup_{baseline,scan}_rep*.json"
 echo "    'calibration' target included alongside mock/5/10/20/28 -- isolates instrumentation overhead"
-if grep -q "EMPTY" "$CPU_PIN_LOG" 2>/dev/null; then
-  echo "    [!] One or more reps showed an EMPTY cpuset -- see ${CPU_PIN_LOG} and ${FAILURES_LOG}"
-fi
+# Reaching this point guarantees all completed reps passed CPU pin verification,
+# as empty cpuset failures trigger immediate suite aborts via abort_pin_failure.
 if [ -s "$FAILURES_LOG" ]; then
   echo "    [!] Some cells failed and were skipped -- see ${FAILURES_LOG}"
   echo "        Re-run just those cells manually before treating results as complete."

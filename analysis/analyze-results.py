@@ -533,8 +533,9 @@ def analyze_baseline(df, output_dir):
                        "connection contention, not a server-side latency measurement.",
                label="tab:baseline-client-diagnostics")
 
-    # Table 1b: between-run (clean-slate) reproducibility of end-to-end latency
-    table1b = between_run_consistency(base, "http_req_duration", "baseline", ["tier"],
+    # Table 1b: between-run (clean-slate) reproducibility of end-to-end latency.
+    # Uses e2e (status==200 only), matching Table 1 -- see Table 5 comment.
+    table1b = between_run_consistency(e2e, "http_req_duration", "baseline", ["tier"],
                                       lambda k: _tier_label(k[0]))
     save_table(table1b, "table1b_baseline_between_run_consistency", output_dir,
                caption="Between-run consistency of mean end-to-end latency across independent, "
@@ -586,8 +587,10 @@ def analyze_baseline(df, output_dir):
                        "(pooled across all repetitions).",
                label="tab:df-share")
 
-    # Table 5: significance between adjacent tiers (mock vs v5, v5 vs v10, ...)
-    table5 = pairwise_mannwhitney(base, "http_req_duration", "baseline", "tier", order, _tier_label)
+    # Table 5: significance between adjacent tiers (mock vs v5, v5 vs v10, ...).
+    # Uses e2e (status==200 only), consistent with Table 1/1b/2/3 above --
+    # timeouts/HTTP errors must not be mixed into a latency comparison.
+    table5 = pairwise_mannwhitney(e2e, "http_req_duration", "baseline", "tier", order, _tier_label)
     save_table(table5, "table5_baseline_adjacent_tier_significance", output_dir,
                caption="Mann-Whitney U test between adjacent feature-count tiers, end-to-end latency "
                        "at VUS=1. Tested on rep-level means (one independent observation per repetition) "
@@ -733,19 +736,21 @@ def analyze_scan(df, output_dir):
                        "between-run reproducibility and Table 4c for the full error/timeout breakdown).",
                label="tab:scan-summary-pooled")
 
-    # Table 4b: between-run consistency per (tier, concurrency) cell
-    table4b = between_run_consistency(scan, "http_req_duration", "scan", ["tier", "vus"],
+    # Table 4b: between-run consistency per (tier, concurrency) cell.
+    # Uses e2e (status==200 only), matching Table 4 -- see Table 5 comment.
+    table4b = between_run_consistency(e2e, "http_req_duration", "scan", ["tier", "vus"],
                                       lambda k: f"{_tier_label(k[0])} @ VUS={int(k[1])}")
     save_table(table4b, "table4b_scan_between_run_consistency", output_dir,
                caption="Between-run consistency of mean end-to-end latency across independent, "
                        "clean-slate repetitions of the concurrency scan.",
                label="tab:scan-between-run")
 
-    # Table 6: significance between adjacent concurrency levels, per tier
+    # Table 6: Significance between adjacent concurrency levels per tier (status==200).
+    # Excludes errors/timeouts to prevent concurrency-driven failures from skewing latency metrics.
     table6_parts = []
     for t in order:
         part = pairwise_mannwhitney(
-            scan, "http_req_duration", "scan", "vus", levels,
+            e2e, "http_req_duration", "scan", "vus", levels,
             lambda v: f"VUS={int(v)}", fixed_filters={"tier": t},
         )
         if not part.empty:
