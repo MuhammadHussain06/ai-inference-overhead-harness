@@ -541,15 +541,15 @@ def analyze_baseline(df, output_dir):
                        "clean-slate repetitions of the baseline phase.",
                label="tab:baseline-between-run")
 
-    # Table 2: mean Python-side decomposition per target (pooled across reps), plus the
-    # Java-side estimated network overhead alongside it (see JAVA_NETWORK_OVERHEAD_METRIC).
+    # Table 2: Python-side mean latency decomposition and Java network overhead. Filtered
+    # on status=="200" to maintain correctness independently of k6 metric emission logic.
     decomp_rows = []
     for t in order:
         row = {"Group": _tier_label(t)}
         for metric in PYTHON_TELEMETRY_METRICS:
-            vals = base[(base["metric"] == metric) & (base["tier"] == t)]["value"]
+            vals = base[(base["metric"] == metric) & (base["tier"] == t) & (base["status"] == "200")]["value"]
             row[metric] = round(float(vals.mean()), 3) if not vals.empty else np.nan
-        net_vals = base[(base["metric"] == JAVA_NETWORK_OVERHEAD_METRIC) & (base["tier"] == t)]["value"]
+        net_vals = base[(base["metric"] == JAVA_NETWORK_OVERHEAD_METRIC) & (base["tier"] == t) & (base["status"] == "200")]["value"]
         row[JAVA_NETWORK_OVERHEAD_METRIC] = round(float(net_vals.mean()), 3) if not net_vals.empty else np.nan
         decomp_rows.append(row)
     table2 = pd.DataFrame(decomp_rows)
@@ -562,13 +562,14 @@ def analyze_baseline(df, output_dir):
                label="tab:baseline-decomp")
 
     # Table 3: DataFrame-construction share of measured computation time
+    # (explicit status=="200" filter -- see Table 2 comment above)
     share_rows = []
     for t in order:
         if t in ("mock", "calibration"):
             continue
-        df_t = base[(base["metric"] == "python_dataframe_construction_time_ms") & (base["tier"] == t)]["value"]
-        inf_t = base[(base["metric"] == "python_model_inference_time_ms") & (base["tier"] == t)]["value"]
-        comp_t = base[(base["metric"] == "python_computation_time_ms") & (base["tier"] == t)]["value"]
+        df_t = base[(base["metric"] == "python_dataframe_construction_time_ms") & (base["tier"] == t) & (base["status"] == "200")]["value"]
+        inf_t = base[(base["metric"] == "python_model_inference_time_ms") & (base["tier"] == t) & (base["status"] == "200")]["value"]
+        comp_t = base[(base["metric"] == "python_computation_time_ms") & (base["tier"] == t) & (base["status"] == "200")]["value"]
         if df_t.empty or inf_t.empty or comp_t.empty:
             continue
         comp_mean = float(comp_t.mean())
@@ -611,7 +612,7 @@ def analyze_baseline(df, output_dir):
         x_labels = [f"v{t}" for t in ai_order]
         for i, (metric, label) in enumerate(stages):
             vals = np.array([
-                base[(base["metric"] == metric) & (base["tier"] == t)]["value"].mean()
+                base[(base["metric"] == metric) & (base["tier"] == t) & (base["status"] == "200")]["value"].mean()
                 for t in ai_order
             ])
             vals = np.nan_to_num(vals)
@@ -822,7 +823,7 @@ def analyze_scan(df, output_dir):
         x_labels = [str(v) for v in levels]
         for i, (metric, label) in enumerate(stages):
             vals = np.array([
-                scan[(scan["metric"] == metric) & (scan["tier"] == heaviest) & (scan["vus"] == vus)]["value"].mean()
+                scan[(scan["metric"] == metric) & (scan["tier"] == heaviest) & (scan["vus"] == vus) & (scan["status"] == "200")]["value"].mean()
                 for vus in levels
             ])
             vals = np.nan_to_num(vals)

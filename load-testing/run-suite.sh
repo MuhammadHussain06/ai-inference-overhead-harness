@@ -137,6 +137,24 @@ EOF
   echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} governor=${cpu_governor} freq_khz=${cpu_freq_khz} git=${git_commit:0:12}"
 }
 
+# Parses a Docker cpuset string (e.g., "3-5" or "0,2,4") to compute the target core
+# count dynamically, ensuring JVM processor validation scales with configuration.
+count_cpuset_cores() {
+  local cpuset="$1"
+  local total=0
+  local part lo hi
+  IFS=',' read -ra _parts <<< "$cpuset"
+  for part in "${_parts[@]}"; do
+    if [[ "$part" == *-* ]]; then
+      lo="${part%-*}"; hi="${part#*-}"
+      total=$(( total + (hi - lo + 1) ))
+    elif [ -n "$part" ]; then
+      total=$(( total + 1 ))
+    fi
+  done
+  echo "$total"
+}
+
 # Reads the cpuset a container was actually assigned by the kernel, not what
 # it was configured with. Tries cgroup v2 first, falls back to v1.
 read_live_cpuset() {
@@ -195,20 +213,24 @@ verify_cpu_pinning() {
 
  # Verify the JVM correctly detected cpuset limits, as Netty sizes event-loop
  # threads using Runtime.availableProcessors() based on cgroup auto-detection.
-  local java_cpus
+  local java_cpus expected_java_cpus
   java_cpus=$(docker exec "$java_container" sh -c \
     'java -XshowSettings:system -version 2>&1 | grep -i "available processors" | grep -o "[0-9]*"' \
     2>/dev/null || echo "")
-  echo "  [cpu-pin] ${label}: JVM-reported available processors(${java_cpus:-EMPTY})"
-  echo "cpu_pin_check label=${label} jvm_available_processors=${java_cpus:-EMPTY}" >> "$CPU_PIN_LOG"
+  expected_java_cpus=$(count_cpuset_cores "$java_requested")
+  echo "  [cpu-pin] ${label}: JVM-reported available processors(${java_cpus:-EMPTY}), expected(${expected_java_cpus:-EMPTY} from requested cpuset ${java_requested:-EMPTY})"
+  echo "cpu_pin_check label=${label} jvm_available_processors=${java_cpus:-EMPTY} expected_from_cpuset=${expected_java_cpus:-EMPTY}" >> "$CPU_PIN_LOG"
 
   if [ -z "$java_cpus" ]; then
     abort_pin_failure "$label" "could not read JVM-reported available processors -- Netty event-loop" \
       "sizing is unverifiable for this rep."
-  elif [ "$java_cpus" != "3" ]; then
-    abort_pin_failure "$label" "JVM reports ${java_cpus} available processors, expected 3 -- Netty's" \
-      "event-loop thread count (availableProcessors() * 2 by default) would be sized off the wrong" \
-      "core count for this rep."
+  elif [ -z "$expected_java_cpus" ] || [ "$expected_java_cpus" = "0" ]; then
+    abort_pin_failure "$label" "could not derive an expected core count from the requested cpuset" \
+      "(${java_requested:-EMPTY}) -- cannot verify JVM core detection for this rep."
+  elif [ "$java_cpus" != "$expected_java_cpus" ]; then
+    abort_pin_failure "$label" "JVM reports ${java_cpus} available processors, expected ${expected_java_cpus}" \
+      "(derived from requested cpuset ${java_requested}) -- Netty's event-loop thread count" \
+      "(availableProcessors() * 2 by default) would be sized off the wrong core count for this rep."
   fi
 
   echo "  [cpu-pin] ${label}: OK -- pinning verified, proceeding."

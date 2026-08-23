@@ -6,6 +6,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.bind.support.WebExchangeBindException;
+import org.springframework.web.server.ServerWebInputException;
 
 import java.time.LocalDateTime;
 import java.util.HashMap;
@@ -14,9 +15,22 @@ import java.util.Map;
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
-    // Handles two 400 Bad Request envelope formats:
-    // - WebExchangeBindException ("Validation Failed"): Field-level bean validation errors with a field->message map
+    // Handles three 400 Bad Request envelope formats:
+    // - WebExchangeBindException ("Validation Failed"): Field-level bean validation errors with a field->message map.
     // - IllegalArgumentException ("Bad Request"): Cross-field business rule failures with a single message string.
+    // - ServerWebInputException ("Malformed Request"): Unparseable/mistyped JSON body, caught here to prevent fall-through to generic 500 error handling.
+    @ExceptionHandler(ServerWebInputException.class)
+    public ResponseEntity<ErrorResponseDto> handleServerWebInputException(ServerWebInputException ex) {
+        ErrorResponseDto response = new ErrorResponseDto(
+                LocalDateTime.now(),
+                HttpStatus.BAD_REQUEST.value(),
+                "Malformed Request",
+                "Request body could not be parsed: " + ex.getReason(),
+                null
+        );
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
+    }
+
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<ErrorResponseDto> handleIllegalArgument(IllegalArgumentException ex) {
         ErrorResponseDto response = new ErrorResponseDto(

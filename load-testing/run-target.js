@@ -6,7 +6,12 @@ import { sendTransaction, TARGETS } from './lib/common.js';
 //   TARGET            : Endpoint key ('mock' | 'calibration' | '5' | '10' | '20' | '28') [Required]
 //   VUS               : Concurrent virtual users [Required]
 //   ITERATIONS_PER_VU : Requests per VU; used by the concurrency scan to keep
-//                       tail-percentile sample size constant as VUS varies [Optional]
+//                       the per-VU sample count constant as VUS varies. Total
+//                       N therefore grows with VUS (100 at VUS=1, 6400 at
+//                       VUS=64) -- intentional, since higher-VUS cells need
+//                       more samples to resolve tail percentiles under
+//                       contention. VUS=1 here is intentionally thin; the
+//                       baseline (E1) phase already covers VUS=1 densely. [Optional]
 //   ITERATIONS        : Total request budget divided across VUs; used by the
 //                       baseline (VUS=1) cells [Optional, default: 500]
 //   PHASE             : Experiment phase tag ('baseline', 'scan') [Optional]

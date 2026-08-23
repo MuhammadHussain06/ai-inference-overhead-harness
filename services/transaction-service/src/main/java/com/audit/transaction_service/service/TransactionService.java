@@ -32,7 +32,9 @@ public class TransactionService {
     private final TransactionRepository transactionRepository;
     private final WebClient webClient;
 
-    @Value("${app.db.save.enabled:true}")
+    // Fallback matches application.properties' documented fail-safe default (false);
+    // only used if the property is ever missing entirely.
+    @Value("${app.db.save.enabled:false}")
     private boolean dbSaveEnabled;
 
     public TransactionService(TransactionRepository transactionRepository, WebClient webClient) {
