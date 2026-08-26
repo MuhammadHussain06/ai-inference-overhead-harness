@@ -39,6 +39,11 @@ CPU_PIN_LOG="${RESULTS_DIR}/cpu_pin_check_log.txt"
 
 TARGETS=(mock calibration 5 10 20 28)
 CONCURRENCY_LEVELS=(1 2 4 8 16 32 64)
+# Derived from CONCURRENCY_LEVELS; used by E2's max-VUS warm-up pass below.
+MAX_VUS=0
+for _lvl in "${CONCURRENCY_LEVELS[@]}"; do
+  if [ "$_lvl" -gt "$MAX_VUS" ]; then MAX_VUS="$_lvl"; fi
+done
 BASELINE_ITERATIONS=500
 SCAN_ITERATIONS_PER_VU=100
 COOLDOWN_S=10
@@ -125,6 +130,8 @@ capture_run_metadata() {
   "suite_config": {
     "targets": [$(printf '"%s",' "${TARGETS[@]}" | sed 's/,$//')],
     "concurrency_levels": [$(printf '%s,' "${CONCURRENCY_LEVELS[@]}" | sed 's/,$//')],
+    "max_vus": ${MAX_VUS},
+    "scan_warmup_includes_max_vus_pass": true,
     "baseline_iterations": ${BASELINE_ITERATIONS},
     "scan_iterations_per_vu": ${SCAN_ITERATIONS_PER_VU},
     "cooldown_s": ${COOLDOWN_S},
@@ -308,8 +315,15 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   restart_stack
   wait_for_ready
   verify_cpu_pinning "scan rep=${rep}"
-  echo "[*] Warming up JIT / connection pools..."
+  echo "[*] Warming up JIT / connection pools (default VUS)..."
   k6 run warm-up.js --out "json=${RESULTS_DIR}/warmup_scan_rep${rep}.json"
+  sleep "$COOLDOWN_S"
+
+  # Matches warm-up concurrency to the scan's peak VUS; separate output
+  # file so table0's convergence check can report on it distinctly.
+  echo "[*] Warming up JIT / connection pools (MAX_VUS=${MAX_VUS})..."
+  env WARMUP_VUS="$MAX_VUS" \
+    k6 run warm-up.js --out "json=${RESULTS_DIR}/warmup_scan_maxvus_rep${rep}.json"
   sleep "$COOLDOWN_S"
 
   # Randomizes target and concurrency order per rep (shuffled independently)
@@ -336,7 +350,8 @@ echo "[+] Suite complete. Raw results in ${RESULTS_DIR}/"
 echo "    Per-rep cell order logged to ${ORDER_LOG}"
 echo "    Host/toolchain fingerprint (incl. CPU governor/freq snapshot) logged to ${METADATA_FILE}"
 echo "    CPU pinning verification (per-rep cgroup check) logged to ${CPU_PIN_LOG}"
-echo "    Warm-up JSON output (for post-hoc convergence check) saved as warmup_{baseline,scan}_rep*.json"
+echo "    Warm-up JSON output (for post-hoc convergence check) saved as warmup_baseline_rep*.json,"
+echo "    warmup_scan_rep*.json (default VUS), and warmup_scan_maxvus_rep*.json (VUS=${MAX_VUS})"
 echo "    'calibration' target included alongside mock/5/10/20/28 -- isolates instrumentation overhead"
 # Reaching this point guarantees all completed reps passed CPU pin verification,
 # as empty cpuset failures trigger immediate suite aborts via abort_pin_failure.

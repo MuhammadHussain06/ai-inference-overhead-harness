@@ -25,21 +25,20 @@ import java.util.stream.Collectors;
 @Service
 public class TransactionService {
 
-    // MUST match FEATURE_TIERS in Python service (app/config.py).
-    // Lacks auto-sync; mismatch causes premature proxy rejection of valid tiers.
-    private static final Set<Integer> VALID_FEATURE_TIERS = Set.of(5, 10, 20, 28);
-
     private final TransactionRepository transactionRepository;
     private final WebClient webClient;
+    private final FeatureTierRegistry featureTierRegistry;
 
     // Fallback matches application.properties' documented fail-safe default (false);
     // only used if the property is ever missing entirely.
     @Value("${app.db.save.enabled:false}")
     private boolean dbSaveEnabled;
 
-    public TransactionService(TransactionRepository transactionRepository, WebClient webClient) {
+    public TransactionService(TransactionRepository transactionRepository, WebClient webClient,
+                              FeatureTierRegistry featureTierRegistry) {
         this.transactionRepository = transactionRepository;
         this.webClient = webClient;
+        this.featureTierRegistry = featureTierRegistry;
     }
 
     public Mono<ResponseDto> processTransaction(RequestDto request, long requestStartNanos) {
@@ -56,9 +55,10 @@ public class TransactionService {
         switch (strategy) {
             case "DISTRIBUTED_AI_SYNCHRONOUS":
                 featureTier = request.getFeatureTier();
-                if (featureTier == null || !VALID_FEATURE_TIERS.contains(featureTier)) {
+                Set<Integer> validTiers = featureTierRegistry.getValidTiers();
+                if (featureTier == null || !validTiers.contains(featureTier)) {
                     return Mono.error(new IllegalArgumentException(
-                            "featureTier must be one of " + VALID_FEATURE_TIERS + " for strategy DISTRIBUTED_AI_SYNCHRONOUS, got: " + featureTier));
+                            "featureTier must be one of " + validTiers + " for strategy DISTRIBUTED_AI_SYNCHRONOUS, got: " + featureTier));
                 }
                 List<Double> features = request.getFeatures();
                 if (features == null || features.size() < featureTier) {
