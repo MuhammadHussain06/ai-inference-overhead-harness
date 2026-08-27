@@ -208,20 +208,22 @@ Content-Type: application/json
 
 ## Containerization & Hardware
 
-| | python-service | transaction-service |
-|---|---|---|
-| Image | `python:3.11-slim` | build `eclipse-temurin:21-jdk-alpine`, run `21-jre-alpine` |
-| Port | `8000` | `8080` |
-| Cores | `0-2` | `3-5` |
-| Limit / reserved | 3.0 CPU / 3G RAM (1.0 / 1G) | 3.0 CPU / 3G RAM (1.0 / 1G) |
-| Notes | `UVICORN_WORKERS=3` at benchmark time; `n_jobs=1` + BLAS env vars keep each `predict_proba` call single-threaded — independent from the 3-worker concurrency | Outbound pool to Python sized via `python.service.max-connections` (default `128`); must stay ≥ highest VUS in `run-suite.sh`'s `CONCURRENCY_LEVELS` (currently `64`) or queueing inflates `estimatedNetworkOverheadMs`. `python.service.pending-acquire-timeout-ms` (default `5000`) bounds the wait. Feature-tier set fetched from Python's `/health` at startup, retrying up to 60s |
+| | python-service | transaction-service | k6 (load generator) |
+|---|---|---|---|
+| Image | `python:3.11-slim` | build `eclipse-temurin:21-jdk-alpine`, run `21-jre-alpine` | `grafana/k6` |
+| Port | `8000` | `8080` | — |
+| Cores | `0-2` | `3-5` | `6-7` |
+| Limit / reserved | 3.0 CPU / 3G RAM (1.0 / 1G) | 3.0 CPU / 3G RAM (1.0 / 1G) | 2.0 CPU / 1G RAM |
+| Notes | `UVICORN_WORKERS=3` at benchmark time; `n_jobs=1` + BLAS env vars keep each `predict_proba` call single-threaded — independent from the 3-worker concurrency | Outbound pool to Python sized via `python.service.max-connections` (default `128`); must stay ≥ highest VUS in `run-suite.sh`'s `CONCURRENCY_LEVELS` (currently `64`) or queueing inflates `estimatedNetworkOverheadMs`. `python.service.pending-acquire-timeout-ms` (default `5000`) bounds the wait. Feature-tier set fetched from Python's `/health` at startup, retrying up to 60s. Heap fixed via `JAVA_TOOL_OPTIONS=-Xms1536m -Xmx1536m` for reproducible sizing across hosts/reps | Runs in its own container on a disjoint cpuset. Gated behind the `loadgen` Compose profile; invoked per-cell by `run-suite.sh` via `docker compose run`, not started by `docker compose up` |
+
+Resource limits (`mem_limit`/`mem_reservation`/`cpus`) use Compose's plain (non-Swarm) top-level keys rather than `deploy.resources.limits`, which is a Swarm-only directive silently unenforced by `docker compose up`.
 
 **Requirements**
 
 - Docker + Docker Compose v2 (`docker compose`)
-- 6+ logical cores (`cpuset` hardcoded to `0-2`/`3-5` — adjust or drop on smaller machines)
-- ~6GB free RAM
-- [k6](https://k6.io/docs/get-started/installation/) installed locally
+- 8+ logical cores (`cpuset` hardcoded to `0-2`/`3-5`/`6-7` across the three containers — adjust or drop on smaller machines)
+- ~7GB free RAM
+- k6 runs containerized (`grafana/k6`, pulled automatically on first `run-suite.sh` invocation) — no host install needed
 - Python 3 + `pip install -r analysis/requirements.txt` (pandas, numpy, matplotlib, scipy, statsmodels, tabulate)
 - No GPU required
 
@@ -281,10 +283,12 @@ python3 analysis/analyze-results.py                  # tables + figures
 
 - **Single-node only** — no multi-region/network-hop simulation.
 - **"Network overhead" = Docker bridge-network overhead** — `estimatedNetworkOverheadMs` reflects the bridge/NAT path between two containers on one host, not a real network hop, plus a small serialization-estimation error.
-- **k6 shares cores with the services under test** on a minimum-spec (6-core) host — k6, the Docker daemon, and host OS all run unpinned on the same cores being measured.
-- **No independent proof k6 wasn't the bottleneck** — `http_req_blocked` diagnostics are a partial check only.
+- **k6 is pinned to its own cpuset (`6-7`), separate from python-service (`0-2`) and transaction-service (`3-5`), and verified live each rep** — this stops k6 from directly contending with the services under test for cgroup-level scheduling slots. It does not isolate any of the three from the Docker daemon or the rest of the host OS, which remain unpinned; on a minimum-spec (8-core) host they still share physical cores with everything else running on the machine.
+- **`http_req_blocked` diagnostics are a partial check only** — they can't independently prove k6 never became the bottleneck at high concurrency.
+- **k6 is capped at 2 CPUs** — at high VUS counts, check `http_req_blocked` before trusting results, since a resource-starved load generator can look like service degradation.
+- **OOM kills are checked per cell** (`docker inspect --format '{{.State.OOMKilled}}'`) and logged to `run_failures_log.txt`, but a killed container ends that cell's data — re-run any flagged cells.
 - **Instrumentation overhead is measured, not removed** — the `calibration` target bounds it as a floor; it stays baked into the AI/mock numbers.
-- **No verification the two `cpuset` ranges are on distinct physical cores** rather than SMT siblings.
+- **No verification the three `cpuset` ranges (python/java/k6) are on distinct physical cores** rather than SMT siblings.
 - **Pinning assumes a native Linux Docker host** — on Docker Desktop (macOS/Windows), `cpuset` inside the VM has no fixed relationship to physical cores.
 - **CPU governor/frequency is a single per-suite snapshot**, not per-repetition — won't catch mid-run thermal throttling.
 - **Synthetic, uniformly-random feature vectors** — the licensed dataset can't be bundled, so `randomFeatures()` draws in a rough PCA-shaped range instead.
@@ -295,7 +299,7 @@ python3 analysis/analyze-results.py                  # tables + figures
 - **Mock and calibration are latency baselines only** — never real fraud checks.
 - **`--synthetic` training data is a smoke test**, not a benchmark source.
 - **`n_jobs=1` verification** confirms the sklearn/XGBoost-level parameter reads back correctly; combined with BLAS env vars it's a strong, not absolute, single-threading guarantee.
-- **6-core pinning is host-specific** — results aren't comparable across different core counts/SMT settings without adjusting `cpuset`.
+- **8-core pinning is host-specific** — results aren't comparable across different core counts/SMT settings without adjusting `cpuset`.
 
 ---
 
