@@ -19,6 +19,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # Preflight: fail fast before any containers are touched.
+# k6 runs containerized (see the `k6` service in docker-compose.yml),
+# pinned to its own cpuset, separate from the services under test.
 for _req_cmd in docker curl shuf; do
   if ! command -v "$_req_cmd" >/dev/null 2>&1; then
     echo "[!] Required command not found: ${_req_cmd}. Aborting before touching any containers." >&2
@@ -240,6 +242,23 @@ verify_cpu_pinning() {
       "(availableProcessors() * 2 by default) would be sized off the wrong core count for this rep."
   fi
 
+  # Verifies the k6 container's own cpuset, matching the compose file's
+  # hardcoded value.
+  local k6_expected="6-7"
+  local k6_live
+  k6_live=$(docker compose -f "$COMPOSE_FILE" --profile loadgen run --rm -T --entrypoint sh k6 \
+    -c 'cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || cat /sys/fs/cgroup/cpuset/cpuset.cpus 2>/dev/null' \
+    2>/dev/null || echo "")
+  echo "  [cpu-pin] ${label}: k6 live(${k6_live:-EMPTY}) expected(${k6_expected})"
+  echo "cpu_pin_check label=${label} k6_live=${k6_live:-EMPTY} k6_expected=${k6_expected}" >> "$CPU_PIN_LOG"
+  if [ -z "$k6_live" ]; then
+    abort_pin_failure "$label" "could not read a live cgroup cpuset for the k6 container -- k6's" \
+      "own core isolation is unverifiable on this host."
+  elif [ "$k6_live" != "$k6_expected" ]; then
+    abort_pin_failure "$label" "k6's live cgroup cpuset (${k6_live}) does not match the requested" \
+      "cpuset (${k6_expected}) -- k6 core isolation was not honored on this Docker/cgroup driver version."
+  fi
+
   echo "  [cpu-pin] ${label}: OK -- pinning verified, proceeding."
 }
 
@@ -274,12 +293,41 @@ shuffled() {
   printf '%s\n' "$@" | shuf | tr '\n' ' '
 }
 
+# Runs a k6 script in its own container, pinned to the cpuset in docker-compose.yml.
+# Usage: k6_run <script.js> [KEY=VALUE ...] -- <k6-args...>
+# KEY=VALUE pairs before `--` are passed as `-e KEY=VALUE` to the container.
+k6_run() {
+  local script="$1"; shift
+  local env_flags=()
+  while [ "$1" != "--" ]; do
+    env_flags+=("-e" "$1")
+    shift
+  done
+  shift # drop the --
+  docker compose -f "$COMPOSE_FILE" --profile loadgen run --rm -T \
+    "${env_flags[@]}" k6 run "/scripts/${script}" "$@"
+}
+
+# Flags a cell if either container was OOM-killed during it.
+check_oom_killed() {
+  local label="$1"
+  local py_container java_container py_oom java_oom
+  py_container=$(docker compose -f "$COMPOSE_FILE" ps -q python-service 2>/dev/null || echo "")
+  java_container=$(docker compose -f "$COMPOSE_FILE" ps -q transaction-service 2>/dev/null || echo "")
+  py_oom=$(docker inspect --format '{{.State.OOMKilled}}' "$py_container" 2>/dev/null || echo "unknown")
+  java_oom=$(docker inspect --format '{{.State.OOMKilled}}' "$java_container" 2>/dev/null || echo "unknown")
+  if [ "$py_oom" = "true" ] || [ "$java_oom" = "true" ]; then
+    echo "  [!] OOM-killed during ${label}: python=${py_oom} java=${java_oom}" | tee -a "$FAILURES_LOG"
+  fi
+}
+
 run_cell() {
   local label="$1"
   shift
   if ! "$@"; then
     echo "[!] FAILED: ${label}" | tee -a "$FAILURES_LOG"
   fi
+  check_oom_killed "$label"
 }
 
 capture_run_metadata
@@ -291,7 +339,7 @@ for rep in $(seq 1 "$REPS_BASELINE"); do
   wait_for_ready
   verify_cpu_pinning "baseline rep=${rep}"
   echo "[*] Warming up JIT / connection pools..."
-  k6 run warm-up.js --out "json=${RESULTS_DIR}/warmup_baseline_rep${rep}.json"
+  k6_run warm-up.js -- --out "json=/results/warmup_baseline_rep${rep}.json"
   sleep "$COOLDOWN_S"
 
   # Independent per-rep shuffle of target order.
@@ -302,9 +350,9 @@ for rep in $(seq 1 "$REPS_BASELINE"); do
   for target in "${TARGETS_THIS_REP[@]}"; do
     echo "  -> target=${target} rep=${rep}"
     run_cell "baseline target=${target} rep=${rep}" \
-      env TARGET="$target" VUS=1 ITERATIONS=$BASELINE_ITERATIONS PHASE=baseline REP="$rep" \
-      k6 run run-target.js \
-      --out "json=${RESULTS_DIR}/baseline_${target}_rep${rep}.json"
+      k6_run run-target.js \
+      TARGET="$target" VUS=1 ITERATIONS="$BASELINE_ITERATIONS" PHASE=baseline REP="$rep" -- \
+      --out "json=/results/baseline_${target}_rep${rep}.json"
     sleep "$COOLDOWN_S"
   done
 done
@@ -316,14 +364,14 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   wait_for_ready
   verify_cpu_pinning "scan rep=${rep}"
   echo "[*] Warming up JIT / connection pools (default VUS)..."
-  k6 run warm-up.js --out "json=${RESULTS_DIR}/warmup_scan_rep${rep}.json"
+  k6_run warm-up.js -- --out "json=/results/warmup_scan_rep${rep}.json"
   sleep "$COOLDOWN_S"
 
   # Matches warm-up concurrency to the scan's peak VUS; separate output
   # file so table0's convergence check can report on it distinctly.
   echo "[*] Warming up JIT / connection pools (MAX_VUS=${MAX_VUS})..."
-  env WARMUP_VUS="$MAX_VUS" \
-    k6 run warm-up.js --out "json=${RESULTS_DIR}/warmup_scan_maxvus_rep${rep}.json"
+  k6_run warm-up.js WARMUP_VUS="$MAX_VUS" -- \
+    --out "json=/results/warmup_scan_maxvus_rep${rep}.json"
   sleep "$COOLDOWN_S"
 
   # Randomizes target and concurrency order per rep (shuffled independently)
@@ -338,9 +386,9 @@ for rep in $(seq 1 "$REPS_SCAN"); do
     for vus in "${CONCURRENCY_THIS_REP[@]}"; do
       echo "  -> target=${target} vus=${vus} rep=${rep}"
       run_cell "scan target=${target} vus=${vus} rep=${rep}" \
-        env TARGET="$target" VUS="$vus" ITERATIONS_PER_VU=$SCAN_ITERATIONS_PER_VU PHASE=scan REP="$rep" \
-        k6 run run-target.js \
-        --out "json=${RESULTS_DIR}/scan_${target}_vus${vus}_rep${rep}.json"
+        k6_run run-target.js \
+        TARGET="$target" VUS="$vus" ITERATIONS_PER_VU="$SCAN_ITERATIONS_PER_VU" PHASE=scan REP="$rep" -- \
+        --out "json=/results/scan_${target}_vus${vus}_rep${rep}.json"
       sleep "$COOLDOWN_S"
     done
   done

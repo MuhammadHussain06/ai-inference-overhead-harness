@@ -19,14 +19,10 @@ services:
       retries: 10
       start_period: 10s
     cpuset: "0-2"
-    deploy:
-      resources:
-        limits:
-          cpus: '3.0'
-          memory: 3G
-        reservations:
-          cpus: '1.0'
-          memory: 1G
+    # Enforced by plain `docker compose up` (unlike deploy.resources.limits).
+    mem_limit: 3g
+    mem_reservation: 1g
+    cpus: 3.0
     networks:
       - testbed-net
 
@@ -38,18 +34,34 @@ services:
     environment:
       - PYTHON_SERVICE_URL=http://python:8000
       - APP_DB_SAVE_ENABLED=false
+      # Fixed heap for reproducible sizing across hosts/reps.
+      - JAVA_TOOL_OPTIONS=-Xms1536m -Xmx1536m
     depends_on:
       python-service:
         condition: service_healthy
     cpuset: "3-5"
-    deploy:
-      resources:
-        limits:
-          cpus: '3.0'
-          memory: 3G
-        reservations:
-          cpus: '1.0'
-          memory: 1G
+    mem_limit: 3g
+    mem_reservation: 1g
+    cpus: 3.0
+    networks:
+      - testbed-net
+
+  # Load generator, pinned to its own core range. Behind a profile so
+  # `docker compose up` doesn't start it; run-suite.sh invokes it per-cell
+  # via `docker compose run`.
+  k6:
+    image: grafana/k6:latest
+    profiles: ["loadgen"]
+    entrypoint: ["k6"]
+    working_dir: /scripts
+    volumes:
+      - ./load-testing:/scripts
+      - ./results:/results
+    environment:
+      - BASE_URL=http://java:8080/api/v1/transactions
+    cpuset: "6-7"
+    mem_limit: 1g
+    cpus: 2.0
     networks:
       - testbed-net
 
