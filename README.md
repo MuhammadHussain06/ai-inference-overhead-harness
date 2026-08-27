@@ -91,6 +91,7 @@ Each service runs in its own container, pinned to a disjoint CPU range, so they 
 - Valid feature-tier set is fetched from `fraud-ml-service`'s `/health` at startup — never hardcoded in Java.
 - Outbound Java→Python connection pool is explicitly sized (`python.service.max-connections`, default `128`) and logged at startup.
 - In-memory H2 — clean slate every run.
+- Per-request logging is off on both services (Java: `TransactionService` at `WARN`; Python: `uvicorn --no-access-log`) — a synchronous stdout write on the WebFlux event loop or the request coroutine would otherwise stall it, adding latency/throughput noise unrelated to inference.
 </details>
 
 <details>
