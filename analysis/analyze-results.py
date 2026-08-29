@@ -90,6 +90,7 @@ def check_cpu_pin_log(results_dir):
     pairs = [
         ("python_requested", "python_live"), ("java_requested", "java_live"),
         ("expected_from_cpuset", "jvm_effective_cpu_count"), ("k6_expected", "k6_live"),
+        ("tiers_expected", "tiers_loaded"),
     ]
     n_checks = n_mismatches = 0
     mismatch_lines = []
@@ -104,6 +105,11 @@ def check_cpu_pin_log(results_dir):
                     if fields[expected_key] != fields[live_key]:
                         n_mismatches += 1
                         mismatch_lines.append(line.strip())
+            if "n_jobs_verified" in fields:
+                n_checks += 1
+                if fields["n_jobs_verified"] != "true":
+                    n_mismatches += 1
+                    mismatch_lines.append(line.strip())
 
     if n_mismatches:
         print(f"[cpu-pin] WARNING: {n_mismatches}/{n_checks} checks mismatched "

@@ -21,7 +21,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 # Preflight: fail fast before any containers are touched.
 # k6 runs containerized (see the `k6` service in docker-compose.yml),
 # pinned to its own cpuset, separate from the services under test.
-for _req_cmd in docker curl shuf; do
+for _req_cmd in docker curl shuf python3; do
   if ! command -v "$_req_cmd" >/dev/null 2>&1; then
     echo "[!] Required command not found: ${_req_cmd}. Aborting before touching any containers." >&2
     exit 1
@@ -41,6 +41,9 @@ CPU_PIN_LOG="${RESULTS_DIR}/cpu_pin_check_log.txt"
 
 TARGETS=(mock calibration 5 10 20 28)
 CONCURRENCY_LEVELS=(1 2 4 8 16 32 64)
+# AI-tier subset of TARGETS, sorted -- what python-service's /health should
+# report as loadedTiers. Derived from TARGETS so it can't drift out of sync.
+EXPECTED_TIERS=$(printf '%s\n' "${TARGETS[@]}" | grep -E '^[0-9]+$' | sort -n | tr '\n' ',' | sed 's/,$//')
 # Derived from CONCURRENCY_LEVELS; used by E2's max-VUS warm-up pass below.
 MAX_VUS=0
 for _lvl in "${CONCURRENCY_LEVELS[@]}"; do
@@ -175,18 +178,18 @@ read_live_cpuset() {
 
 
 # Aborts the suite: a rep with unverified CPU pinning must not produce k6
-# output that gets pooled with clean reps. Tears the stack down and exits
-# before that rep's k6 cells run.
-abort_pin_failure() {
+# Any invalidating condition -- pinning, tier loading, or a cell failure --
+# tears the stack down and exits rather than continuing to produce output
+# that would just get rejected wholesale at analysis time anyway.
+abort_suite() {
   local label="$1"; shift
   local reason="$*"  # join remaining args -- callers pass the message across multiple lines
   echo "" | tee -a "$FAILURES_LOG"
-  echo "  [FATAL] [cpu-pin] ${label}: ${reason}" | tee -a "$FAILURES_LOG"
-  echo "  [FATAL] Aborting suite -- CPU pinning could not be verified for this rep." | tee -a "$FAILURES_LOG"
-  echo "  [FATAL] No results were written for this rep. Fix the host/Docker cgroup" | tee -a "$FAILURES_LOG"
-  echo "  [FATAL] setup (see README CPU pinning caveat) and re-run run-suite.sh from" | tee -a "$FAILURES_LOG"
-  echo "  [FATAL] the beginning -- prior reps already on disk in ${RESULTS_DIR} were" | tee -a "$FAILURES_LOG"
-  echo "  [FATAL] pin-verified and can be kept, but this suite invocation is incomplete." | tee -a "$FAILURES_LOG"
+  echo "  [FATAL] ${label}: ${reason}" | tee -a "$FAILURES_LOG"
+  echo "  [FATAL] Aborting suite. No results were written for this rep. Prior reps" | tee -a "$FAILURES_LOG"
+  echo "  [FATAL] already on disk in ${RESULTS_DIR} are unaffected and can be kept," | tee -a "$FAILURES_LOG"
+  echo "  [FATAL] but this suite invocation is incomplete -- fix the cause and" | tee -a "$FAILURES_LOG"
+  echo "  [FATAL] re-run run-suite.sh from the beginning." | tee -a "$FAILURES_LOG"
   docker compose -f "$COMPOSE_FILE" down || true
   exit 1
 }
@@ -198,7 +201,7 @@ verify_cpu_pinning() {
   java_container=$(docker compose -f "$COMPOSE_FILE" ps -q transaction-service 2>/dev/null || echo "")
 
   if [ -z "$py_container" ] || [ -z "$java_container" ]; then
-    abort_pin_failure "$label" "could not resolve container IDs -- cannot verify pinning at all."
+    abort_suite "[cpu-pin] ${label}" "could not resolve container IDs -- cannot verify pinning at all."
   fi
 
   local py_requested java_requested py_live java_live
@@ -213,9 +216,9 @@ verify_cpu_pinning() {
        "java_requested=${java_requested:-EMPTY} java_live=${java_live:-EMPTY}" >> "$CPU_PIN_LOG"
 
   if [ -z "$py_live" ] || [ -z "$java_live" ]; then
-    abort_pin_failure "$label" "could not read a live cgroup cpuset -- pinning is unverifiable on this host."
+    abort_suite "[cpu-pin] ${label}" "could not read a live cgroup cpuset -- pinning is unverifiable on this host."
   elif [ "$py_live" != "$py_requested" ] || [ "$java_live" != "$java_requested" ]; then
-    abort_pin_failure "$label" "live cgroup cpuset (python=${py_live} java=${java_live}) does not match" \
+    abort_suite "[cpu-pin] ${label}" "live cgroup cpuset (python=${py_live} java=${java_live}) does not match" \
       "the requested cpuset (python=${py_requested} java=${java_requested}) -- pinning was not honored" \
       "on this Docker/cgroup driver version."
   fi
@@ -231,13 +234,13 @@ verify_cpu_pinning() {
   echo "cpu_pin_check label=${label} jvm_effective_cpu_count=${java_cpus:-EMPTY} expected_from_cpuset=${expected_java_cpus:-EMPTY}" >> "$CPU_PIN_LOG"
 
   if [ -z "$java_cpus" ]; then
-    abort_pin_failure "$label" "could not read the JVM-reported Effective CPU Count -- Netty event-loop" \
+    abort_suite "[cpu-pin] ${label}" "could not read the JVM-reported Effective CPU Count -- Netty event-loop" \
       "sizing is unverifiable for this rep."
   elif [ -z "$expected_java_cpus" ] || [ "$expected_java_cpus" = "0" ]; then
-    abort_pin_failure "$label" "could not derive an expected core count from the requested cpuset" \
+    abort_suite "[cpu-pin] ${label}" "could not derive an expected core count from the requested cpuset" \
       "(${java_requested:-EMPTY}) -- cannot verify JVM core detection for this rep."
   elif [ "$java_cpus" != "$expected_java_cpus" ]; then
-    abort_pin_failure "$label" "JVM reports ${java_cpus} effective CPUs, expected ${expected_java_cpus}" \
+    abort_suite "[cpu-pin] ${label}" "JVM reports ${java_cpus} effective CPUs, expected ${expected_java_cpus}" \
       "(derived from requested cpuset ${java_requested}) -- Netty's event-loop thread count" \
       "(availableProcessors() * 2 by default) would be sized off the wrong core count for this rep."
   fi
@@ -252,14 +255,56 @@ verify_cpu_pinning() {
   echo "  [cpu-pin] ${label}: k6 live(${k6_live:-EMPTY}) expected(${k6_expected})"
   echo "cpu_pin_check label=${label} k6_live=${k6_live:-EMPTY} k6_expected=${k6_expected}" >> "$CPU_PIN_LOG"
   if [ -z "$k6_live" ]; then
-    abort_pin_failure "$label" "could not read a live cgroup cpuset for the k6 container -- k6's" \
+    abort_suite "[cpu-pin] ${label}" "could not read a live cgroup cpuset for the k6 container -- k6's" \
       "own core isolation is unverifiable on this host."
   elif [ "$k6_live" != "$k6_expected" ]; then
-    abort_pin_failure "$label" "k6's live cgroup cpuset (${k6_live}) does not match the requested" \
+    abort_suite "[cpu-pin] ${label}" "k6's live cgroup cpuset (${k6_live}) does not match the requested" \
       "cpuset (${k6_expected}) -- k6 core isolation was not honored on this Docker/cgroup driver version."
   fi
 
   echo "  [cpu-pin] ${label}: OK -- pinning verified, proceeding."
+}
+
+# Confirms python-service actually loaded the expected feature tiers and
+# verified single-threaded inference (n_jobs=1) for each, via its own
+# /health endpoint -- silent tier-load failure would corrupt AI-tier cells
+# without ever showing up as a request-level error.
+verify_tiers() {
+  local label="$1"
+  local health_json
+  health_json=$(curl -s http://localhost:8000/health 2>/dev/null || echo "")
+  if [ -z "$health_json" ]; then
+    abort_suite "[tier-check] ${label}" "could not reach python-service's /health -- tier loading is unverifiable."
+  fi
+
+  local loaded_tiers all_verified
+  loaded_tiers=$(echo "$health_json" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(",".join(sorted(data.get("loadedTiers", []), key=int)))
+except Exception:
+    print("")
+')
+  all_verified=$(echo "$health_json" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print("true" if all(data.get("nJobsVerified", {}).values()) else "false")
+except Exception:
+    print("false")
+')
+
+  echo "  [tier-check] ${label}: loaded(${loaded_tiers:-EMPTY}) expected(${EXPECTED_TIERS}) n_jobs_verified(${all_verified})"
+  echo "cpu_pin_check label=${label} tiers_loaded=${loaded_tiers:-EMPTY} tiers_expected=${EXPECTED_TIERS} n_jobs_verified=${all_verified}" >> "$CPU_PIN_LOG"
+
+  if [ "$loaded_tiers" != "$EXPECTED_TIERS" ]; then
+    abort_suite "[tier-check] ${label}" "python-service's /health loadedTiers (${loaded_tiers:-EMPTY})" \
+      "does not match expected (${EXPECTED_TIERS})."
+  elif [ "$all_verified" != "true" ]; then
+    abort_suite "[tier-check] ${label}" "python-service's /health nJobsVerified reports at least one" \
+      "tier without n_jobs pinned to 1 -- single-threaded inference guarantee not met."
+  fi
 }
 
 restart_stack() {
@@ -308,7 +353,7 @@ k6_run() {
     "${env_flags[@]}" k6 run "/scripts/${script}" "$@"
 }
 
-# Flags a cell if either container was OOM-killed during it.
+# Aborts the suite if either container was OOM-killed during the cell.
 check_oom_killed() {
   local label="$1"
   local py_container java_container py_oom java_oom
@@ -317,7 +362,7 @@ check_oom_killed() {
   py_oom=$(docker inspect --format '{{.State.OOMKilled}}' "$py_container" 2>/dev/null || echo "unknown")
   java_oom=$(docker inspect --format '{{.State.OOMKilled}}' "$java_container" 2>/dev/null || echo "unknown")
   if [ "$py_oom" = "true" ] || [ "$java_oom" = "true" ]; then
-    echo "  [!] OOM-killed during ${label}: python=${py_oom} java=${java_oom}" | tee -a "$FAILURES_LOG"
+    abort_suite "[cell] ${label}" "OOM-killed: python=${py_oom} java=${java_oom}"
   fi
 }
 
@@ -335,11 +380,13 @@ archive_gc_log() {
   fi
 }
 
+# Aborts the suite on the first cell failure -- no benefit to continuing
+# once analyze-results.py will reject the whole run anyway.
 run_cell() {
   local label="$1"
   shift
   if ! "$@"; then
-    echo "[!] FAILED: ${label}" | tee -a "$FAILURES_LOG"
+    abort_suite "[cell] ${label}" "k6 exited non-zero."
   fi
   check_oom_killed "$label"
 }
@@ -352,6 +399,7 @@ for rep in $(seq 1 "$REPS_BASELINE"); do
   restart_stack
   wait_for_ready
   verify_cpu_pinning "baseline rep=${rep}"
+  verify_tiers "baseline rep=${rep}"
   echo "[*] Warming up JIT / connection pools..."
   k6_run warm-up.js -- --out "json=/results/warmup_baseline_rep${rep}.json"
   sleep "$COOLDOWN_S"
@@ -378,6 +426,7 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   restart_stack
   wait_for_ready
   verify_cpu_pinning "scan rep=${rep}"
+  verify_tiers "scan rep=${rep}"
   echo "[*] Warming up JIT / connection pools (default VUS)..."
   k6_run warm-up.js -- --out "json=/results/warmup_scan_rep${rep}.json"
   sleep "$COOLDOWN_S"
@@ -417,12 +466,5 @@ echo "    CPU pinning verification (per-rep cgroup check) logged to ${CPU_PIN_LO
 echo "    Warm-up JSON output (for post-hoc convergence check) saved as warmup_baseline_rep*.json,"
 echo "    warmup_scan_rep*.json (default VUS), and warmup_scan_maxvus_rep*.json (VUS=${MAX_VUS})"
 echo "    'calibration' target included alongside mock/5/10/20/28 -- isolates instrumentation overhead"
-# Reaching this point guarantees all completed reps passed CPU pin verification,
-# as empty cpuset failures trigger immediate suite aborts via abort_pin_failure.
-if [ -s "$FAILURES_LOG" ]; then
-  echo "    [!] Some cells failed and were skipped -- see ${FAILURES_LOG}"
-  echo "        Re-run just those cells manually before treating results as complete."
-else
-  echo "    No cell failures logged."
-fi
+echo "    No cell failures -- every rep passed cpu-pin and tier verification."
 echo "    Run: python3 ../analysis/analyze-results.py"
