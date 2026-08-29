@@ -15,6 +15,8 @@ import argparse
 import glob
 import json
 import os
+import re
+import sys
 
 import numpy as np
 import pandas as pd
@@ -64,8 +66,55 @@ def _rep_sort_key(r):
 
 # Loading
 
-def load_results(results_dir):
+def parse_run_failures(results_dir):
+    """Returns raw lines from run_failures_log.txt, if any."""
+    log_path = os.path.join(results_dir, "run_failures_log.txt")
+    if not os.path.isfile(log_path):
+        return []
+    with open(log_path) as f:
+        return [line.strip() for line in f if line.strip()]
 
+
+
+def check_cpu_pin_log(results_dir):
+    """Re-verifies cpu_pin_check_log.txt. run-suite.sh hard-aborts on a live
+    mismatch, so this should always come back clean on a completed run."""
+    log_path = os.path.join(results_dir, "cpu_pin_check_log.txt")
+    if not os.path.isfile(log_path):
+        print("[cpu-pin] No cpu_pin_check_log.txt found -- skipping verification.")
+        return
+
+    def kv(line):
+        return dict(p.split("=", 1) for p in line.split() if "=" in p)
+
+    pairs = [
+        ("python_requested", "python_live"), ("java_requested", "java_live"),
+        ("expected_from_cpuset", "jvm_effective_cpu_count"), ("k6_expected", "k6_live"),
+    ]
+    n_checks = n_mismatches = 0
+    mismatch_lines = []
+    with open(log_path) as f:
+        for line in f:
+            if not line.startswith("cpu_pin_check"):
+                continue
+            fields = kv(line.strip())
+            for expected_key, live_key in pairs:
+                if expected_key in fields and live_key in fields:
+                    n_checks += 1
+                    if fields[expected_key] != fields[live_key]:
+                        n_mismatches += 1
+                        mismatch_lines.append(line.strip())
+
+    if n_mismatches:
+        print(f"[cpu-pin] WARNING: {n_mismatches}/{n_checks} checks mismatched "
+              f"(unexpected -- run-suite.sh should have aborted on these):")
+        for line in mismatch_lines:
+            print(f"    {line}")
+    else:
+        print(f"[cpu-pin] {n_checks} checks verified, all matched.")
+
+
+def load_results(results_dir):
     files = sorted(glob.glob(os.path.join(results_dir, "*.json")))
     if not files:
         raise FileNotFoundError(
@@ -844,6 +893,87 @@ def analyze_scan(df, output_dir):
 
 
 
+GC_LINE_RE = re.compile(
+    r"^\[[^\]]+\]\[(?P<uptime>[\d.]+)s\]\[(?P<level>[a-z]+)\s*\]\[(?P<tags>[^\]]+?)\s*\]\s*(?P<msg>.*)$"
+)
+GC_DUR_RE = re.compile(r"(?P<dur_ms>[\d.]+)ms\s*$")
+
+
+def parse_gc_log(path):
+    """Extracts (uptime_s, pause_ms) for each G1 pause event."""
+    pauses = []
+    first_uptime = last_uptime = None
+    with open(path, errors="replace") as f:
+        for line in f:
+            m = GC_LINE_RE.match(line)
+            if not m:
+                continue
+            uptime = float(m.group("uptime"))
+            first_uptime = first_uptime if first_uptime is not None else uptime
+            last_uptime = uptime
+            if m.group("level") != "info" or m.group("tags") != "gc":
+                continue
+            msg = m.group("msg")
+            if not msg.startswith("Pause"):
+                continue
+            dm = GC_DUR_RE.search(msg)
+            if dm:
+                pauses.append((uptime, float(dm.group("dur_ms"))))
+    window_s = (last_uptime - first_uptime) if first_uptime is not None else None
+    return pauses, window_s
+
+
+def analyze_gc_logs(results_dir, output_dir):
+    """Summarizes per-rep GC pause overhead from archived gc_<phase>_rep<N>.log files."""
+    gc_logs_dir = os.path.join(results_dir, "gc-logs")
+    if not os.path.isdir(gc_logs_dir):
+        print("[gc] No gc-logs directory found -- skipping GC overhead analysis.")
+        return
+
+    name_re = re.compile(r"gc_(?P<phase>baseline|scan)_rep(?P<rep>\d+)\.log")
+    rows = []
+    for log_path in sorted(glob.glob(os.path.join(gc_logs_dir, "gc_*_rep*.log"))):
+        m = name_re.match(os.path.basename(log_path))
+        if not m:
+            continue
+        phase, rep = m.group("phase"), int(m.group("rep"))
+        pauses, window_s = parse_gc_log(log_path)
+        total_ms = sum(d for _, d in pauses)
+        max_ms = max((d for _, d in pauses), default=0.0)
+        overhead_pct = (total_ms / 1000.0 / window_s * 100.0) if window_s else None
+        rows.append({
+            "phase": phase, "rep": rep, "n_pauses": len(pauses),
+            "total_pause_ms": round(total_ms, 2), "max_pause_ms": round(max_ms, 2),
+            "window_s": round(window_s, 1) if window_s else None,
+            "gc_overhead_pct": round(overhead_pct, 3) if overhead_pct is not None else None,
+        })
+
+    if not rows:
+        print("[gc] gc-logs directory exists but no gc_<phase>_rep<N>.log files found -- skipping.")
+        return
+
+    gc_df = pd.DataFrame(rows).sort_values(["phase", "rep"])
+    save_table(gc_df, "table_gc_overhead", output_dir,
+               caption="Per-repetition JVM GC pause overhead (Unified JVM Logging, -Xlog:gc*).",
+               label="tab:gc-overhead")
+
+    high = gc_df[gc_df["gc_overhead_pct"] > 1.0]
+    if not high.empty:
+        print(f"[gc] WARNING: {len(high)} rep(s) show >1% of wall-clock time in GC pauses -- "
+              f"see table_gc_overhead; GC may be contributing to tail latency.")
+    else:
+        print("[gc] GC pause overhead <=1% of wall-clock time in all reps.")
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for phase, g in gc_df.groupby("phase"):
+        ax.bar([f"{phase} r{r}" for r in g["rep"]], g["gc_overhead_pct"].fillna(0), label=phase)
+    ax.set_ylabel("GC pause overhead (% of wall-clock time)")
+    ax.set_title("Per-repetition JVM GC overhead")
+    ax.legend()
+    plt.xticks(rotation=45, ha="right")
+    save_figure(fig, "fig_gc_overhead", output_dir)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze k6 results for the fraud-eval-harness testbed.")
     parser.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR,
@@ -853,12 +983,24 @@ def main():
     args = parser.parse_args()
 
     print(f"[*] Loading results from {args.results_dir} ...")
+
+    check_cpu_pin_log(args.results_dir)
+
+    failures = parse_run_failures(args.results_dir)
+    if failures:
+        print(f"[!] {len(failures)} entries in run_failures_log.txt:")
+        for line in failures:
+            print(f"    {line}")
+        print("[!] Exiting -- fix the cause and re-run the suite for a clean dataset.")
+        sys.exit(1)
+
     df = load_results(args.results_dir)
     print(f"[*] Loaded {len(df)} metric points from {df['source_file'].nunique()} file(s).")
 
     analyze_warmup(df, args.output_dir)
     analyze_baseline(df, args.output_dir)
     analyze_scan(df, args.output_dir)
+    analyze_gc_logs(args.results_dir, args.output_dir)
 
     print(f"\n[+] Done. Tables -> {os.path.join(args.output_dir, 'tables')}")
     print(f"[+] Done. Figures -> {os.path.join(args.output_dir, 'figures')}")

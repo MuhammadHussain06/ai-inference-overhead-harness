@@ -34,8 +34,11 @@ services:
     environment:
       - PYTHON_SERVICE_URL=http://python:8000
       - APP_DB_SAVE_ENABLED=false
-      # Fixed heap for reproducible sizing across hosts/reps.
-      - JAVA_TOOL_OPTIONS=-Xms1536m -Xmx1536m
+      # Fixed heap for reproducible sizing across hosts/reps. GC log lets
+      # tail-latency spikes be cross-checked against GC pauses.
+      - JAVA_TOOL_OPTIONS=-Xms1536m -Xmx1536m -Xlog:gc*:file=/gc-logs/gc.log:time,uptime,level,tags:filecount=0
+    volumes:
+      - ./results/gc-logs:/gc-logs
     depends_on:
       python-service:
         condition: service_healthy

@@ -30,7 +30,7 @@ done
 
 COMPOSE_FILE="../docker-compose.yml"
 RESULTS_DIR="../results"
-mkdir -p "$RESULTS_DIR"
+mkdir -p "$RESULTS_DIR" "$RESULTS_DIR/gc-logs"
 ORDER_LOG="${RESULTS_DIR}/run_order_log.txt"
 : > "$ORDER_LOG"   # truncate/create fresh each suite run
 METADATA_FILE="${RESULTS_DIR}/run_metadata.json"
@@ -321,6 +321,20 @@ check_oom_killed() {
   fi
 }
 
+# Moves the JVM's GC log (continuously written to gc.log for the container's
+# whole lifetime) to a rep-labeled file before the next restart_stack starts
+# a fresh JVM and overwrites it. Call once per rep, after that rep's cells.
+archive_gc_log() {
+  local label="$1"
+  local src="$RESULTS_DIR/gc-logs/gc.log"
+  local dest="$RESULTS_DIR/gc-logs/gc_${label}.log"
+  if [ -f "$src" ]; then
+    mv "$src" "$dest"
+  else
+    echo "  [!] No GC log found at ${src} for ${label}" | tee -a "$FAILURES_LOG"
+  fi
+}
+
 run_cell() {
   local label="$1"
   shift
@@ -355,6 +369,7 @@ for rep in $(seq 1 "$REPS_BASELINE"); do
       --out "json=/results/baseline_${target}_rep${rep}.json"
     sleep "$COOLDOWN_S"
   done
+  archive_gc_log "baseline_rep${rep}"
 done
 
 echo "[*] E2: concurrency scan x ${REPS_SCAN} independent repetitions"
@@ -392,6 +407,7 @@ for rep in $(seq 1 "$REPS_SCAN"); do
       sleep "$COOLDOWN_S"
     done
   done
+  archive_gc_log "scan_rep${rep}"
 done
 
 echo "[+] Suite complete. Raw results in ${RESULTS_DIR}/"
