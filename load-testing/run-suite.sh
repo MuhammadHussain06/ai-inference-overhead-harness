@@ -265,10 +265,9 @@ verify_cpu_pinning() {
   echo "  [cpu-pin] ${label}: OK -- pinning verified, proceeding."
 }
 
-# Confirms python-service actually loaded the expected feature tiers and
-# verified single-threaded inference (n_jobs=1) for each, via its own
-# /health endpoint -- silent tier-load failure would corrupt AI-tier cells
-# without ever showing up as a request-level error.
+# Confirms python-service's /health reports the expected loaded tiers and
+# n_jobs=1 verification -- a silent tier-load failure wouldn't otherwise
+# show up as a request-level error.
 verify_tiers() {
   local label="$1"
   local health_json
@@ -282,7 +281,7 @@ verify_tiers() {
 import json, sys
 try:
     data = json.load(sys.stdin)
-    print(",".join(sorted(data.get("loadedTiers", []), key=int)))
+    print(",".join(sorted((str(t) for t in data.get("loadedTiers", [])), key=int)))
 except Exception:
     print("")
 ')
