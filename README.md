@@ -88,10 +88,11 @@ Each service runs in its own container, pinned to a disjoint CPU range, so they 
 - Reactive Java stack end to end (WebFlux + R2DBC).
 - CPU pinning verified per repetition against each container's *live* cgroup cpuset — not just the requested compose config.
 - Model inference pinned to `n_jobs=1`, read back and verified, exposed on `/health` as `nJobsVerified`. `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS` all pinned to 1.
-- Valid feature-tier set is fetched from `fraud-ml-service`'s `/health` at startup — never hardcoded in Java.
+- Valid feature-tier set is fetched from `fraud-ml-service`'s `/health` at startup — never hardcoded in Java. `run-suite.sh` re-verifies this per rep (`loadedTiers` matches expected, `nJobsVerified` all true) and aborts the suite if it doesn't.
 - Outbound Java→Python connection pool is explicitly sized (`python.service.max-connections`, default `128`) and logged at startup.
 - In-memory H2 — clean slate every run.
 - Per-request logging is off on both services (Java: `TransactionService` at `WARN`; Python: `uvicorn --no-access-log`) — a synchronous stdout write on the WebFlux event loop or the request coroutine would otherwise stall it, adding latency/throughput noise unrelated to inference.
+- JVM GC events are logged continuously to `results/gc-logs/gc_<phase>_rep<N>.log` (one file per rep, archived by `run-suite.sh` before the next rep's JVM overwrites `gc.log`) — lets tail-latency spikes be cross-checked against GC pauses. Unified JVM logging has negligible overhead and doesn't sit on the request path.
 </details>
 
 <details>
@@ -225,7 +226,7 @@ Resource limits (`mem_limit`/`mem_reservation`/`cpus`) use Compose's plain (non-
 - 8+ logical cores (`cpuset` hardcoded to `0-2`/`3-5`/`6-7` across the three containers — adjust or drop on smaller machines)
 - ~7GB free RAM
 - k6 runs containerized (`grafana/k6`, pulled automatically on first `run-suite.sh` invocation) — no host install needed
-- Python 3 + `pip install -r analysis/requirements.txt` (pandas, numpy, matplotlib, scipy, statsmodels, tabulate)
+- Python 3 on the host — required by `run-suite.sh` itself (tier verification) in addition to `pip install -r analysis/requirements.txt` (pandas, numpy, matplotlib, scipy, statsmodels, tabulate) for the analysis phase
 - No GPU required
 
 ---
@@ -255,6 +256,7 @@ Requires `APP_DB_SAVE_ENABLED=false` in `docker-compose.yml`.
 | `run_metadata.json` | Timestamp, Docker/Compose versions, git commit + dirty flag, CPU/RAM, CPU governor/frequency snapshot |
 | `cpu_pin_check_log.txt` | Per-repetition requested-vs-live cpuset |
 | `warmup_*_rep{N}.json` | Warm-up latency, tagged `phase=warmup`, for convergence checks |
+| `gc-logs/gc_<phase>_rep{N}.log` | JVM GC events for that rep's transaction-service lifetime |
 
 ### CPU pinning verification
 
@@ -263,9 +265,11 @@ Requires `APP_DB_SAVE_ENABLED=false` in `docker-compose.yml`.
 - **Requested** — `docker inspect --format '{{.HostConfig.CpusetCpus}}'`
 - **Live** — `docker exec <container> cat /sys/fs/cgroup/cpuset.cpus.effective` (cgroup v2, falling back to the v1 path)
 
-A mismatch or empty value is flagged in both `cpu_pin_check_log.txt` and `run_failures_log.txt` — treat that repetition as not core-isolated.
+A mismatch or empty value aborts the whole suite immediately (`abort_suite`) — no results are written for that rep, and prior reps already on disk are unaffected.
 
-Failed cells (dropped connections, transient errors) are logged to `run_failures_log.txt` and skipped without aborting the suite. Stack-level setup failures still abort immediately. **Check `run_failures_log.txt` after every run** and re-run any listed cells before treating results as complete.
+`run-suite.sh` also verifies python-service's feature-tier loading each rep, via its own `/health` endpoint: the reported `loadedTiers` must match the AI tiers in `TARGETS` (derived automatically, not hardcoded twice), and `nJobsVerified` must be true for every tier. A silent tier-load failure would otherwise corrupt AI-tier cells without ever showing up as a request-level error. Same abort behavior as a cpu-pin mismatch.
+
+Any cell failure (dropped connection, transient error, OOM kill) aborts the suite the same way, rather than logging it and continuing — `analyze-results.py` rejects the whole dataset if `run_failures_log.txt` has any entries regardless, so there's no benefit to continuing past the first one. Fix the cause and re-run the suite for a clean dataset.
 
 ### Manual / one-off run
 
@@ -287,7 +291,8 @@ python3 analysis/analyze-results.py                  # tables + figures
 - **k6 is pinned to its own cpuset (`6-7`), separate from python-service (`0-2`) and transaction-service (`3-5`), and verified live each rep** — this stops k6 from directly contending with the services under test for cgroup-level scheduling slots. It does not isolate any of the three from the Docker daemon or the rest of the host OS, which remain unpinned; on a minimum-spec (8-core) host they still share physical cores with everything else running on the machine.
 - **`http_req_blocked` diagnostics are a partial check only** — they can't independently prove k6 never became the bottleneck at high concurrency.
 - **k6 is capped at 2 CPUs** — at high VUS counts, check `http_req_blocked` before trusting results, since a resource-starved load generator can look like service degradation.
-- **OOM kills are checked per cell** (`docker inspect --format '{{.State.OOMKilled}}'`) and logged to `run_failures_log.txt`, but a killed container ends that cell's data — re-run any flagged cells.
+- **OOM kills are checked per cell** (`docker inspect --format '{{.State.OOMKilled}}'`) and abort the suite immediately, same as a cpu-pin mismatch, rather than being logged and skipped.
+- **GC pause overhead is measured, not eliminated** — `table_gc_overhead` (from `analyze-results.py`) reports per-rep GC pause time as a % of wall-clock time; a rep above ~1% or with a single pause near the P99 latency should be treated as a candidate confound for that rep's tail, not attributed to inference cost.
 - **Instrumentation overhead is measured, not removed** — the `calibration` target bounds it as a floor; it stays baked into the AI/mock numbers.
 - **No verification the three `cpuset` ranges (python/java/k6) are on distinct physical cores** rather than SMT siblings.
 - **Pinning assumes a native Linux Docker host** — on Docker Desktop (macOS/Windows), `cpuset` inside the VM has no fixed relationship to physical cores.
