@@ -150,6 +150,7 @@ def load_results(results_dir):
                     "vus": tags.get("vus"),
                     "phase": tags.get("phase"),
                     "rep": tags.get("rep"),
+                    "rate": tags.get("rate"),
                     # HTTP status code; "0" means no response was received
                     "status": tags.get("status"),
                     "time": data.get("time"),
@@ -980,6 +981,64 @@ def analyze_gc_logs(results_dir, output_dir):
     save_figure(fig, "fig_gc_overhead", output_dir)
 
 
+def analyze_openloop_check(df, output_dir):
+    """
+    Optional: compares the manual open-loop (constant-arrival-rate) check
+    against the main suite's closed-loop scan at VUS 32/64, per tier.
+    Skipped silently if no openloop_*.json files are in --results-dir.
+    """
+    ol = df[df["source_file"].str.startswith("openloop") & (df["metric"] == "http_req_duration") &
+            (df["status"] == "200")]
+    if ol.empty:
+        return
+
+    dropped = df[df["source_file"].str.startswith("openloop") & (df["metric"] == "dropped_iterations")]
+
+    rows = []
+    for tier in sorted(ol["tier"].dropna().unique(), key=lambda t: TIER_ORDER.index(t) if t in TIER_ORDER else 99):
+        ol_stats = summarize(ol[ol["tier"] == tier], f"{_tier_label(tier)} open-loop")
+        if not ol_stats:
+            continue
+        rows.append({"Tier": _tier_label(tier), "Model": "Open-loop (constant-arrival-rate)",
+                     "P95 (ms)": ol_stats["P95 (ms)"], "P99 (ms)": ol_stats["P99 (ms)"],
+                     "N": ol_stats["N (pooled, all reps)"],
+                     "Dropped iterations": int(dropped[dropped["tier"] == tier]["value"].sum())})
+
+        for vus in (32, 64):
+            cl_cell = df[(df["phase"] == "scan") & (df["metric"] == "http_req_duration") &
+                         (df["status"] == "200") & (df["tier"] == tier) & (df["vus"] == vus)]
+            cl_stats = summarize(cl_cell, f"{_tier_label(tier)} closed-loop VUS={vus}")
+            if cl_stats:
+                rows.append({"Tier": _tier_label(tier), "Model": f"Closed-loop VUS={vus}",
+                             "P95 (ms)": cl_stats["P95 (ms)"], "P99 (ms)": cl_stats["P99 (ms)"],
+                             "N": cl_stats["N (pooled, all reps)"], "Dropped iterations": "n/a"})
+
+    if not rows:
+        return
+
+    table = pd.DataFrame(rows)
+    save_table(table, "table7_openloop_validity_check", output_dir,
+               caption="Open-loop (constant-arrival-rate) tail latency vs. the closed-loop scan at "
+                       "VUS 32/64, for manually-checked tiers. Validates the concurrency scan against "
+                       "coordinated omission; not part of the automated suite.",
+               label="tab:openloop-validity")
+
+    fig, ax = plt.subplots(figsize=(6, 4), dpi=300)
+    tiers = table["Tier"].unique()
+    models = table["Model"].unique()
+    x = np.arange(len(tiers))
+    width = 0.8 / max(len(models), 1)
+    for i, m in enumerate(models):
+        ys = [table.loc[(table["Tier"] == t) & (table["Model"] == m), "P99 (ms)"].mean() for t in tiers]
+        ax.bar(x + i * width, ys, width, label=m)
+    ax.set_xticks(x + width * (len(models) - 1) / 2)
+    ax.set_xticklabels(tiers)
+    ax.set_ylabel("P99 Latency (ms)")
+    ax.set_title("Closed-loop vs. Open-loop P99 (validity check)", fontweight="bold")
+    ax.legend(fontsize=7)
+    save_figure(fig, "figure7_openloop_validity_check", output_dir)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze k6 results for the fraud-eval-harness testbed.")
     parser.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR,
@@ -1007,6 +1066,7 @@ def main():
     analyze_baseline(df, args.output_dir)
     analyze_scan(df, args.output_dir)
     analyze_gc_logs(args.results_dir, args.output_dir)
+    analyze_openloop_check(df, args.output_dir)
 
     print(f"\n[+] Done. Tables -> {os.path.join(args.output_dir, 'tables')}")
     print(f"[+] Done. Figures -> {os.path.join(args.output_dir, 'figures')}")
