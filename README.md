@@ -13,6 +13,7 @@ python3 analysis/analyze-results.py      # generate tables + figures
 ## Table of Contents
 
 - [Idea](#idea)
+- [Scope](#scope)
 - [Architecture](#architecture)
 - [Features](#features)
 - [Dataset](#dataset)
@@ -41,6 +42,14 @@ This separation lets you attribute latency precisely:
 - **AI tier − Calibration** ≈ DataFrame construction + model inference
 - DB persistence (`APP_DB_SAVE_ENABLED=false`) is off for all benchmark runs, so writes never enter the measured path
 - In-memory H2 — every run starts from a clean slate
+
+---
+
+## Scope
+
+**This testbed answers:** in a synchronous, single-node, single-request microservice call, how much of end-to-end latency is model compute versus everything else (network, framework, serialization, queueing) — and how that ratio shifts with model complexity (feature-tier) and concurrency.
+
+**It deliberately does not answer:** batched or dynamic-batching inference cost (every call is a single row in, single prediction out — see [Limitations](#limitations)), multi-model or multi-tenant serving, GPU-backed inference, multi-region/network-hop latency, or production fraud-detection accuracy (accuracy is never measured — the fraud-detection model is an incidental stand-in workload chosen for its four-tier feature-count structure, not for its domain).
 
 ---
 
@@ -100,7 +109,7 @@ Each service runs in its own container, pinned to a disjoint CPU range, so they 
 
 - `run-suite.sh`: full baseline + concurrency-scan suite across clean-slate restarts, with per-repetition target/concurrency shuffling, CPU-pin verification, host/toolchain provenance fingerprinting, and a failures log so one broken cell doesn't abort the run.
 - `warm-up.js`: JIT/pool warm-up once per restart, hitting every target sequentially in its own window (plus a second max-VUS pass before the concurrency scan). Shares code with `run-target.js` so warm-up traffic is tagged and classified identically to measured traffic.
-- `analyze-results.py`: P50/P95/P99 tables and histograms per strategy/tier, Mann-Whitney U significance testing (Holm-Bonferroni corrected, rank-biserial effect sizes), cluster-level bootstrap CIs, reproducibility (CoV% across reps), paired error/timeout tables, client-contention diagnostics, warm-up convergence checks, and throughput-vs-concurrency figures.
+- `analyze-results.py`: P50/P95/P99 tables and histograms per strategy/tier, Mann-Whitney U significance testing (Holm-Bonferroni corrected, rank-biserial effect sizes), cluster-level bootstrap CIs, reproducibility (CoV% across reps), paired error/timeout tables, client-contention diagnostics, warm-up convergence checks, throughput-vs-concurrency figures, and an optional open-loop-vs-closed-loop validity check (see [Running](#running)) when `openloop_*.json` files are present.
 </details>
 
 ---
@@ -282,6 +291,21 @@ python3 analysis/analyze-results.py                  # tables + figures
 
 `warm-up.js` is tunable via `WARMUP_ITERATIONS_PER_TARGET`, `WARMUP_VUS`, `WARMUP_MAX_DURATION_S`, and reads `BASE_URL` (falls back to `http://localhost:8080/api/v1/transactions`).
 
+### Open-loop validity check (optional)
+
+The main suite's concurrency scan is closed-loop (see [Limitations](#limitations)). `run-target-openloop.js` runs the same target under a `constant-arrival-rate` executor instead, so requests fire on a fixed schedule regardless of how fast responses come back — this is the standard mitigation for coordinated omission. Run it against the top 1–2 concurrency cells only, after the main suite, as a check on whether the closed-loop tail-latency numbers hold up:
+
+```bash
+docker compose up
+k6 run load-testing/warm-up.js
+TARGET=28 RATE=32 TIME_UNIT=1s DURATION=2m PRE_ALLOCATED_VUS=64 MAX_VUS=128 \
+  k6 run --out json=results/openloop_28_rate32.json load-testing/run-target-openloop.js
+```
+
+`RATE` is requests per `TIME_UNIT` — set it to roughly the throughput the closed-loop cell achieved at that VUS level, not the VUS count itself. `PRE_ALLOCATED_VUS`/`MAX_VUS` must be generous enough to sustain `RATE` if response times climb; k6 logs a `dropped_iterations` warning if it runs out of headroom, which itself is diagnostic (it means the server can't sustain that arrival rate — a real finding, not a script bug). This script is standalone and manual by design — it is not invoked by `run-suite.sh` and does not replace the main suite.
+
+Output filenames must start with `openloop` (e.g. `openloop_28_rate32.json`) — `analyze-results.py` detects any such files in `--results-dir`, and if present, adds `table7_openloop_validity_check` and `figure7_openloop_validity_check` comparing open-loop P95/P99 against the closed-loop scan at VUS 32/64 for the same tier. If no `openloop_*` files are present, this step is skipped silently and the rest of the analysis is unaffected.
+
 ---
 
 ## Limitations
@@ -291,6 +315,9 @@ python3 analysis/analyze-results.py                  # tables + figures
 - **k6 is pinned to its own cpuset (`6-7`), separate from python-service (`0-2`) and transaction-service (`3-5`), and verified live each rep** — this stops k6 from directly contending with the services under test for cgroup-level scheduling slots. It does not isolate any of the three from the Docker daemon or the rest of the host OS, which remain unpinned; on a minimum-spec (8-core) host they still share physical cores with everything else running on the machine.
 - **`http_req_blocked` diagnostics are a partial check only** — they can't independently prove k6 never became the bottleneck at high concurrency.
 - **k6 is capped at 2 CPUs** — at high VUS counts, check `http_req_blocked` before trusting results, since a resource-starved load generator can look like service degradation.
+- **The main suite's load model is closed-loop (`per-vu-iterations`)** — each VU waits for a response before issuing its next request, so under a GC pause or saturation the offered load drops instead of queuing (the "coordinated omission" failure mode). This specifically risks understating P95/P99 at the highest-concurrency cells, which is where the concurrency-scan's tail-latency claims live. Per-rep GC-log correlation and CoV-based reproducibility (`analyze-results.py`) give partial, not full, protection against this. `load-testing/run-target-openloop.js` runs a `constant-arrival-rate` (open-loop) check at a fixed request rate for the top 1–2 concurrency cells (32/64) as a targeted validity check against the closed-loop numbers — it is a manual, standalone script, not wired into `run-suite.sh`, and is not intended to replace the main suite's load model.
+- **Every inference call is a single row in, single prediction out** — there is no batching path anywhere in `fraud-ml-service` (`pd.DataFrame([row])` per request). Results characterize unbatched synchronous-call overhead only; they say nothing about batched or dynamically-batched serving cost.
+- **Concurrency-scan P99s are not uniformly powered** — `ITERATIONS_PER_VU` holds per-VU sample count constant while total N grows with VUS (100 at VUS=1, 6400 at VUS=64, by design, to resolve tail percentiles under contention). This means P99 confidence intervals widen at lower concurrency levels; don't read a table of per-concurrency P99s as equally precise across the row.
 - **OOM kills are checked per cell** (`docker inspect --format '{{.State.OOMKilled}}'`) and abort the suite immediately, same as a cpu-pin mismatch, rather than being logged and skipped.
 - **GC pause overhead is measured, not eliminated** — `table_gc_overhead` (from `analyze-results.py`) reports per-rep GC pause time as a % of wall-clock time; a rep above ~1% or with a single pause near the P99 latency should be treated as a candidate confound for that rep's tail, not attributed to inference cost.
 - **Instrumentation overhead is measured, not removed** — the `calibration` target bounds it as a floor; it stays baked into the AI/mock numbers.
@@ -320,7 +347,8 @@ python3 analysis/analyze-results.py                  # tables + figures
 ├── load-testing/
 │   ├── run-suite.sh              # full baseline + concurrency-scan orchestrator
 │   ├── warm-up.js                # per-target sequential JIT/pool warm-up
-│   ├── run-target.js             # single (target, concurrency, rep) cell runner
+│   ├── run-target.js             # single (target, concurrency, rep) cell runner (closed-loop)
+│   ├── run-target-openloop.js    # manual constant-arrival-rate check, top concurrency cells only
 │   └── lib/common.js             # shared sendTransaction()/TARGETS + telemetry Trends
 └── services/
     ├── fraud-ml-service/            # Python FastAPI inference service
