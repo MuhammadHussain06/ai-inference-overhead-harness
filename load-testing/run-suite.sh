@@ -39,8 +39,8 @@ FAILURES_LOG="${RESULTS_DIR}/run_failures_log.txt"
 CPU_PIN_LOG="${RESULTS_DIR}/cpu_pin_check_log.txt"
 : > "$CPU_PIN_LOG"   # truncate/create fresh each suite run
 
-TARGETS=(mock calibration 5 10 20 28)
-CONCURRENCY_LEVELS=(1 2 4 8 16 32 64)
+TARGETS=(${TARGETS_OVERRIDE:-mock calibration 5 10 20 28})
+CONCURRENCY_LEVELS=(${CONCURRENCY_OVERRIDE:-1 2 4 8 16 32 64})
 # AI-tier subset of TARGETS, sorted -- what python-service's /health should
 # report as loadedTiers. Derived from TARGETS so it can't drift out of sync.
 EXPECTED_TIERS=$(printf '%s\n' "${TARGETS[@]}" | grep -E '^[0-9]+$' | sort -n | tr '\n' ',' | sed 's/,$//')
@@ -49,13 +49,15 @@ MAX_VUS=0
 for _lvl in "${CONCURRENCY_LEVELS[@]}"; do
   if [ "$_lvl" -gt "$MAX_VUS" ]; then MAX_VUS="$_lvl"; fi
 done
-BASELINE_ITERATIONS=500
-SCAN_ITERATIONS_PER_VU=100
+BASELINE_ITERATIONS="${BASELINE_ITERATIONS_OVERRIDE:-500}"
+SCAN_ITERATIONS_PER_VU="${SCAN_ITERATIONS_PER_VU_OVERRIDE:-100}"
 COOLDOWN_S=10
-REPS_BASELINE=5
+REPS_BASELINE="${REPS_BASELINE_OVERRIDE:-5}"
 # n=5 vs 5 keeps the minimum achievable two-sided Mann-Whitney p-value
 # (0.0079) below alpha=0.05, matching REPS_BASELINE's power for table5/table6.
-REPS_SCAN=5
+# Overriding below 5 (e.g. for a smoke test) drops below that power -- fine
+# for a pipeline check, not for a rep count you intend to analyze for real.
+REPS_SCAN="${REPS_SCAN_OVERRIDE:-5}"
 
 
 capture_run_metadata() {
