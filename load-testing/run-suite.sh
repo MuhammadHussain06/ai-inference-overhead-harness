@@ -32,8 +32,9 @@ COMPOSE_FILE="../docker-compose.yml"
 RESULTS_DIR="../results"
 mkdir -p "$RESULTS_DIR" "$RESULTS_DIR/gc-logs"
 
-# Timestamp-archives prior cell logs, JSON metrics, and GC output outside
-# of RESULTS_DIR to prevent non-recursive analysis glob collisions.
+# Timestamp-archives prior cell logs, JSON metrics, and GC output into
+# results/archive/<timestamp>/ -- a subdirectory analyze-results.py's
+# non-recursive glob never descends into.
 if compgen -G "${RESULTS_DIR}/*.json" > /dev/null 2>&1 || [ -f "${RESULTS_DIR}/run_order_log.txt" ]; then
   ARCHIVE_DIR="${RESULTS_DIR}/archive/$(date +%Y%m%d_%H%M%S)"
   mkdir -p "$ARCHIVE_DIR"
