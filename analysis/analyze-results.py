@@ -608,14 +608,17 @@ def analyze_baseline(df, output_dir):
             row[metric] = round(float(vals.mean()), 3) if not vals.empty else np.nan
         net_vals = base[(base["metric"] == JAVA_NETWORK_OVERHEAD_METRIC) & (base["tier"] == t) & (base["status"] == "200")]["value"]
         row[JAVA_NETWORK_OVERHEAD_METRIC] = round(float(net_vals.mean()), 3) if not net_vals.empty else np.nan
+        row["Negative (%)"] = round(100 * float((net_vals < 0).mean()), 1) if not net_vals.empty else np.nan
+        row["Min (ms)"] = round(float(net_vals.min()), 3) if not net_vals.empty else np.nan
         decomp_rows.append(row)
     table2 = pd.DataFrame(decomp_rows)
     save_table(table2, "table2_baseline_python_decomposition_mean_ms", output_dir,
                caption="Mean Python-side latency decomposition (ms) by tier at VUS=1, pooled across "
                        "repetitions, with the estimated network overhead (round-trip time minus "
-                       "Python execution time) shown alongside. Occasional small negative values in "
-                       "that column reflect estimation noise in the serialization-time measurement, "
-                       "not a real negative transit time.",
+                       "Python execution time) shown alongside. 'Negative (%)' and 'Min (ms)' quantify "
+                       "how often and how far that column goes negative per tier -- a small, tier-"
+                       "consistent rate reflects clock/timer noise between the two processes; a large "
+                       "or tier-clustered rate would indicate a real measurement problem, not noise.",
                label="tab:baseline-decomp")
 
     # Table 3: DataFrame-construction share of measured computation time
