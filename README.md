@@ -242,6 +242,20 @@ Resource limits (`mem_limit`/`mem_reservation`/`cpus`) use Compose's plain (non-
 
 ## Running
 
+### Smoke test (recommended before the full suite)
+
+A small, fast pass through the same verified pipeline — 2 targets, 2 concurrency levels, 2 reps, reduced iteration counts — to catch a structural problem (bad config, a broken tag, a mislabeled tier) in minutes instead of hours into a real run. Also fires one deliberately over-rate open-loop request to confirm `dropped_iterations` is actually detected.
+
+```bash
+docker compose up -d
+cd load-testing
+./run-smoke-test.sh
+```
+
+Check `run_failures_log.txt` and `cpu_pin_check_log.txt` afterward, and confirm `table7_openloop_validity_check` shows a nonzero dropped-iterations count for the smoke-openloop cell. Clean here means the pipeline is trustworthy, not that any given rep count is sufficient — re-run the smoke test after any fix until it passes, then move to the full suite.
+
+`run-suite.sh`'s `TARGETS`, `CONCURRENCY_LEVELS`, `REPS_BASELINE`, `REPS_SCAN`, `BASELINE_ITERATIONS`, and `SCAN_ITERATIONS_PER_VU` are all overridable via `TARGETS_OVERRIDE`, `CONCURRENCY_OVERRIDE`, `REPS_BASELINE_OVERRIDE`, `REPS_SCAN_OVERRIDE`, `BASELINE_ITERATIONS_OVERRIDE`, and `SCAN_ITERATIONS_PER_VU_OVERRIDE` env vars — `run-smoke-test.sh` is a thin wrapper setting these to a small slice; unset, `run-suite.sh` behaves exactly as before.
+
 ### Full suite (recommended)
 
 Restarts the stack per repetition, shuffles order, logs provenance.
@@ -346,6 +360,7 @@ Output filenames must start with `openloop` (e.g. `openloop_28_rate32.json`) —
 │   └── requirements.txt
 ├── load-testing/
 │   ├── run-suite.sh              # full baseline + concurrency-scan orchestrator
+│   ├── run-smoke-test.sh         # small pipeline-check pass before the full suite
 │   ├── warm-up.js                # per-target sequential JIT/pool warm-up
 │   ├── run-target.js             # single (target, concurrency, rep) cell runner (closed-loop)
 │   ├── run-target-openloop.js    # manual constant-arrival-rate check, top concurrency cells only
