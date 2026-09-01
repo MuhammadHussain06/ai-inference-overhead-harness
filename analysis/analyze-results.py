@@ -997,15 +997,22 @@ def analyze_openloop_check(df, output_dir):
 
     dropped = df[df["source_file"].str.startswith("openloop") & (df["metric"] == "dropped_iterations")]
 
+    # dropped_iterations lacks per-request tier tags as unexecuted iterations miss http.post().
+    # Attributes drops via source_file (openloop_<tier>_*.json) using http_req_duration tags.
+    file_tier = ol.groupby("source_file")["tier"].first()
+    dropped_by_file = dropped.groupby("source_file")["value"].sum()
+
     rows = []
     for tier in sorted(ol["tier"].dropna().unique(), key=lambda t: TIER_ORDER.index(t) if t in TIER_ORDER else 99):
         ol_stats = summarize(ol[ol["tier"] == tier], f"{_tier_label(tier)} open-loop")
         if not ol_stats:
             continue
+        tier_files = file_tier[file_tier == tier].index
+        dropped_count = int(dropped_by_file.reindex(tier_files, fill_value=0).sum())
         rows.append({"Tier": _tier_label(tier), "Model": "Open-loop (constant-arrival-rate)",
                      "P95 (ms)": ol_stats["P95 (ms)"], "P99 (ms)": ol_stats["P99 (ms)"],
                      "N": ol_stats["N (pooled, all reps)"],
-                     "Dropped iterations": int(dropped[dropped["tier"] == tier]["value"].sum())})
+                     "Dropped iterations": dropped_count})
 
         for vus in (32, 64):
             cl_cell = df[(df["phase"] == "scan") & (df["metric"] == "http_req_duration") &

@@ -31,6 +31,21 @@ done
 COMPOSE_FILE="../docker-compose.yml"
 RESULTS_DIR="../results"
 mkdir -p "$RESULTS_DIR" "$RESULTS_DIR/gc-logs"
+
+# Timestamp-archives prior cell logs, JSON metrics, and GC output outside
+# of RESULTS_DIR to prevent non-recursive analysis glob collisions.
+if compgen -G "${RESULTS_DIR}/*.json" > /dev/null 2>&1 || [ -f "${RESULTS_DIR}/run_order_log.txt" ]; then
+  ARCHIVE_DIR="${RESULTS_DIR}/archive/$(date +%Y%m%d_%H%M%S)"
+  mkdir -p "$ARCHIVE_DIR"
+  find "$RESULTS_DIR" -maxdepth 1 -name '*.json' -exec mv {} "$ARCHIVE_DIR/" \;
+  find "$RESULTS_DIR" -maxdepth 1 -name '*_log.txt' -exec mv {} "$ARCHIVE_DIR/" \;
+  if [ -d "${RESULTS_DIR}/gc-logs" ] && [ -n "$(ls -A "${RESULTS_DIR}/gc-logs" 2>/dev/null)" ]; then
+    mv "${RESULTS_DIR}/gc-logs" "${ARCHIVE_DIR}/gc-logs"
+    mkdir -p "${RESULTS_DIR}/gc-logs"
+  fi
+  echo "[*] Archives previous run's results to ${ARCHIVE_DIR}"
+fi
+
 ORDER_LOG="${RESULTS_DIR}/run_order_log.txt"
 : > "$ORDER_LOG"   # truncate/create fresh each suite run
 METADATA_FILE="${RESULTS_DIR}/run_metadata.json"

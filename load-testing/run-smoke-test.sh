@@ -20,10 +20,12 @@ SCAN_ITERATIONS_PER_VU_OVERRIDE=10 \
 ./run-suite.sh
 
 echo "[*] Deliberate over-rate open-loop check (expect dropped_iterations > 0)"
-BASE_URL="${BASE_URL:-http://localhost:8080/api/v1/transactions}" \
-TARGET=28 RATE=5000 TIME_UNIT=1s DURATION=20s \
-PRE_ALLOCATED_VUS=32 MAX_VUS=64 PHASE=smoke-openloop REP=1 \
-  k6 run --out json=../results/openloop_28_smoke.json run-target-openloop.js
+# Runs in container to mirror run-suite.sh k6_run() without host k6 dependencies.
+# Uses docker-compose BASE_URL and volume mounts (./load-testing:/scripts, ./results:/results).
+docker compose -f ../docker-compose.yml --profile loadgen run --rm -T \
+  -e TARGET=28 -e RATE=5000 -e TIME_UNIT=1s -e DURATION=20s \
+  -e PRE_ALLOCATED_VUS=32 -e MAX_VUS=64 -e PHASE=smoke-openloop -e REP=1 \
+  k6 run /scripts/run-target-openloop.js --out json=/results/openloop_28_smoke.json
 
 echo "[*] Running analyze-results.py -- confirm it completes and table7/figure7 appear"
 python3 ../analysis/analyze-results.py
