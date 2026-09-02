@@ -17,6 +17,7 @@ REPS_BASELINE_OVERRIDE=2 \
 REPS_SCAN_OVERRIDE=2 \
 BASELINE_ITERATIONS_OVERRIDE=20 \
 SCAN_ITERATIONS_PER_VU_OVERRIDE=10 \
+WARMUP_ITERATIONS_PER_TARGET_OVERRIDE=20 \
 ./run-suite.sh
 
 echo "[*] Deliberate over-rate open-loop check (expect dropped_iterations > 0)"

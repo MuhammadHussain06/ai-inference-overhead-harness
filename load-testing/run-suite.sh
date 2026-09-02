@@ -77,6 +77,19 @@ for _lvl in "${CONCURRENCY_LEVELS[@]}"; do
 done
 BASELINE_ITERATIONS="${BASELINE_ITERATIONS_OVERRIDE:-500}"
 SCAN_ITERATIONS_PER_VU="${SCAN_ITERATIONS_PER_VU_OVERRIDE:-100}"
+# Unset by default -- warm-up.js's own 1500 default applies for the full suite.
+# Set for a reduced-scale run (e.g. the smoke test) so warm-up doesn't dwarf it.
+WARMUP_ITERATIONS_PER_TARGET_OVERRIDE="${WARMUP_ITERATIONS_PER_TARGET_OVERRIDE:-}"
+
+# Shared warm-up env args: WARMUP_TARGETS keeps warm-up scoped to this run's
+# actual TARGETS (matters when TARGETS_OVERRIDE reduces it, e.g. the smoke
+# test) instead of always warming all 6 targets regardless of what's being
+# tested. WARMUP_ITERATIONS_PER_TARGET only passed if explicitly overridden,
+# so the full suite keeps warm-up.js's own 1500 default untouched.
+WARMUP_ENV_ARGS=("WARMUP_TARGETS=${TARGETS[*]}")
+if [ -n "$WARMUP_ITERATIONS_PER_TARGET_OVERRIDE" ]; then
+  WARMUP_ENV_ARGS+=("WARMUP_ITERATIONS_PER_TARGET=${WARMUP_ITERATIONS_PER_TARGET_OVERRIDE}")
+fi
 COOLDOWN_S=10
 REPS_BASELINE="${REPS_BASELINE_OVERRIDE:-5}"
 # n=5 vs 5 keeps the minimum achievable two-sided Mann-Whitney p-value
@@ -429,7 +442,7 @@ for rep in $(seq 1 "$REPS_BASELINE"); do
   verify_cpu_pinning "baseline rep=${rep}"
   verify_tiers "baseline rep=${rep}"
   echo "[*] Warming up JIT / connection pools..."
-  k6_run warm-up.js -- --out "json=/results/warmup_baseline_rep${rep}.json"
+  k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" -- --out "json=/results/warmup_baseline_rep${rep}.json"
   sleep "$COOLDOWN_S"
 
   # Independent per-rep shuffle of target order.
@@ -456,13 +469,13 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   verify_cpu_pinning "scan rep=${rep}"
   verify_tiers "scan rep=${rep}"
   echo "[*] Warming up JIT / connection pools (default VUS)..."
-  k6_run warm-up.js -- --out "json=/results/warmup_scan_rep${rep}.json"
+  k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" -- --out "json=/results/warmup_scan_rep${rep}.json"
   sleep "$COOLDOWN_S"
 
   # Matches warm-up concurrency to the scan's peak VUS; separate output
   # file so table0's convergence check can report on it distinctly.
   echo "[*] Warming up JIT / connection pools (MAX_VUS=${MAX_VUS})..."
-  k6_run warm-up.js WARMUP_VUS="$MAX_VUS" -- \
+  k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" WARMUP_VUS="$MAX_VUS" -- \
     --out "json=/results/warmup_scan_maxvus_rep${rep}.json"
   sleep "$COOLDOWN_S"
 

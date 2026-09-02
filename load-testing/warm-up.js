@@ -14,6 +14,8 @@ import { sendTransaction, TARGETS } from './lib/common.js';
 //   WARMUP_ITERATIONS_PER_TARGET : Requests sent per target window [Default: 1500]
 //   WARMUP_VUS                   : Concurrent VUs per target window [Default: 5]
 //   WARMUP_MAX_DURATION_S        : Hard per-target timeout ceiling (seconds) [Default: 60]
+//   WARMUP_TARGETS                : Space-separated target keys to warm, in order
+//                                   [Default: mock calibration 5 10 20 28]
 //   BASE_URL                     : Target API endpoint [Default: http://localhost:8080/api/v1/transactions]
 
 const ITERATIONS_PER_TARGET = parseInt(__ENV.WARMUP_ITERATIONS_PER_TARGET || '1500', 10);
@@ -26,26 +28,26 @@ const ITERATIONS_PER_VU = Math.max(1, Math.ceil(ITERATIONS_PER_TARGET / VUS));
 // VUs spin up (guarantees strict non-overlap regardless of pacing).
 const SLOT_S = MAX_DURATION_S + 5;
 
-const ORDER = ['mock', 'calibration', '5', '10', '20', '28'];
+const ORDER = (__ENV.WARMUP_TARGETS || 'mock calibration 5 10 20 28').trim().split(/\s+/);
 
 export const options = {
-  scenarios: Object.fromEntries(
-      ORDER.map((key, i) => [
-        `warm_${key}`,
-        {
-          executor: 'per-vu-iterations',
-          vus: VUS,
-          iterations: ITERATIONS_PER_VU,
-          maxDuration: `${MAX_DURATION_S}s`,
-          startTime: `${i * SLOT_S}s`,
-          exec: `warm_${key}`,
-        },
-      ])
-  ),
+    scenarios: Object.fromEntries(
+        ORDER.map((key, i) => [
+            `warm_${key}`,
+            {
+                executor: 'per-vu-iterations',
+                vus: VUS,
+                iterations: ITERATIONS_PER_VU,
+                maxDuration: `${MAX_DURATION_S}s`,
+                startTime: `${i * SLOT_S}s`,
+                exec: `warm_${key}`,
+            },
+        ])
+    ),
 };
 
 function warm(key) {
-  sendTransaction(TARGETS[key], { phase: 'warmup' });
+    sendTransaction(TARGETS[key], { phase: 'warmup' });
 }
 
 
