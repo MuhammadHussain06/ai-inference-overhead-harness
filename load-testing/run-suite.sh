@@ -28,6 +28,16 @@ for _req_cmd in docker curl shuf python3; do
   fi
 done
 
+# Warns on WSL2: cgroup cpuset checks pass, but Hyper-V host core migration is unobservable.
+# Non-blocking; flags warning and records status in run_metadata.json.
+IS_WSL2="false"
+if grep -qi microsoft /proc/version 2>/dev/null; then
+  IS_WSL2="true"
+  echo "[!] WSL2 detected -- physical-core pinning is not guaranteed even when" >&2
+  echo "    verify_cpu_pinning() reports OK (see README Limitations). Recorded" >&2
+  echo "    in run_metadata.json for this run." >&2
+fi
+
 COMPOSE_FILE="../docker-compose.yml"
 RESULTS_DIR="../results"
 mkdir -p "$RESULTS_DIR" "$RESULTS_DIR/gc-logs"
@@ -141,6 +151,7 @@ capture_run_metadata() {
 {
   "timestamp_utc": "$(json_escape "$timestamp")",
   "host_uname": "$(json_escape "$host_uname")",
+  "wsl2_detected": "${IS_WSL2}",
   "docker_version": "$(json_escape "$docker_version")",
   "docker_compose_version": "$(json_escape "$compose_version")",
   "git_commit": "$(json_escape "$git_commit")",
@@ -164,7 +175,7 @@ capture_run_metadata() {
 }
 EOF
 
-  echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} governor=${cpu_governor} freq_khz=${cpu_freq_khz} git=${git_commit:0:12}"
+  echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} governor=${cpu_governor} freq_khz=${cpu_freq_khz} git=${git_commit:0:12} wsl2=${IS_WSL2}"
 }
 
 # Parses a Docker cpuset string (e.g., "3-5" or "0,2,4") to compute the target core
