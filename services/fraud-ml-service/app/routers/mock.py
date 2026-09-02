@@ -12,11 +12,11 @@ router = APIRouter()
 
 
 def _score_mock():
-    comp_start = time.perf_counter()
+    # computationTimeMs stays 0.0, matching calibration._noop(): the field means
+    # dataframeConstructionTimeMs + modelInferenceTimeMs, neither of which applies here.
     risk_score = random.uniform(0.0, 1.0)
     is_fraud = risk_score >= settings.FRAUD_THRESHOLD
-    computation_time_ms = (time.perf_counter() - comp_start) * 1000
-    return is_fraud, risk_score, computation_time_ms
+    return is_fraud, risk_score, 0.0
 
 
 @router.post("/predict/mock", response_model=TransactionResponse, response_model_by_alias=True)

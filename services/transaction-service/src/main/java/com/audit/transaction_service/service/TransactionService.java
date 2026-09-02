@@ -156,6 +156,8 @@ public class TransactionService {
                         entity.setRiskScore(riskScore);
                         entity.setTransactionStatus(status);
                         entity.setEvaluationStrategy(strategy);
+                        // Pre-save snapshot; excludes DB write time, unlike the response's executionTimeMs.
+                        entity.setExecutionTimeMs((System.nanoTime() - overallStartTime) / 1_000_000.0);
 
                         long dbStart = System.nanoTime();
                         return transactionRepository.save(entity)
