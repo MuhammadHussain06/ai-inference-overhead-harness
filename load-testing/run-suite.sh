@@ -32,9 +32,8 @@ COMPOSE_FILE="../docker-compose.yml"
 RESULTS_DIR="../results"
 mkdir -p "$RESULTS_DIR" "$RESULTS_DIR/gc-logs"
 
-# Timestamp-archives prior cell logs, JSON metrics, and GC output into
-# results/archive/<timestamp>/ -- a subdirectory analyze-results.py's
-# non-recursive glob never descends into.
+# Timestamp-archives prior cell logs, JSON metrics, and GC output outside
+# of RESULTS_DIR to prevent non-recursive analysis glob collisions.
 if compgen -G "${RESULTS_DIR}/*.json" > /dev/null 2>&1 || [ -f "${RESULTS_DIR}/run_order_log.txt" ]; then
   ARCHIVE_DIR="${RESULTS_DIR}/archive/$(date +%Y%m%d_%H%M%S)"
   mkdir -p "$ARCHIVE_DIR"
@@ -57,9 +56,10 @@ CPU_PIN_LOG="${RESULTS_DIR}/cpu_pin_check_log.txt"
 
 TARGETS=(${TARGETS_OVERRIDE:-mock calibration 5 10 20 28})
 CONCURRENCY_LEVELS=(${CONCURRENCY_OVERRIDE:-1 2 4 8 16 32 64})
-# AI-tier subset of TARGETS, sorted -- what python-service's /health should
-# report as loadedTiers. Derived from TARGETS so it can't drift out of sync.
-EXPECTED_TIERS=$(printf '%s\n' "${TARGETS[@]}" | grep -E '^[0-9]+$' | sort -n | tr '\n' ',' | sed 's/,$//')
+# python-service always loads every tier in docker-compose.yml's FEATURE_TIERS,
+# regardless of which subset of targets this invocation exercises -- keep in
+# sync with docker-compose.yml's FEATURE_TIERS if that value ever changes.
+EXPECTED_TIERS="5,10,20,28"
 # Derived from CONCURRENCY_LEVELS; used by E2's max-VUS warm-up pass below.
 MAX_VUS=0
 for _lvl in "${CONCURRENCY_LEVELS[@]}"; do
