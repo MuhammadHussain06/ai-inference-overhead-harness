@@ -907,6 +907,8 @@ GC_LINE_RE = re.compile(
     r"^\[[^\]]+\]\[(?P<uptime>[\d.]+)s\]\[(?P<level>[a-z]+)\s*\]\[(?P<tags>[^\]]+?)\s*\]\s*(?P<msg>.*)$"
 )
 GC_DUR_RE = re.compile(r"(?P<dur_ms>[\d.]+)ms\s*$")
+# G1 messages are prefixed "GC(N) Pause ..."; startswith("Pause") never matches this.
+GC_PAUSE_RE = re.compile(r"^GC\(\d+\)\s+Pause")
 
 
 def parse_gc_log(path):
@@ -924,7 +926,7 @@ def parse_gc_log(path):
             if m.group("level") != "info" or m.group("tags") != "gc":
                 continue
             msg = m.group("msg")
-            if not msg.startswith("Pause"):
+            if not GC_PAUSE_RE.match(msg):
                 continue
             dm = GC_DUR_RE.search(msg)
             if dm:
