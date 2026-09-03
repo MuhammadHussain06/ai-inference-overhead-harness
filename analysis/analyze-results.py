@@ -1,11 +1,8 @@
 """
-Analyzes k6 load-test results from load-testing/run-suite.sh.
-
-Computes latency distributions, scaling behavior, and run-to-run reproducibility
-for the baseline (E1) and concurrency scan (E2) experiments. Significance tests
-run on rep-level means (Holm-Bonferroni corrected, with rank-biserial effect
-size) to avoid pseudoreplication. Latency tables cover HTTP 200 requests only,
-each paired with an error-rate table.
+Analyzes k6 load-test results from load-testing/run-suite.sh: latency,
+scaling, and reproducibility for the baseline (E1) and concurrency scan
+(E2) experiments. Significance tests use rep-level means (Holm-Bonferroni,
+rank-biserial effect size). Latency tables cover HTTP 200 requests only.
 
 Usage:
     python3 analyze-results.py [--results-dir ../results] [--output-dir ./output]
@@ -41,9 +38,8 @@ PYTHON_TELEMETRY_METRICS = [
     "python_total_time_ms",
 ]
 
-# Java-side estimate: aiCallRoundTripTimeMs minus Python's own totalPythonExecutionTimeMs.
-# Not part of PYTHON_TELEMETRY_METRICS (different side of the wire, different meaning) but
-# reported alongside it in Table 2 since it fills out the same latency decomposition.
+# Java-side estimate (round-trip time minus Python execution time); reported
+# alongside Table 2's decomposition though it's not a Python telemetry metric.
 JAVA_NETWORK_OVERHEAD_METRIC = "java_estimated_network_overhead_ms"
 
 COLOR_CYCLE = ['#2b5c8f', '#c0392b', '#27ae60', '#8e44ad', '#e67e22', '#16a085']
@@ -67,7 +63,7 @@ def _rep_sort_key(r):
 # Loading
 
 def parse_run_failures(results_dir):
-    """Returns raw lines from run_failures_log.txt, if any."""
+    """Returns lines from run_failures_log.txt, if any."""
     log_path = os.path.join(results_dir, "run_failures_log.txt")
     if not os.path.isfile(log_path):
         return []
@@ -77,8 +73,8 @@ def parse_run_failures(results_dir):
 
 
 def check_cpu_pin_log(results_dir):
-    """Re-verifies cpu_pin_check_log.txt. run-suite.sh hard-aborts on a live
-    mismatch, so this should always come back clean on a completed run."""
+    """Verifies cpu_pin_check_log.txt; run-suite.sh aborts on a live
+    mismatch, so a completed run should always come back clean."""
     log_path = os.path.join(results_dir, "cpu_pin_check_log.txt")
     if not os.path.isfile(log_path):
         print("[cpu-pin] No cpu_pin_check_log.txt found -- skipping verification.")
@@ -151,8 +147,7 @@ def load_results(results_dir):
                     "phase": tags.get("phase"),
                     "rep": tags.get("rep"),
                     "rate": tags.get("rate"),
-                    # HTTP status code; "0" means no response was received
-                    "status": tags.get("status"),
+                    "status": tags.get("status"),  # "0" = no response received
                     "time": data.get("time"),
                     "source_file": os.path.basename(fp),
                 })
@@ -170,10 +165,8 @@ def load_results(results_dir):
 # Stats — within-run
 
 def cluster_bootstrap_ci(sub_df, stat_fn, rep_col="rep", n_boot=2000, ci=0.95, seed=42):
-    """
-    Resamples whole repetitions (clusters) with replacement to pool requests, preserving
-    internal request correlation and avoiding pseudoreplication from correlated within-run data.
-    """
+    """Cluster bootstrap: resamples whole reps with replacement to avoid
+    pseudoreplication from correlated within-run requests."""
     reps = sub_df[rep_col].unique()
     if len(reps) < 2:
         return (np.nan, np.nan)
@@ -217,11 +210,8 @@ def summarize(sub_df, label, n_boot=2000):
 
 
 def error_summary(df, phase, group_cols, label_fn):
-    """
-    Per-cell breakdown of successful, HTTP-error, and timeout/network-error
-    requests, computed from http_req_duration points (one per attempted
-    request, regardless of outcome).
-    """
+    """Per-cell success/HTTP-error/timeout breakdown from http_req_duration
+    points (one per attempted request, regardless of outcome)."""
     sub = df[(df["metric"] == "http_req_duration") & (df["phase"] == phase)].copy()
     if sub.empty:
         return pd.DataFrame()
@@ -251,8 +241,8 @@ def error_summary(df, phase, group_cols, label_fn):
 
 
 def crosscheck_error_counters(df, phase, group_cols, label_fn, table_from_duration):
-    """Cross-checks error_summary's http_req_duration-derived counts against k6's
-    independent request_http_error/request_timeout_error counters."""
+    """Cross-checks error_summary's counts against k6's independent
+    request_http_error / request_timeout_error counters."""
     counter_metrics = {
         "request_http_error": "HTTP Errors (non-200 response)",
         "request_timeout_error": "Timeouts / Network Errors (no response)",
@@ -298,11 +288,8 @@ def _throughput_reqs_per_s(subset_df):
 
 
 def client_diagnostics_summary(df, phase, group_cols, label_fn, blocked_warn_ms=5.0):
-    """
-    k6's own http_req_blocked (time waiting for a free connection out of k6's
-    pool) as a per-cell diagnostic -- a rise correlated with concurrency
-    rather than tier points at the client, not the server under test.
-    """
+    """Per-cell http_req_blocked diagnostic; a rise correlated with
+    concurrency (not tier) points at client-side contention, not the server."""
     sub = df[(df["metric"] == "http_req_blocked") & (df["phase"] == phase) & df["value"].notna()].copy()
     if sub.empty:
         return pd.DataFrame()
@@ -324,10 +311,8 @@ def client_diagnostics_summary(df, phase, group_cols, label_fn, blocked_warn_ms=
 # Stats — significance
 
 def rank_biserial_effect_size(U, n1, n2):
-    """
-    Rank-biserial correlation from a Mann-Whitney U statistic (equivalent to
-    Cliff's delta). Ranges [-1, 1]; 0 = no separation between groups.
-    """
+    """Rank-biserial correlation from a Mann-Whitney U (== Cliff's delta);
+    range [-1, 1], 0 = no separation between groups."""
     return 1 - (2 * U) / (n1 * n2)
 
 
@@ -350,15 +335,11 @@ def _fmt_p(p):
 
 
 def pairwise_mannwhitney(df, metric, phase, group_col, order, label_fn, fixed_filters=None, rep_col="rep"):
-    """
-    Mann-Whitney U test between adjacent pairs in `order`, computed on
-    rep-level means to avoid pseudoreplication from correlated within-run
-    requests. Applies Holm-Bonferroni correction across the comparison
-    family and reports rank-biserial effect size alongside each p-value.
-    Also reports a pooled-request p-value, for reference only.
+    """Mann-Whitney U between adjacent pairs in `order`, on rep-level means
+    (avoids pseudoreplication), Holm-Bonferroni corrected, with rank-biserial
+    effect size. Also reports a pooled-request p-value for reference only.
 
-    fixed_filters: column constraints (e.g., {"vus": 64}) applied before
-        comparison.
+    fixed_filters: column constraints applied before comparison, e.g. {"vus": 64}.
     """
     sub = df[(df["metric"] == metric) & (df["phase"] == phase) & df["value"].notna()]
     if fixed_filters:
@@ -373,7 +354,7 @@ def pairwise_mannwhitney(df, metric, phase, group_col, order, label_fn, fixed_fi
         rep_means_a = sub[sub[group_col] == a].groupby(rep_col)["value"].mean().to_numpy()
         rep_means_b = sub[sub[group_col] == b].groupby(rep_col)["value"].mean().to_numpy()
 
-        # Requires >=2 reps per side for a valid rep-level test
+        # needs >=2 reps per side for a valid rep-level test
         if len(rep_means_a) < 2 or len(rep_means_b) < 2:
             continue
 
@@ -410,7 +391,7 @@ def pairwise_mannwhitney(df, metric, phase, group_col, order, label_fn, fixed_fi
         r["p-value (Holm-corrected)"] = _fmt_p(p_holm)
         r["Significant (Holm, alpha=0.05)"] = "Yes" if sig else "No"
 
-    # Primary (corrected, rep-level) result first; pooled diagnostic last
+    # corrected rep-level result first, pooled diagnostic last
     cols = ["Comparison", "N reps (A)", "N reps (B)",
             "Median of rep-means A (ms)", "Median of rep-means B (ms)",
             "U statistic", "p-value (rep-level, uncorrected)",
@@ -423,10 +404,8 @@ def pairwise_mannwhitney(df, metric, phase, group_col, order, label_fn, fixed_fi
 # Stats — between-run
 
 def between_run_consistency(df, metric, phase, group_cols, label_fn):
-    """
-    Computes between-run Mean, SD, and CoV% across independent repetitions,
-    using per-repetition means rather than pooled requests.
-    """
+    """Between-run mean, SD, and CoV% across independent reps, using
+    per-rep means rather than pooled requests."""
 
     sub = df[(df["metric"] == metric) & (df["phase"] == phase) & df["value"].notna()].copy()
     if sub.empty:
@@ -499,15 +478,12 @@ def save_figure(fig, name, output_dir):
     print(f"[+] Figure -> {png_path} / .pdf")
 
 
-# warm-up convergence (post-hoc steady-state check)
+# warm-up convergence
 
 def analyze_warmup(df, output_dir, window_size=100):
-    """
-    Post-hoc check of whether the fixed warm-up iteration budget reached a
-    stable state, comparing P50 latency in the first vs. last window_size
-    requests of each target's warm-up window per rep. Coarse, not a formal
-    changepoint detector.
-    """
+    """Post-hoc check of warm-up convergence: compares P50 latency in the
+    first vs. last window_size requests of each rep's warm-up window.
+    Coarse, not a formal changepoint detector."""
     warm = df[(df["phase"] == "warmup") & (df["metric"] == "http_req_duration") &
               df["value"].notna() & (df["status"] == "200")].copy()
     if warm.empty:
@@ -519,9 +495,7 @@ def analyze_warmup(df, output_dir, window_size=100):
     for (tier, source_file), g in warm.groupby(["tier", "source_file"]):
         g = g.sort_values("time")
         if len(g) < 2 * window_size:
-            # Too few requests in this window to split cleanly; skip rather
-            # than report a misleading number from an undersized sample.
-            continue
+            continue  # too few requests to split cleanly
         first_window = g["value"].iloc[:window_size]
         last_window = g["value"].iloc[-window_size:]
         p50_first = float(np.percentile(first_window, 50))
@@ -561,10 +535,10 @@ def analyze_baseline(df, output_dir):
     n_reps = base["rep"].nunique()
     print(f"[*] E1 baseline: {n_reps} independent repetition(s) detected.")
 
-    # Latency computed on successful (200) requests only; see Table 1c for error rates
+    # successful (200) requests only; see Table 1c for error rates
     e2e = base[(base["metric"] == "http_req_duration") & base["value"].notna() & (base["status"] == "200")]
 
-    # Table 1: pooled within-run end-to-end latency per target (all reps combined, successful requests only)
+    # Table 1: pooled e2e latency per target, successful requests only
     rows = [summarize(e2e[e2e["tier"] == t], _tier_label(t)) for t in order]
     table1 = pd.DataFrame([r for r in rows if r])
     save_table(table1, "table1_baseline_e2e_latency_pooled", output_dir,
@@ -589,8 +563,7 @@ def analyze_baseline(df, output_dir):
                        "connection contention, not a server-side latency measurement.",
                label="tab:baseline-client-diagnostics")
 
-    # Table 1b: between-run (clean-slate) reproducibility of end-to-end latency.
-    # Uses e2e (status==200 only), matching Table 1 -- see Table 5 comment.
+    # Table 1b: between-run reproducibility (uses e2e, matching Table 1)
     table1b = between_run_consistency(e2e, "http_req_duration", "baseline", ["tier"],
                                       lambda k: _tier_label(k[0]))
     save_table(table1b, "table1b_baseline_between_run_consistency", output_dir,
@@ -598,15 +571,16 @@ def analyze_baseline(df, output_dir):
                        "clean-slate repetitions of the baseline phase.",
                label="tab:baseline-between-run")
 
-    # Table 2: Python-side mean latency decomposition and Java network overhead. Filtered
-    # on status=="200" to maintain correctness independently of k6 metric emission logic.
+    # Table 2: Python-side latency decomposition + Java network overhead.
+    # No status==200 filter: these are custom Trend metrics with no status
+    # tag (also true for Table 3, Figure 1, Figure 5, same metrics).
     decomp_rows = []
     for t in order:
         row = {"Group": _tier_label(t)}
         for metric in PYTHON_TELEMETRY_METRICS:
-            vals = base[(base["metric"] == metric) & (base["tier"] == t) & (base["status"] == "200")]["value"]
+            vals = base[(base["metric"] == metric) & (base["tier"] == t)]["value"]
             row[metric] = round(float(vals.mean()), 3) if not vals.empty else np.nan
-        net_vals = base[(base["metric"] == JAVA_NETWORK_OVERHEAD_METRIC) & (base["tier"] == t) & (base["status"] == "200")]["value"]
+        net_vals = base[(base["metric"] == JAVA_NETWORK_OVERHEAD_METRIC) & (base["tier"] == t)]["value"]
         row[JAVA_NETWORK_OVERHEAD_METRIC] = round(float(net_vals.mean()), 3) if not net_vals.empty else np.nan
         row["Negative (%)"] = round(100 * float((net_vals < 0).mean()), 1) if not net_vals.empty else np.nan
         row["Min (ms)"] = round(float(net_vals.min()), 3) if not net_vals.empty else np.nan
@@ -621,15 +595,14 @@ def analyze_baseline(df, output_dir):
                        "or tier-clustered rate would indicate a real measurement problem, not noise.",
                label="tab:baseline-decomp")
 
-    # Table 3: DataFrame-construction share of measured computation time
-    # (explicit status=="200" filter -- see Table 2 comment above)
+    # Table 3: DataFrame-construction share of computation time (no status filter; see Table 2)
     share_rows = []
     for t in order:
         if t in ("mock", "calibration"):
             continue
-        df_t = base[(base["metric"] == "python_dataframe_construction_time_ms") & (base["tier"] == t) & (base["status"] == "200")]["value"]
-        inf_t = base[(base["metric"] == "python_model_inference_time_ms") & (base["tier"] == t) & (base["status"] == "200")]["value"]
-        comp_t = base[(base["metric"] == "python_computation_time_ms") & (base["tier"] == t) & (base["status"] == "200")]["value"]
+        df_t = base[(base["metric"] == "python_dataframe_construction_time_ms") & (base["tier"] == t)]["value"]
+        inf_t = base[(base["metric"] == "python_model_inference_time_ms") & (base["tier"] == t)]["value"]
+        comp_t = base[(base["metric"] == "python_computation_time_ms") & (base["tier"] == t)]["value"]
         if df_t.empty or inf_t.empty or comp_t.empty:
             continue
         comp_mean = float(comp_t.mean())
@@ -646,9 +619,8 @@ def analyze_baseline(df, output_dir):
                        "(pooled across all repetitions).",
                label="tab:df-share")
 
-    # Table 5: significance between adjacent tiers (mock vs v5, v5 vs v10, ...).
-    # Uses e2e (status==200 only), consistent with Table 1/1b/2/3 above --
-    # timeouts/HTTP errors must not be mixed into a latency comparison.
+    # Table 5: significance between adjacent tiers, on e2e (status==200),
+    # consistent with Table 1/1b; Tables 2/3 use python_* Trends (no status tag).
     table5 = pairwise_mannwhitney(e2e, "http_req_duration", "baseline", "tier", order, _tier_label)
     save_table(table5, "table5_baseline_adjacent_tier_significance", output_dir,
                caption="Mann-Whitney U test between adjacent feature-count tiers, end-to-end latency "
@@ -674,7 +646,7 @@ def analyze_baseline(df, output_dir):
         x_labels = [f"v{t}" for t in ai_order]
         for i, (metric, label) in enumerate(stages):
             vals = np.array([
-                base[(base["metric"] == metric) & (base["tier"] == t) & (base["status"] == "200")]["value"].mean()
+                base[(base["metric"] == metric) & (base["tier"] == t)]["value"].mean()
                 for t in ai_order
             ])
             vals = np.nan_to_num(vals)
@@ -742,11 +714,10 @@ def analyze_scan(df, output_dir):
     n_reps = scan["rep"].nunique()
     print(f"[*] E2 scan: {n_reps} independent repetition(s) detected.")
 
-    # Latency computed on successful (200) requests only; see Table 4c for error rates
+    # successful (200) requests only; see Table 4c for error rates
     e2e = scan[(scan["metric"] == "http_req_duration") & scan["value"].notna() & (scan["status"] == "200")]
 
-    # Table 4c: error/timeout breakdown per (tier, concurrency) cell;
-    # reused for the "Error Rate (%)" column in Table 4 below.
+    # Table 4c: error/timeout breakdown per cell; reused for Table 4's Error Rate column
     table4c = error_summary(scan, "scan", ["tier", "vus"],
                             lambda k: f"{_tier_label(k[0])} @ VUS={int(k[1])}")
     save_table(table4c, "table4c_scan_error_rates", output_dir,
@@ -795,8 +766,7 @@ def analyze_scan(df, output_dir):
                        "between-run reproducibility and Table 4c for the full error/timeout breakdown).",
                label="tab:scan-summary-pooled")
 
-    # Table 4b: between-run consistency per (tier, concurrency) cell.
-    # Uses e2e (status==200 only), matching Table 4 -- see Table 5 comment.
+    # Table 4b: between-run consistency per cell (uses e2e, matching Table 4)
     table4b = between_run_consistency(e2e, "http_req_duration", "scan", ["tier", "vus"],
                                       lambda k: f"{_tier_label(k[0])} @ VUS={int(k[1])}")
     save_table(table4b, "table4b_scan_between_run_consistency", output_dir,
@@ -804,8 +774,8 @@ def analyze_scan(df, output_dir):
                        "clean-slate repetitions of the concurrency scan.",
                label="tab:scan-between-run")
 
-    # Table 6: Significance between adjacent concurrency levels per tier (status==200).
-    # Excludes errors/timeouts to prevent concurrency-driven failures from skewing latency metrics.
+    # Table 6: significance between adjacent concurrency levels per tier
+    # (status==200; excludes errors/timeouts from skewing latency)
     table6_parts = []
     for t in order:
         part = pairwise_mannwhitney(
@@ -872,8 +842,8 @@ def analyze_scan(df, output_dir):
     ax.grid(True, which="both", linestyle="--", alpha=0.4)
     save_figure(fig, "figure4_throughput_vs_concurrency", output_dir)
 
-    # Figure 5: Compute decomposition under load for feature tier 28. Isolate thread-pool
-    # queueing (Thread Dispatch) from invariant steps (DataFrame Construction, Inference).
+    # Figure 5: compute decomposition under load for tier 28; isolates
+    # thread-pool queueing from invariant steps (DataFrame, inference)
     heaviest = "28" if "28" in order else next((t for t in reversed(order) if t not in ("mock", "calibration")), None)
     if heaviest:
         stages = [
@@ -887,7 +857,7 @@ def analyze_scan(df, output_dir):
         x_labels = [str(v) for v in levels]
         for i, (metric, label) in enumerate(stages):
             vals = np.array([
-                scan[(scan["metric"] == metric) & (scan["tier"] == heaviest) & (scan["vus"] == vus) & (scan["status"] == "200")]["value"].mean()
+                scan[(scan["metric"] == metric) & (scan["tier"] == heaviest) & (scan["vus"] == vus)]["value"].mean()
                 for vus in levels
             ])
             vals = np.nan_to_num(vals)
@@ -907,8 +877,7 @@ GC_LINE_RE = re.compile(
     r"^\[[^\]]+\]\[(?P<uptime>[\d.]+)s\]\[(?P<level>[a-z]+)\s*\]\[(?P<tags>[^\]]+?)\s*\]\s*(?P<msg>.*)$"
 )
 GC_DUR_RE = re.compile(r"(?P<dur_ms>[\d.]+)ms\s*$")
-# G1 messages are prefixed "GC(N) Pause ..."; startswith("Pause") never matches this.
-GC_PAUSE_RE = re.compile(r"^GC\(\d+\)\s+Pause")
+GC_PAUSE_RE = re.compile(r"^GC\(\d+\)\s+Pause")  # matches G1 pause lines: "GC(N) Pause ..."
 
 
 def parse_gc_log(path):
@@ -987,11 +956,9 @@ def analyze_gc_logs(results_dir, output_dir):
 
 
 def analyze_openloop_check(df, output_dir):
-    """
-    Optional: compares the manual open-loop (constant-arrival-rate) check
-    against the main suite's closed-loop scan at VUS 32/64, per tier.
-    Skipped silently if no openloop_*.json files are in --results-dir.
-    """
+    """Compares the manual open-loop (constant-arrival-rate) check against
+    the closed-loop scan at VUS 32/64, per tier. Skipped silently if no
+    openloop_*.json files exist in --results-dir."""
     ol = df[df["source_file"].str.startswith("openloop") & (df["metric"] == "http_req_duration") &
             (df["status"] == "200")]
     if ol.empty:
@@ -999,8 +966,8 @@ def analyze_openloop_check(df, output_dir):
 
     dropped = df[df["source_file"].str.startswith("openloop") & (df["metric"] == "dropped_iterations")]
 
-    # dropped_iterations lacks per-request tier tags as unexecuted iterations miss http.post().
-    # Attributes drops via source_file (openloop_<tier>_*.json) using http_req_duration tags.
+    # dropped_iterations lacks tier tags (unexecuted iterations skip
+    # http.post()); attributes drops via source_file instead
     file_tier = ol.groupby("source_file")["tier"].first()
     dropped_by_file = dropped.groupby("source_file")["value"].sum()
 
