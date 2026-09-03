@@ -20,6 +20,7 @@ python3 analysis/analyze-results.py      # generate tables + figures
 - [API](#api)
 - [Containerization & Hardware](#containerization--hardware)
 - [Running](#running)
+- [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
 - [Structure](#structure)
 - [Credits](#credits)
@@ -235,7 +236,7 @@ Resource limits (`mem_limit`/`mem_reservation`/`cpus`) use Compose's plain (non-
 - 8+ logical cores (`cpuset` hardcoded to `0-2`/`3-5`/`6-7` across the three containers — adjust or drop on smaller machines)
 - ~7GB free RAM
 - k6 runs containerized (`grafana/k6`, pulled automatically on first `run-suite.sh` invocation) — no host install needed
-- Python 3 on the host — required by `run-suite.sh` itself (tier verification) in addition to `pip install -r analysis/requirements.txt` (pandas, numpy, matplotlib, scipy, statsmodels, tabulate) for the analysis phase
+- Python 3 on the host — required by `run-suite.sh` itself (tier verification) in addition to `pip install -r analysis/requirements.txt` (pandas, numpy, matplotlib, scipy, statsmodels, tabulate) for the analysis phase. `requirements.txt` pins floors, not ceilings — recent CPython (3.13+) needs recent-enough wheels of these anyway, and older exact pins can fail a from-source build on a newer compiler toolchain
 - No GPU required
 
 ---
@@ -319,6 +320,13 @@ TARGET=28 RATE=32 TIME_UNIT=1s DURATION=2m PRE_ALLOCATED_VUS=64 MAX_VUS=128 \
 `RATE` is requests per `TIME_UNIT` — set it to roughly the throughput the closed-loop cell achieved at that VUS level, not the VUS count itself. `PRE_ALLOCATED_VUS`/`MAX_VUS` must be generous enough to sustain `RATE` if response times climb; k6 logs a `dropped_iterations` warning if it runs out of headroom, which itself is diagnostic (it means the server can't sustain that arrival rate — a real finding, not a script bug). This script is standalone and manual by design — it is not invoked by `run-suite.sh` and does not replace the main suite.
 
 Output filenames must start with `openloop` (e.g. `openloop_28_rate32.json`) — `analyze-results.py` detects any such files in `--results-dir`, and if present, adds `table7_openloop_validity_check` and `figure7_openloop_validity_check` comparing open-loop P95/P99 against the closed-loop scan at VUS 32/64 for the same tier. If no `openloop_*` files are present, this step is skipped silently and the rest of the analysis is unaffected.
+
+### Troubleshooting
+
+- **`permission denied` writing to `/results/*.json` from inside the k6 container.** The `grafana/k6` image runs as a non-root user internally, so a host `results/` directory owned by your user with default permissions can block its writes on a bind mount. Fix with `chmod -R 777 results/` before running.
+- **`Conflict. The container name "/..." is already in use`** on `docker compose up`. Leftover stopped containers from an earlier interrupted run are holding a name. `docker ps -a`, then `docker rm` the stale container(s), then retry.
+- **`pip install -r analysis/requirements.txt` fails building from source.** Usually means no prebuilt wheel exists for your Python version at these floors — this is more likely on very new or very old CPython. Upgrading pip first (`pip install --upgrade pip`) often surfaces a compatible wheel; if it still falls back to a source build and fails, installing without version constraints (`pip install pandas numpy matplotlib scipy tabulate statsmodels`) is a safe fallback — the analysis phase isn't sensitive to exact versions of these.
+- **Docker/Compose issues in general** (daemon unreachable, `docker compose` vs `docker-compose`, WSL2-specific PATH quirks) are environment setup, not something this project can account for — consult Docker's own docs for your OS if `docker info` itself isn't working before troubleshooting anything here.
 
 ---
 
