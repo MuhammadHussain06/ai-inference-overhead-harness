@@ -89,6 +89,31 @@ capture_run_metadata() {
   cpu_count=$(nproc 2>/dev/null || echo "unknown")
   total_mem_kb=$(grep -m1 "MemTotal" /proc/meminfo 2>/dev/null | grep -o '[0-9]*' || echo "unknown")
 
+  # Reads the control cpuset for each service from the resolved compose config.
+  # python-service's cpuset varies per cell during the ablation run; this
+  # records the baseline/control value (0-2) written in docker-compose.yml.
+  local resolved_config
+  resolved_config=$(docker compose -f "$COMPOSE_FILE" config 2>/dev/null || echo "")
+
+  extract_cpuset() {
+    printf '%s\n' "$resolved_config" | awk -v svc="  ${1}:" '
+      $0 == svc { in_svc=1; next }
+      in_svc && /^  [a-zA-Z0-9_-]+:$/ { in_svc=0 }
+      in_svc && /^ +cpuset:/ { sub(/^ +cpuset: */, ""); gsub(/"/, ""); print; exit }
+    '
+  }
+
+  local py_cpuset java_cpuset k6_cpuset
+  py_cpuset=$(extract_cpuset "python-service")
+  java_cpuset=$(extract_cpuset "transaction-service")
+  k6_cpuset=$(extract_cpuset "k6")
+
+  local py_cores java_cores k6_cores total_pinned_cores
+  py_cores=$(count_cpuset_cores "${py_cpuset:-}")
+  java_cores=$(count_cpuset_cores "${java_cpuset:-}")
+  k6_cores=$(count_cpuset_cores "${k6_cpuset:-}")
+  total_pinned_cores=$((py_cores + java_cores + k6_cores))
+
   cat > "$METADATA_FILE" <<EOF
 {
   "timestamp_utc": "${timestamp}",
@@ -98,6 +123,17 @@ capture_run_metadata() {
   "cpu_model": "${cpu_model}",
   "cpu_count": "${cpu_count}",
   "total_mem_kb": "${total_mem_kb}",
+  "cores_used_by_suite": {
+    "python_service_cpuset": "${py_cpuset:-unknown}",
+    "python_service_cores": ${py_cores},
+    "transaction_service_cpuset": "${java_cpuset:-unknown}",
+    "transaction_service_cores": ${java_cores},
+    "k6_cpuset": "${k6_cpuset:-unknown}",
+    "k6_cores": ${k6_cores},
+    "total_pinned_cores": ${total_pinned_cores},
+    "host_cores_available": "${cpu_count}",
+    "note": "python_service_cpuset reflects the docker-compose.yml control value; the cpuset arm sweeps other values at runtime"
+  },
   "ablation_config": {
     "target": "${ABLATION_TARGET}",
     "vus": ${ABLATION_VUS},
@@ -108,7 +144,7 @@ capture_run_metadata() {
   }
 }
 EOF
-  echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} git=${git_commit:0:12} wsl2=${IS_WSL2}"
+  echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} (pinned: ${total_pinned_cores}) git=${git_commit:0:12} wsl2=${IS_WSL2}"
 }
 
 abort_suite() {
@@ -117,6 +153,20 @@ abort_suite() {
   echo "  [FATAL] ${label}: $*" | tee -a "$FAILURES_LOG"
   docker compose -f "$COMPOSE_FILE" down || true
   exit 1
+}
+
+count_cpuset_cores() {
+  local cpuset="$1" total=0 part lo hi
+  IFS=',' read -ra _parts <<< "$cpuset"
+  for part in "${_parts[@]}"; do
+    if [[ "$part" == *-* ]]; then
+      lo="${part%-*}"; hi="${part#*-}"
+      total=$(( total + (hi - lo + 1) ))
+    elif [ -n "$part" ]; then
+      total=$(( total + 1 ))
+    fi
+  done
+  echo "$total"
 }
 
 read_live_cpuset() {
