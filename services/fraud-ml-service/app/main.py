@@ -38,13 +38,11 @@ app.add_middleware(TimingMiddleware)
 
 
 @app.get("/health")
-def health():
+async def health():
     return {
         "status": "ok",
         "loadedTiers": list(model_registry.tiers.keys()),
         "nJobsVerified": {n: tier.n_jobs_verified for n, tier in model_registry.tiers.items()},
-        # Live value, not just the requested env var -- confirms the override in
-        # lifespan() actually took effect. run-ablation.sh checks this per rep.
         "threadLimiterTokens": to_thread.current_default_thread_limiter().total_tokens,
     }
 
