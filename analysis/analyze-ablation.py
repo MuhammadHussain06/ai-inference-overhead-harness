@@ -72,7 +72,7 @@ def load_ablation_cells(results_dir):
                 if obj.get("type") != "Point" or obj.get("metric") not in METRICS:
                     continue
                 tags = (obj.get("data", {}) or {}).get("tags", {}) or {}
-                if tags.get("phase") != "ablation" or tags.get("status") != "200":
+                if tags.get("phase") != "ablation":
                     continue
                 rows.append({
                     "metric": obj["metric"],
