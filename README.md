@@ -3,7 +3,7 @@
 A containerized testbed that measures the **latency and throughput cost of a live AI fraud-inference call**, benchmarked against a network-equivalent mock and a zero-work calibration floor.
 
 ```bash
-docker compose up          # bring up the stack
+docker compose up                        # bring up the stack
 ./load-testing/run-suite.sh              # run the full benchmark suite
 python3 analysis/analyze-results.py      # generate tables + figures
 ```
@@ -40,8 +40,11 @@ Every transaction is scored by one of three strategies, sharing the same JVM, ne
 This separation lets you attribute latency precisely:
 
 - **Mock − Calibration** ≈ cost of one random draw
+
 - **AI tier − Calibration** ≈ DataFrame construction + model inference
+
 - DB persistence (`APP_DB_SAVE_ENABLED=false`) is off for all benchmark runs, so writes never enter the measured path
+
 - In-memory H2, so every run starts from a clean slate
 
 ---
@@ -80,7 +83,9 @@ Each service runs in its own container, pinned to a disjoint CPU range, so they 
 <summary><b>Routing and tiers</b></summary>
 
 - Three-way strategy routing (`AI` / `mock` / `calibration`), selected per request via `strategy`.
+
 - Four feature-count tiers for the AI strategy (`5`/`10`/`20`/`28`), selected via `featureTier`, routed to `/predict/v{tier}`. Each tier is its own XGBoost model, loaded once at startup and held in memory.
+
 - The `calibration` target runs the full pipeline with zero computation behind it.
 </details>
 
@@ -88,7 +93,9 @@ Each service runs in its own container, pinned to a disjoint CPU range, so they 
 <summary><b>Telemetry</b></summary>
 
 - Stage-by-stage latency nested in every response: parsing, network, DB write, response build, serialization (Java); parsing, thread dispatch, DataFrame construction, model inference, compute stall, serialization (Python).
+
 - Timeouts/connection errors (`status=0`) tracked separately from HTTP errors.
+
 - Client-side connection contention (`http_req_blocked`) reported as its own diagnostic, so a throughput plateau can be checked against the load generator before blaming server capacity.
 </details>
 
@@ -96,12 +103,19 @@ Each service runs in its own container, pinned to a disjoint CPU range, so they 
 <summary><b>Isolation and verification</b></summary>
 
 - Reactive Java stack end to end (WebFlux + R2DBC).
+
 - CPU pinning is verified per repetition against each container's *live* cgroup cpuset, rather than only the requested Compose configuration.
+
 - Model inference pinned to `n_jobs=1`, read back and verified, exposed on `/health` as `nJobsVerified`. `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS` all pinned to 1.
+
 - The valid feature-tier set is fetched from `fraud-ml-service`'s `/health` at startup instead of being hardcoded in Java. `run-suite.sh` re-verifies this per rep (`loadedTiers` matches expected, `nJobsVerified` all true) and aborts the suite if it doesn't.
+
 - Outbound Java→Python connection pool is explicitly sized (`python.service.max-connections`, default `128`) and logged at startup.
+
 - In-memory H2, clean slate every run.
+
 - Per-request logging is off on both services (Java: `TransactionService` at `WARN`; Python: `uvicorn --no-access-log`), because a synchronous stdout write on the WebFlux event loop or the request coroutine would otherwise stall it, adding latency and throughput noise unrelated to inference.
+
 - JVM GC events are logged continuously to `results/gc-logs/gc_<phase>_rep<N>.log` (one file per rep, archived by `run-suite.sh` before the next rep's JVM overwrites `gc.log`), so tail-latency spikes can be cross-checked against GC pauses. Unified JVM logging has negligible overhead and stays off the request path.
 </details>
 
@@ -233,10 +247,15 @@ Resource limits (`mem_limit`/`mem_reservation`/`cpus`) use Compose's plain (non-
 **Requirements**
 
 - Docker + Docker Compose v2 (`docker compose`)
+
 - 8+ logical cores (`cpuset` hardcoded to `0-2`/`3-5`/`6-7` across the three containers; adjust or drop on smaller machines)
+
 - ~7GB free RAM
+
 - k6 runs containerized (`grafana/k6`, pulled automatically on first `run-suite.sh` invocation), so no host install is needed
+
 - Python 3 on the host, required by `run-suite.sh` itself for tier verification, in addition to `pip install -r analysis/requirements.txt` (pandas, numpy, matplotlib, scipy, statsmodels, tabulate, jinja2) for the analysis phase. `requirements.txt` sets minimum versions rather than exact pins: recent CPython (3.13+) needs sufficiently new wheels of these anyway, and older exact pins can fail a from-source build on a newer compiler toolchain.
+
 - No GPU required
 
 ---
@@ -324,9 +343,13 @@ Output filenames must start with `openloop` (e.g. `openloop_28_rate32.json`). `a
 ### Troubleshooting
 
 - **`permission denied` writing to `/results/*.json` from inside the k6 container.** The `grafana/k6` image runs as a non-root user internally, so a host `results/` directory owned by your user with default permissions can block its writes on a bind mount. Fix with `chmod -R 777 results/` before running.
+
 - **`Conflict. The container name "/..." is already in use`** on `docker compose up`. Leftover stopped containers from an earlier interrupted run are holding a name. `docker ps -a`, then `docker rm` the stale container(s), then retry.
+
 - **`pip install -r analysis/requirements.txt` fails building from source.** This usually means no prebuilt wheel exists for your Python version at these minimums, which is more likely on very new or very old CPython. Upgrading pip first (`pip install --upgrade pip`) often surfaces a compatible wheel. If it still falls back to a source build and fails, installing without version constraints (`pip install pandas numpy matplotlib scipy tabulate statsmodels jinja2`) is a safe fallback, since the analysis phase isn't sensitive to exact versions of these.
+
 - **`analyze-results.py` runs out of memory, or WSL2 itself becomes unresponsive, on a full-suite dataset.** The script loads baseline/warmup and scan/openloop data in two separate passes to keep peak memory down, but a multi-gigabyte raw results directory can still need several GB of headroom. On WSL2, Docker Desktop's own Resources settings don't govern this: the effective memory ceiling for everything running under WSL2, including this script and the containers themselves, comes from `.wslconfig` (`%UserProfile%\.wslconfig`, `[wsl2]` section, `memory=`). Raise that value and run `wsl --shutdown` for it to take effect if analysis runs out of memory.
+
 - **Docker or Compose issues in general** (daemon unreachable, `docker compose` vs `docker-compose`, WSL2-specific PATH quirks) come down to environment setup rather than anything this project can account for. Consult Docker's own docs for your OS if `docker info` itself isn't working, before troubleshooting anything here.
 
 ---
@@ -334,28 +357,51 @@ Output filenames must start with `openloop` (e.g. `openloop_28_rate32.json`). `a
 ## Limitations
 
 - **Single-node only.** No multi-region or network-hop simulation.
+
 - **"Network overhead" means Docker bridge-network overhead.** `estimatedNetworkOverheadMs` reflects the bridge/NAT path between two containers on one host rather than a real network hop, plus a small serialization-estimation error.
+
 - **k6 is pinned to its own cpuset (`6-7`), separate from python-service (`0-2`) and transaction-service (`3-5`), and verified live each rep.** This stops k6 from directly contending with the services under test for cgroup-level scheduling slots. It does not isolate any of the three from the Docker daemon or the rest of the host OS, which remain unpinned; on a minimum-spec (8-core) host they still share physical cores with everything else running on the machine.
+
 - **`http_req_blocked` diagnostics are a partial check only.** They can't independently prove k6 never became the bottleneck at high concurrency.
+
 - **k6 is capped at 2 CPUs.** At high VUS counts, check `http_req_blocked` before trusting results, since a resource-starved load generator can look like service degradation.
+
 - **The main suite's load model is closed-loop (`per-vu-iterations`).** Each VU waits for a response before issuing its next request, so under a GC pause or saturation the offered load drops instead of queuing (the "coordinated omission" failure mode). This specifically risks understating P95/P99 at the highest-concurrency cells, which is where the concurrency scan's tail-latency claims live. Per-rep GC-log correlation and CoV-based reproducibility (`analyze-results.py`) reduce this risk without eliminating it. `load-testing/run-target-openloop.js` runs a `constant-arrival-rate` (open-loop) check at a fixed request rate for the top 1 to 2 concurrency cells (32/64) as a targeted validity check against the closed-loop numbers. It's a manual, standalone script that `run-suite.sh` never wires in, and it isn't a replacement for the main suite's load model.
+
 - **Every inference call is a single row in, single prediction out.** There is no batching path anywhere in `fraud-ml-service` (`pd.DataFrame([row])` per request). Results characterize unbatched synchronous-call overhead only; they say nothing about batched or dynamically-batched serving cost.
+
 - **Concurrency-scan P99s aren't uniformly powered.** `ITERATIONS_PER_VU` holds per-VU sample count constant while total N grows with VUS (100 at VUS=1, 6400 at VUS=64, by design, to resolve tail percentiles under contention). This means P99 confidence intervals widen at lower concurrency levels; don't read a table of per-concurrency P99s as equally precise across the row.
+
 - **OOM kills are checked per cell** (`docker inspect --format '{{.State.OOMKilled}}'`) and abort the suite immediately, same as a cpu-pin mismatch, rather than being logged and skipped.
+
 - **GC pause overhead is measured rather than eliminated.** `table_gc_overhead` (from `analyze-results.py`) reports per-rep GC pause time as a percentage of wall-clock time. Treat a rep above roughly 1%, or with a single pause near the P99 latency, as a candidate confound for that rep's tail rather than as inference cost.
+
 - **Instrumentation overhead is measured rather than removed.** The `calibration` target bounds it as a floor; it stays baked into the AI and mock numbers.
+
 - **No verification the three `cpuset` ranges (python/java/k6) are on distinct physical cores** rather than SMT siblings.
+
 - **Pinning assumes a native Linux Docker host.** On Docker Desktop (macOS/Windows), `cpuset` inside the VM has no fixed relationship to physical cores.
+
 - **On WSL2/Docker Desktop specifically, `verify_cpu_pinning()` can pass while pinning still isn't real.** cgroup-level `cpuset` is honored inside the WSL2 VM, so the requested-vs-live cgroup check reports OK. The Hyper-V host scheduler can still migrate the underlying virtual CPUs across physical cores independent of that, though, and this script has no way to observe or catch it. This differs from the general Docker Desktop caveat above in that the pass/fail signal itself is unreliable here, beyond just the isolation. `run-suite.sh` detects WSL2 (checks `/proc/version`) and records `wsl2_detected` in `run_metadata.json`, so any affected `results/` snapshot stays traceable after the fact. That's disclosure rather than mitigation: treat concurrency-scan tail-latency claims (E2) as more exposed to this than the baseline decomposition (E1), since scheduling pressure, and with it migration risk, scales with load.
+
 - **CPU governor and frequency are captured as a single per-suite snapshot rather than per repetition.** This won't catch mid-run thermal throttling.
+
 - **Synthetic, uniformly-random feature vectors.** The licensed dataset can't be bundled, so `randomFeatures()` draws in a rough PCA-shaped range instead.
+
 - **Repetition counts (5 baseline, 5 scan) aren't power-justified.** Each rep is a full clean-slate restart, so the count reflects a wall-clock tradeoff. Five versus five is also the smallest N at which a two-sided Mann-Whitney test can reach significance (p=0.0079 < 0.05). Achieved N is always shown with each result.
+
 - **Reduced feature space even at the largest tier.** `V1..V28` plus `Amount` is the full PCA set available, but the source dataset itself is a reduced, anonymized representation. This benchmarks latency rather than production-grade fraud accuracy.
+
 - **In-memory H2.** Wiped on restart; export `results/` before tearing down.
+
 - **Log files reflect the last run only.** `run_metadata.json`, `run_order_log.txt`, `run_failures_log.txt`, and `cpu_pin_check_log.txt` are truncated fresh each run; archive them alongside that run's `results/`.
+
 - **Mock and calibration are latency baselines only.** Neither performs a real fraud check.
+
 - **`--synthetic` training data is a smoke test, and nothing more.** It isn't a source for benchmark-grade models.
+
 - **`n_jobs=1` verification** confirms the sklearn/XGBoost-level parameter reads back correctly. Combined with the BLAS env vars, it gives strong assurance of single-threading, short of an absolute guarantee.
+
 - **8-core pinning is host-specific.** Results aren't comparable across different core counts or SMT settings without adjusting `cpuset`.
 
 ---
@@ -364,30 +410,30 @@ Output filenames must start with `openloop` (e.g. `openloop_28_rate32.json`). `a
 
 ```
 .
-├── docker-compose.yml
-├── analysis/
-│   ├── analyze-results.py        # tables, figures, significance tests
-│   └── requirements.txt
-├── load-testing/
-│   ├── run-suite.sh              # full baseline + concurrency-scan orchestrator
-│   ├── run-smoke-test.sh         # small pipeline-check pass before the full suite
-│   ├── warm-up.js                # per-target sequential JIT/pool warm-up
-│   ├── run-target.js             # single (target, concurrency, rep) cell runner (closed-loop)
-│   ├── run-target-openloop.js    # manual constant-arrival-rate check, top concurrency cells only
-│   └── lib/common.js             # shared sendTransaction()/TARGETS + telemetry Trends
-└── services/
-    ├── fraud-ml-service/            # Python FastAPI inference service
-    │   ├── app/
-    │   │   ├── main.py              # entrypoint, TimingMiddleware, /health
-    │   │   ├── model.py             # FraudModelRegistry: one FraudMLTier per tier
-    │   │   ├── config.py            # FEATURE_TIERS, MODEL_DIR
-    │   │   ├── schemas.py
-    │   │   ├── responses.py         # shared response/telemetry builder
-    │   │   └── routers/predict.py (POST /predict/v{n}), mock.py, calibration.py
-    │   ├── models/fraud_model_v{5,10,20,28}.joblib   # pretrained, committed
-    │   └── training/train_model.py  # --n-features {5,10,20,28}, omit for all four
-    └── transaction-service/         # Java Spring Boot orchestrator
-        └── src/main/java/.../{controller,service,model,repository,dto,exception,filter}/
+├── docker-compose.yml                                                                       #
+├── analysis/                                                                                #
+│   ├── analyze-results.py                                                                   # tables, figures, significance tests
+│   └── requirements.txt                                                                     #
+├── load-testing/                                                                            #
+│   ├── run-suite.sh                                                                         # full baseline + concurrency-scan orchestrator
+│   ├── run-smoke-test.sh                                                                    # small pipeline-check pass before the full suite
+│   ├── warm-up.js                                                                           # per-target sequential JIT/pool warm-up
+│   ├── run-target.js                                                                        # single (target, concurrency, rep) cell runner (closed-loop)
+│   ├── run-target-openloop.js                                                               # manual constant-arrival-rate check, top concurrency cells only
+│   └── lib/common.js                                                                        # shared sendTransaction()/TARGETS + telemetry Trends
+└── services/                                                                                #
+    ├── fraud-ml-service/                                                                    # Python FastAPI inference service
+    │   ├── app/                                                                             #
+    │   │   ├── main.py                                                                      # entrypoint, TimingMiddleware, /health
+    │   │   ├── model.py                                                                     # FraudModelRegistry: one FraudMLTier per tier
+    │   │   ├── config.py                                                                    # FEATURE_TIERS, MODEL_DIR
+    │   │   ├── schemas.py                                                                   #
+    │   │   ├── responses.py                                                                 # shared response/telemetry builder
+    │   │   └── routers/predict.py (POST /predict/v{n}), mock.py, calibration.py             #
+    │   ├── models/fraud_model_v{5,10,20,28}.joblib                                          # pretrained, committed
+    │   └── training/train_model.py                                                          # --n-features {5,10,20,28}, omit for all four
+    └── transaction-service/                                                                 # Java Spring Boot orchestrator
+        └── src/main/java/.../{controller,service,model,repository,dto,exception,filter}/    #
 ```
 
 ---
