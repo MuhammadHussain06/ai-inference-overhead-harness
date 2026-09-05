@@ -3,13 +3,11 @@ Analyzes run-ablation.sh's output: isolates which of three candidate
 mechanisms (AnyIO thread-limiter capacity, physical-core ceiling, GIL
 contention via process count) drives Thread Dispatch time at VUS=64.
 
-Each arm holds two mechanisms at a control value and sweeps the third;
-values are read directly from ablation_run_metadata.json rather than
-hardcoded here, so this script always reflects what run-ablation.sh
-actually ran. Rep-level stats use the same cluster-bootstrap and
-Mann-Whitney approach as analyze-results.py, applied to one pairwise
-comparison per arm (control vs. its most extreme value) instead of the
-full pairwise grid, since each arm here has an a priori ordered sweep.
+Each arm holds two mechanisms at a control value and sweeps the third.
+Rep-level stats use the same cluster-bootstrap and Mann-Whitney approach
+as analyze-results.py, applied to one pairwise comparison per arm
+(control vs. its most extreme value) rather than a full pairwise grid,
+since each arm has an a priori ordered sweep.
 
 Usage:
     python3 analyze-ablation.py [--results-dir ../results] [--output-dir ./output]
@@ -89,7 +87,7 @@ def load_ablation_cells(results_dir):
 
 
 def cluster_bootstrap_ci(sub_df, n_boot=2000, ci=0.95, seed=42):
-    """Resamples whole reps with replacement; see analyze-results.py for rationale."""
+    """Resamples whole reps with replacement to avoid pseudoreplication; same approach as analyze-results.py."""
     reps = sub_df["rep"].unique()
     if len(reps) < 2:
         return (np.nan, np.nan)
@@ -132,8 +130,7 @@ def build_decomposition_table(df):
 
 def control_vs_extreme_test(df, metric="python_thread_dispatch_time_ms"):
     """Rep-level Mann-Whitney, control value vs. the arm's most extreme value.
-    One comparison per arm (not a grid), so no multiple-comparison correction
-    is needed here -- unlike analyze-results.py's pairwise_mannwhitneyu."""
+    One comparison per arm, so no multiple-comparison correction is needed."""
     rows = []
     for arm in sorted(df["arm"].unique()):
         arm_df = df[(df["arm"] == arm) & (df["metric"] == metric)]
