@@ -1,9 +1,11 @@
 import time
 from contextlib import asynccontextmanager
 
+from anyio import to_thread
 from fastapi import FastAPI
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from .config import settings
 from .model import model_registry
 from .responses import calibrate_serialization_estimate
 from .routers import calibration, mock, predict
@@ -22,6 +24,11 @@ async def lifespan(app: FastAPI):
 
     model_registry.load_all()
     calibrate_serialization_estimate()  # seed before serving traffic
+    # run_in_threadpool (used by predict.py) draws on anyio's default thread
+    # limiter; override its capacity here, before traffic starts, when the
+    # ablation harness requests a non-default value.
+    if settings.THREAD_LIMITER_TOKENS is not None:
+        to_thread.current_default_thread_limiter().total_tokens = settings.THREAD_LIMITER_TOKENS
     yield
     model_registry.clear()
 
@@ -36,6 +43,9 @@ def health():
         "status": "ok",
         "loadedTiers": list(model_registry.tiers.keys()),
         "nJobsVerified": {n: tier.n_jobs_verified for n, tier in model_registry.tiers.items()},
+        # Live value, not just the requested env var -- confirms the override in
+        # lifespan() actually took effect. run-ablation.sh checks this per rep.
+        "threadLimiterTokens": to_thread.current_default_thread_limiter().total_tokens,
     }
 
 

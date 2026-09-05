@@ -14,5 +14,11 @@ class Settings:
 
     FRAUD_THRESHOLD = float(os.getenv("FRAUD_THRESHOLD", "0.50"))
 
+    # Overrides anyio's default thread-limiter capacity (40) used by run_in_threadpool.
+    # Unset (default) leaves anyio's own default in place. Ablation-only knob (see
+    # run-ablation.sh); the main suite never sets this.
+    _thread_limiter_env = os.getenv("THREAD_LIMITER_TOKENS", "").strip()
+    THREAD_LIMITER_TOKENS = int(_thread_limiter_env) if _thread_limiter_env else None
+
 
 settings = Settings()
