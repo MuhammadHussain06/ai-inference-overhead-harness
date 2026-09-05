@@ -134,8 +134,11 @@ Each service runs in its own container, pinned to a disjoint CPU range, so they 
 [Kaggle Credit Card Fraud dataset](https://www.kaggle.com/mlg-ulb/creditcardfraud), anonymized European transactions from September 2013.
 
 - Each tier uses the first `n` of 28 `V` PCA components (`V1..Vn`) plus `Amount` (`log1p`-transformed). `V10` is a strict superset of `V5`, and so on.
+
 - Highly imbalanced (~0.17% fraud); trained with SMOTE oversampling, then `XGBClassifier`, independently per tier.
+
 - Pretrained models for all four tiers are committed under `services/fraud-ml-service/models/`, so `docker compose up` works with no training step.
+
 - `creditcard.csv` isn't bundled (Kaggle license). To retrain: place it at `services/fraud-ml-service/training/data/creditcard.csv`, or pass `--synthetic` for a structural smoke test only.
 
 ```bash
