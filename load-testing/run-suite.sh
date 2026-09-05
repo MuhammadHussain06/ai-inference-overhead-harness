@@ -160,6 +160,31 @@ capture_run_metadata() {
   # Escape backslashes/quotes in free-text fields before embedding in JSON.
   json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
+  # Resolve the cpuset each service is actually configured with (respects
+  # PYTHON_CPUSET overrides, though run-suite.sh never sets one) and sum
+  # cores pinned across the stack, to verify against cpu_count above.
+  local resolved_config
+  resolved_config=$(docker compose -f "$COMPOSE_FILE" config 2>/dev/null || echo "")
+
+  extract_cpuset() {
+    printf '%s\n' "$resolved_config" | awk -v svc="  ${1}:" '
+      $0 == svc { in_svc=1; next }
+      in_svc && /^  [a-zA-Z0-9_-]+:$/ { in_svc=0 }
+      in_svc && /^ +cpuset:/ { sub(/^ +cpuset: */, ""); gsub(/"/, ""); print; exit }
+    '
+  }
+
+  local py_cpuset java_cpuset k6_cpuset
+  py_cpuset=$(extract_cpuset "python-service")
+  java_cpuset=$(extract_cpuset "transaction-service")
+  k6_cpuset=$(extract_cpuset "k6")
+
+  local py_cores java_cores k6_cores total_pinned_cores
+  py_cores=$(count_cpuset_cores "${py_cpuset:-}")
+  java_cores=$(count_cpuset_cores "${java_cpuset:-}")
+  k6_cores=$(count_cpuset_cores "${k6_cpuset:-}")
+  total_pinned_cores=$((py_cores + java_cores + k6_cores))
+
   cat > "$METADATA_FILE" <<EOF
 {
   "timestamp_utc": "$(json_escape "$timestamp")",
@@ -174,6 +199,16 @@ capture_run_metadata() {
   "cpu_governor_at_start": "$(json_escape "$cpu_governor")",
   "cpu_freq_khz_at_start": "$(json_escape "$cpu_freq_khz")",
   "total_mem_kb": "$(json_escape "$total_mem_kb")",
+  "cores_used_by_suite": {
+    "python_service_cpuset": "$(json_escape "${py_cpuset:-unknown}")",
+    "python_service_cores": ${py_cores},
+    "transaction_service_cpuset": "$(json_escape "${java_cpuset:-unknown}")",
+    "transaction_service_cores": ${java_cores},
+    "k6_cpuset": "$(json_escape "${k6_cpuset:-unknown}")",
+    "k6_cores": ${k6_cores},
+    "total_pinned_cores": ${total_pinned_cores},
+    "host_cores_available": "$(json_escape "$cpu_count")"
+  },
   "suite_config": {
     "targets": [$(printf '"%s",' "${TARGETS[@]}" | sed 's/,$//')],
     "concurrency_levels": [$(printf '%s,' "${CONCURRENCY_LEVELS[@]}" | sed 's/,$//')],
@@ -188,7 +223,7 @@ capture_run_metadata() {
 }
 EOF
 
-  echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} governor=${cpu_governor} freq_khz=${cpu_freq_khz} git=${git_commit:0:12} wsl2=${IS_WSL2}"
+  echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} (pinned: ${total_pinned_cores}) governor=${cpu_governor} freq_khz=${cpu_freq_khz} git=${git_commit:0:12} wsl2=${IS_WSL2}"
 }
 
 # Parses a Docker cpuset string (e.g., "3-5" or "0,2,4") to compute the target core
