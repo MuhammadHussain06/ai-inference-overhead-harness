@@ -387,7 +387,6 @@ What they guard, and why it matters for the results:
 
 ## Experimental design rationale
 
-Choices a reviewer is likely to ask about, and why they were made.
 
 - **7 repetitions per cell.** Each rep is a full clean-slate restart, so the count is a wall-clock tradeoff against statistical power. At n=7 vs 7 the smallest achievable two-sided Mann-Whitney p-value is `2/C(14,7) = 0.00058`, which still clears α=0.05 after Holm correction across the five adjacent-tier comparisons (0.0029). At n=5 the floor is 0.0079, or 0.0397 corrected — significant, but with no margin for one noisy rep. Achieved N is printed with every result.
 - **Rep-level statistics, not request-level.** Requests within a rep share a JVM, a page cache and a thermal state, so they are not independent. All significance tests rank per-rep means and all CIs are cluster bootstraps that resample whole reps. Pooled request-level p-values appear in table 5 marked *diagnostic only* precisely because they are pseudoreplicated and would overstate significance.
