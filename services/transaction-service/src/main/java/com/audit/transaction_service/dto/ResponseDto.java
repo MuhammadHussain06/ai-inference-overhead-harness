@@ -1,5 +1,7 @@
 package com.audit.transaction_service.dto;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+
 import java.math.BigDecimal;
 
 public class ResponseDto {
@@ -81,6 +83,9 @@ public class ResponseDto {
     public Integer getFeatureTier() { return featureTier; }
     public void setFeatureTier(Integer featureTier) { this.featureTier = featureTier; }
 
+    // Also deserialized from fraud-ml-service's response; unknown fields are
+    // ignored so new Python-side telemetry cannot break the upstream call.
+    @JsonIgnoreProperties(ignoreUnknown = true)
     public static class PythonTelemetryDto {
         private double parsingRequestTimeMs = 0.0;
         private double threadDispatchTimeMs = 0.0;

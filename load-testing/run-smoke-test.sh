@@ -31,7 +31,12 @@ docker compose -f ../docker-compose.yml --profile loadgen run --rm -T \
 echo "[*] Running analyze-results.py -- confirm it completes and table7/figure7 appear"
 python3 ../analysis/analyze-results.py
 
-echo "[+] Smoke test complete. Check ../results/run_failures_log.txt and"
-echo "    ../results/cpu_pin_check_log.txt before trusting this run, then"
+echo "[+] Smoke test complete. Check ../results/run_failures_log.txt,"
+echo "    ../results/cpu_pin_check_log.txt (incl. the smt_check line) and"
+echo "    ../results/env_trace_log.txt before trusting this run, then"
 echo "    confirm table7_openloop_validity_check shows Dropped iterations > 0"
 echo "    for the smoke-openloop cell. If all clean, proceed to the full suite."
+echo ""
+echo "    Expected here: table0 is skipped as empty. Its convergence check needs"
+echo "    300+ warm-up requests per window and this run sends 20 -- that is the"
+echo "    smoke test being small, not a pipeline failure."

@@ -16,6 +16,8 @@ class FraudMLTier:
         self.model = None
         self.column_names = [f"V{i}" for i in range(1, n_features + 1)] + ["Amount"]
         self.n_jobs_verified = False
+        # Re-verifies off the timed path on initial predict() to catch libraries resetting n_jobs at runtime.
+        self.n_jobs_runtime_verified = None
 
     def load(self):
         path = settings.model_path(self.n_features)
@@ -78,6 +80,12 @@ class FraudMLTier:
         # Off-CPU time during computation (GIL contention / OS scheduling), floored at 0.
         cpu_time_ms = (time.thread_time() - cpu_start) * 1000
         compute_stall_time_ms = max(0.0, computation_time_ms - cpu_time_ms)
+
+        if self.n_jobs_runtime_verified is None:
+            self.n_jobs_runtime_verified = (getattr(self.model, "n_jobs", None) == 1)
+            if not self.n_jobs_runtime_verified:
+                print(f"[fraud-ml-service] WARNING: v{self.n_features} model reports "
+                      f"n_jobs={getattr(self.model, 'n_jobs', None)} after first inference, expected 1.")
 
         return (is_fraud, risk_score, computation_time_ms, dataframe_construction_time_ms,
                 model_inference_time_ms, compute_stall_time_ms)

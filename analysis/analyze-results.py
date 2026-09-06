@@ -524,8 +524,14 @@ def save_figure(fig, name, output_dir):
 
 # warm-up convergence (post-hoc steady-state check)
 
-def analyze_warmup(df, output_dir, window_size=100):
-    # Checks if the warm-up iteration budget reached a stable state by comparing P50 latency in the first versus last request windows per repetition.
+def analyze_warmup(df, output_dir, window_size=100, tail_tolerance_pct=5.0):
+    """Reports whether each warm-up window reached steady state before measurement began.
+
+    Convergence is judged on the tail (last window vs. the one before it), not on
+    total drift from the first window. Drift from the first window measures how
+    much work warm-up did, which is large by design and says nothing about whether
+    the stack had settled by the end.
+    """
     warm = df[(df["phase"] == "warmup") & (df["metric"] == "http_req_duration") &
               df["value"].notna() & (df["status"] == "200")].copy()
     if warm.empty:
@@ -536,30 +542,92 @@ def analyze_warmup(df, output_dir, window_size=100):
     rows = []
     for (tier, source_file), g in warm.groupby(["tier", "source_file"], observed=True):
         g = g.sort_values("time")
-        if len(g) < 2 * window_size:
-            # Skips undersized request windows to prevent reporting misleading metrics.
+        if len(g) < 3 * window_size:
+            # Three windows are the minimum for a first-vs-tail comparison.
             continue
-        first_window = g["value"].iloc[:window_size]
-        last_window = g["value"].iloc[-window_size:]
-        p50_first = float(np.percentile(first_window, 50))
-        p50_last = float(np.percentile(last_window, 50))
-        pct_change = 100 * (p50_last - p50_first) / p50_first if p50_first else np.nan
+        p50_first = float(np.percentile(g["value"].iloc[:window_size], 50))
+        p50_penultimate = float(np.percentile(g["value"].iloc[-2 * window_size:-window_size], 50))
+        p50_last = float(np.percentile(g["value"].iloc[-window_size:], 50))
+
+        total_drift = 100 * (p50_last - p50_first) / p50_first if p50_first else np.nan
+        tail_drift = 100 * (p50_last - p50_penultimate) / p50_penultimate if p50_penultimate else np.nan
+        converged = not np.isnan(tail_drift) and abs(tail_drift) < tail_tolerance_pct
+
         rows.append({
             "Tier": _tier_label(tier),
             "Source File": source_file,
             "N Requests": len(g),
             f"First {window_size} P50 (ms)": round(p50_first, 3),
+            f"Prev {window_size} P50 (ms)": round(p50_penultimate, 3),
             f"Last {window_size} P50 (ms)": round(p50_last, 3),
-            "Change (%)": round(pct_change, 1) if not np.isnan(pct_change) else np.nan,
-            "Stabilized (<10% drift)": "YES" if not np.isnan(pct_change) and abs(pct_change) < 10 else "no",
+            "Total drift (%)": round(total_drift, 1) if not np.isnan(total_drift) else np.nan,
+            "Tail drift (%)": round(tail_drift, 1) if not np.isnan(tail_drift) else np.nan,
+            f"Converged (tail <{tail_tolerance_pct:g}%)": "YES" if converged else "no",
         })
 
     table = pd.DataFrame(rows)
     save_table(table, "table0_warmup_convergence_check", output_dir,
-               caption=f"Per-rep, per-target warm-up convergence check: P50 latency in the first vs. "
-                       f"last {window_size} requests of each target's warm-up window. Large drift "
-                       f"indicates the warm-up period was insufficient to reach steady state for that target.",
+               caption=f"Per-rep, per-target warm-up convergence check. 'Total drift' is the P50 change "
+                       f"from the first to the last {window_size} requests of the window -- large values "
+                       f"are expected and show warm-up doing its job. 'Tail drift' compares the last "
+                       f"{window_size} requests to the {window_size} before them; only this indicates "
+                       f"whether the stack had reached steady state before the measured phase began. "
+                       f"A window failing the tail criterion means its warm-up budget was too small.",
                label="tab:warmup-convergence")
+
+    if not table.empty:
+        converged_col = f"Converged (tail <{tail_tolerance_pct:g}%)"
+        n_failed = int((table[converged_col] == "no").sum())
+        if n_failed:
+            print(f"[!] {n_failed}/{len(table)} warm-up windows had not converged at the tail. "
+                  f"Raise WARMUP_ITERATIONS_PER_TARGET before trusting the measured phase.")
+
+
+def analyze_measurement_floor(e2e, order, output_dir, floor_tier="calibration"):
+    """Counts requests that completed faster than the zero-work calibration floor.
+
+    The calibration target does no business logic, so its fastest request bounds
+    what the transport and framework can physically achieve. Anything below that
+    bound is a measurement artifact, not a fast inference, and pollutes the
+    minimum and the lower tail of every statistic computed over it.
+    """
+    if floor_tier not in order:
+        print(f"[!] No '{floor_tier}' target in this run; skipping measurement-floor check.")
+        return
+
+    floor_vals = e2e[e2e["tier"] == floor_tier]["value"]
+    if floor_vals.empty:
+        return
+    floor = float(floor_vals.min())
+
+    rows = []
+    for t in order:
+        vals = e2e[e2e["tier"] == t]["value"]
+        if vals.empty:
+            continue
+        below = vals[vals < floor]
+        rows.append({
+            "Group": _tier_label(t),
+            "N": len(vals),
+            "Min (ms)": round(float(vals.min()), 3),
+            "Below floor (n)": len(below),
+            "Below floor (%)": round(100 * len(below) / len(vals), 3),
+            "Lowest below floor (ms)": round(float(below.min()), 3) if len(below) else np.nan,
+        })
+
+    table = pd.DataFrame(rows)
+    save_table(table, "table1e_measurement_floor_violations", output_dir,
+               caption=f"Requests completing faster than the zero-work calibration floor "
+                       f"({floor:.3f} ms, the fastest observed '{floor_tier}' request). The floor is the "
+                       f"physical lower bound for the transport and framework, so any request below it "
+                       f"is a timing artifact rather than a fast inference. A non-zero count here "
+                       f"identifies which tier's reported minimum should not be read as a real latency.",
+               label="tab:measurement-floor")
+
+    total_below = int(table["Below floor (n)"].sum()) if not table.empty else 0
+    if total_below:
+        print(f"[!] {total_below} request(s) completed below the {floor:.3f} ms calibration floor -- "
+              f"see table1e; treat the affected tiers' reported minima as artifacts.")
 
 
 # baseline decomposition (VUS=1)
@@ -622,6 +690,14 @@ def analyze_baseline(df, output_dir):
         for metric in PYTHON_TELEMETRY_METRICS:
             vals = base[(base["metric"] == metric) & (base["tier"] == t)]["value"]
             row[metric] = round(float(vals.mean()), 3) if not vals.empty else np.nan
+        # The serialization figure is an EWMA estimate folded into the total it
+        # helps compute, so its share bounds how much that circularity can matter.
+        serial_mean = row.get("python_serialization_time_ms", np.nan)
+        total_mean = row.get("python_total_time_ms", np.nan)
+        row["Serialization (% of total)"] = (
+            round(100 * serial_mean / total_mean, 2)
+            if total_mean and not np.isnan(serial_mean) and not np.isnan(total_mean) else np.nan
+        )
         net_vals = base[(base["metric"] == JAVA_NETWORK_OVERHEAD_METRIC) & (base["tier"] == t)]["value"]
         row[JAVA_NETWORK_OVERHEAD_METRIC] = round(float(net_vals.mean()), 3) if not net_vals.empty else np.nan
         row["Negative (%)"] = round(100 * float((net_vals < 0).mean()), 1) if not net_vals.empty else np.nan
@@ -631,11 +707,15 @@ def analyze_baseline(df, output_dir):
     save_table(table2, "table2_baseline_python_decomposition_mean_ms", output_dir,
                caption="Mean Python-side latency decomposition (ms) by tier at VUS=1, pooled across "
                        "repetitions, with the estimated network overhead (round-trip time minus "
-                       "Python execution time) shown alongside. 'Negative (%)' and 'Min (ms)' quantify "
+                       "Python execution time) shown alongside. 'Serialization (\\% of total)' bounds "
+                       "the self-referential serialization estimate's contribution to the total it is "
+                       "folded into. 'Negative (\\%)' and 'Min (ms)' quantify "
                        "how often and how far that column goes negative per tier -- a small, tier-"
                        "consistent rate reflects clock/timer noise between the two processes; a large "
                        "or tier-clustered rate would indicate a real measurement problem, not noise.",
                label="tab:baseline-decomp")
+
+    analyze_measurement_floor(e2e, order, output_dir)
 
     # Table 3: DataFrame-construction share of measured computation time
     # (no status=="200" filter -- see Table 2 comment above)

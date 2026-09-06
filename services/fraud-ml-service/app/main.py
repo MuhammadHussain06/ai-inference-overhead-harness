@@ -7,7 +7,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from .config import settings
 from .model import model_registry
-from .responses import calibrate_serialization_estimate
+from .responses import calibrate_serialization_estimate, get_serialization_estimate
 from .routers import calibration, mock, predict
 
 
@@ -43,7 +43,12 @@ async def health():
         "status": "ok",
         "loadedTiers": list(model_registry.tiers.keys()),
         "nJobsVerified": {n: tier.n_jobs_verified for n, tier in model_registry.tiers.items()},
+        # null until a tier has served its first request; the harness checks it
+        # after warm-up, when every tier has run.
+        "nJobsRuntimeVerified": {n: tier.n_jobs_runtime_verified for n, tier in model_registry.tiers.items()},
+        "numericThreadEnv": settings.numeric_thread_env(),
         "threadLimiterTokens": to_thread.current_default_thread_limiter().total_tokens,
+        "serializationEstimateMs": get_serialization_estimate(),
     }
 
 

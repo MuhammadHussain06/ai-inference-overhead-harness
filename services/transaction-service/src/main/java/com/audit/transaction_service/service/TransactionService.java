@@ -6,6 +6,7 @@ import com.audit.transaction_service.dto.ResponseDto;
 import com.audit.transaction_service.exception.UpstreamInferenceException;
 import com.audit.transaction_service.model.Transaction;
 import com.audit.transaction_service.repository.TransactionRepository;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -84,7 +85,6 @@ public class TransactionService {
 
         double requestParsingTimeMs = (System.nanoTime() - requestStartNanos) / 1_000_000.0;
 
-        log.info("[Transaction ID: {}] Sending HTTP POST to Python endpoint {}", request.getTransactionId(), endpoint);
         long netStart = System.nanoTime();
 
         AiRequestDto aiPayload = new AiRequestDto(
@@ -169,7 +169,6 @@ public class TransactionService {
                                             dbWriteTimeMs, pythonTelemetry);
                                 });
                     } else {
-                        log.debug("[Transaction ID: {}] DB persistence bypassed via configuration flag.", request.getTransactionId());
                         return Mono.fromCallable(() -> buildResponse(request, riskScore, status, strategy, resolvedFeatureTier,
                                 overallStartTime, requestParsingTimeMs, aiCallRoundTripTimeMs, 0.0, pythonTelemetry));
                     }
@@ -181,9 +180,6 @@ public class TransactionService {
                                       double dbTime, ResponseDto.PythonTelemetryDto pythonTelemetry) {
         long responseBuildStart = System.nanoTime();
         double executionTimeMs = (System.nanoTime() - overallStartTime) / 1_000_000.0;
-
-        log.info("[Transaction ID: {}] Executed strategy [{}] in {} ms | Status: {}",
-                request.getTransactionId(), strategy, executionTimeMs, status);
 
         ResponseDto response = new ResponseDto(
                 request.getTransactionId(),
@@ -199,6 +195,8 @@ public class TransactionService {
         response.setRequestParsingTimeMs(parseTime);
         response.setAiCallRoundTripTimeMs(netTime);
 
+        // Unclamped: negative values signal Python runtime exceeding Java round trip (calibration fault).
+        // analyze-results.py reports the occurrence rate.
         double estimatedNetworkOverheadMs = netTime - pythonTelemetry.getTotalPythonExecutionTimeMs();
         response.setEstimatedNetworkOverheadMs(estimatedNetworkOverheadMs);
         response.setDbWriteTimeMs(dbTime);
@@ -223,6 +221,8 @@ public class TransactionService {
     }
 
 
+    // Ignores unknown fields so Python telemetry additions do not break Jackson deserialization.
+    @JsonIgnoreProperties(ignoreUnknown = true)
     private static class AiRiskResponse {
         @JsonProperty("isFraud")
         private boolean isFraud;

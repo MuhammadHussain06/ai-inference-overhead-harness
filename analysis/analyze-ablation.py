@@ -110,6 +110,7 @@ def build_decomposition_table(df):
         for value in values:
             cell = arm_df[arm_df["arm_value"] == value]
             row = {"Arm": ARM_LABELS.get(arm, arm), "Value": value,
+                   "N reps": int(cell["rep"].nunique()),
                    "N (pooled)": int((cell["metric"] == "python_total_time_ms").sum())}
             for metric, label in METRICS.items():
                 sub = cell[cell["metric"] == metric]
@@ -118,11 +119,15 @@ def build_decomposition_table(df):
                     continue
                 lo, hi = cluster_bootstrap_ci(sub)
                 row[f"{label} Mean (ms)"] = round(sub["value"].mean(), 3)
-                row[f"{label} 95% CI"] = f"[{lo:.2f}, {hi:.2f}]"
+                # A single rep gives the bootstrap nothing to resample over.
+                row[f"{label} 95% CI"] = (
+                    "n/a (needs >=2 reps)" if np.isnan(lo) else f"[{lo:.2f}, {hi:.2f}]"
+                )
             total_mean = row.get("Total Mean (ms)", np.nan)
             dispatch_mean = row.get("Thread Dispatch Mean (ms)", np.nan)
             row["Thread Dispatch % of Total"] = (
-                round(100 * dispatch_mean / total_mean, 1) if total_mean else np.nan
+                round(100 * dispatch_mean / total_mean, 1)
+                if total_mean and not np.isnan(total_mean) and not np.isnan(dispatch_mean) else np.nan
             )
             rows.append(row)
     return pd.DataFrame(rows)
@@ -155,7 +160,8 @@ def control_vs_extreme_test(df, metric="python_thread_dispatch_time_ms"):
     return pd.DataFrame(rows)
 
 
-def save_table(df, name, output_dir):
+def save_table(df, name, output_dir, caption=None, label=None):
+    """Emits csv/md/tex, matching analyze-results.py so both sets drop into the same paper."""
     if df is None or df.empty:
         print(f"[!] Skipping empty table: {name}")
         return
@@ -164,7 +170,15 @@ def save_table(df, name, output_dir):
     df.to_csv(os.path.join(tables_dir, f"{name}.csv"), index=False)
     with open(os.path.join(tables_dir, f"{name}.md"), "w") as f:
         f.write(df.to_markdown(index=False))
-    print(f"[+] Table  -> {tables_dir}/{name}.csv / .md")
+    with open(os.path.join(tables_dir, f"{name}.tex"), "w") as f:
+        f.write("\\begin{table}[t]\n\\centering\n")
+        f.write(df.to_latex(index=False, escape=True))
+        if caption:
+            f.write(f"\\caption{{{caption}}}\n")
+        if label:
+            f.write(f"\\label{{{label}}}\n")
+        f.write("\\end{table}\n")
+    print(f"[+] Table  -> {tables_dir}/{name}.csv / .md / .tex")
 
 
 def plot_ablation(df, output_dir):
@@ -176,24 +190,31 @@ def plot_ablation(df, output_dir):
     for ax, arm in zip(axes, arms):
         arm_df = df[df["arm"] == arm]
         values = sorted(arm_df["arm_value"].unique(), key=_value_sort_key)
-        dispatch_means, other_means = [], []
+        dispatch_means, other_means, total_errs = [], [], []
         for value in values:
             cell = arm_df[arm_df["arm_value"] == value]
-            total = cell.loc[cell["metric"] == "python_total_time_ms", "value"].mean()
+            total_points = cell[cell["metric"] == "python_total_time_ms"]
+            total = total_points["value"].mean()
             dispatch = cell.loc[cell["metric"] == "python_thread_dispatch_time_ms", "value"].mean()
             dispatch_means.append(dispatch)
             other_means.append(max(total - dispatch, 0))
+            # SD of per-rep means: between-run spread, not within-run request spread.
+            rep_means = total_points.groupby("rep")["value"].mean()
+            total_errs.append(float(rep_means.std(ddof=1)) if len(rep_means) > 1 else 0.0)
 
         x = np.arange(len(values))
         ax.bar(x, other_means, label="Rest of Total", color="#2b5c8f")
-        ax.bar(x, dispatch_means, bottom=other_means, label="Thread Dispatch", color="#c0392b")
+        ax.bar(x, dispatch_means, bottom=other_means, label="Thread Dispatch", color="#c0392b",
+               yerr=total_errs, capsize=4, ecolor="#333333")
         ax.set_xticks(x)
         ax.set_xticklabels(values)
         ax.set_title(ARM_LABELS.get(arm, arm))
         ax.set_xlabel("Value")
     axes[0].set_ylabel("Mean Latency (ms)")
     axes[0].legend()
-    fig.suptitle(f"Thread Dispatch vs. Candidate Mechanism (VUS=64)")
+    n_reps = df["rep"].nunique()
+    fig.suptitle(f"Thread Dispatch vs. Candidate Mechanism "
+                 f"(VUS=64, N={n_reps} runs, error bars = SD of total across runs)")
     fig.tight_layout()
 
     figures_dir = os.path.join(output_dir, "figures")
@@ -219,10 +240,32 @@ def main():
     if df is None:
         print(f"[!] No ablation_*.json files found in {args.results_dir}. Run run-ablation.sh first.")
         return
-    print(f"[*] Loaded {len(df)} metric points across {df['arm'].nunique()} arm(s).")
 
-    save_table(build_decomposition_table(df), "table_ablation_decomposition", args.output_dir)
-    save_table(control_vs_extreme_test(df), "table_ablation_control_vs_extreme", args.output_dir)
+    n_reps = df["rep"].nunique()
+    print(f"[*] Loaded {len(df)} metric points across {df['arm'].nunique()} arm(s), {n_reps} rep(s).")
+
+    # Both headline outputs are rep-level: the CIs resample whole reps and the
+    # significance test ranks per-rep means. Saying so up front beats emitting a
+    # table of NaN CIs and an empty test table with no explanation.
+    if n_reps < 2:
+        print(f"[!] Only {n_reps} rep detected. Bootstrap CIs cannot be computed and no "
+              f"significance test can run. This output is a pipeline check, not a result.")
+    elif n_reps < 4:
+        print(f"[!] Only {n_reps} reps detected. No split of {n_reps} vs {n_reps} reaches "
+              f"p<0.05 under a two-sided Mann-Whitney, so the control-vs-extreme test cannot "
+              f"be significant regardless of effect size. Re-run with REPS_ABLATION_OVERRIDE>=7.")
+
+    save_table(build_decomposition_table(df), "table_ablation_decomposition", args.output_dir,
+               caption="Per-arm latency decomposition at VUS=64. Each arm holds the other two "
+                       "mechanisms at their control value and sweeps one. CIs are 95\\% cluster "
+                       "bootstraps resampling whole repetitions, so they reflect between-run "
+                       "variation rather than within-run request spread.",
+               label="tab:ablation-decomposition")
+    save_table(control_vs_extreme_test(df), "table_ablation_control_vs_extreme", args.output_dir,
+               caption="Rep-level two-sided Mann-Whitney comparing each arm's control value to its "
+                       "most extreme value, on mean thread-dispatch time. One planned comparison per "
+                       "arm, so no multiple-comparison correction is applied.",
+               label="tab:ablation-significance")
     plot_ablation(df, args.output_dir)
 
     print(f"\n[+] Done. Tables -> {os.path.join(args.output_dir, 'tables')}")

@@ -20,5 +20,16 @@ class Settings:
     _thread_limiter_env = os.getenv("THREAD_LIMITER_TOKENS", "").strip()
     THREAD_LIMITER_TOKENS = int(_thread_limiter_env) if _thread_limiter_env else None
 
+    # Exports Dockerfile thread caps to /health so the harness verifies single-threaded numeric settings for CPU pinning.
+    NUMERIC_THREAD_ENV_VARS = (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    )
+
+    def numeric_thread_env(self) -> dict:
+        return {var: os.getenv(var) for var in self.NUMERIC_THREAD_ENV_VARS}
+
 
 settings = Settings()

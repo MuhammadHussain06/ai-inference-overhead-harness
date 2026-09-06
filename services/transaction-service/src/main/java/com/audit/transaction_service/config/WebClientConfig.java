@@ -25,9 +25,8 @@ public class WebClientConfig {
     @Value("${python.service.response-timeout-ms:5000}")
     private long responseTimeoutMs;
 
-    // Must stay >= the highest VUS in run-suite.sh's CONCURRENCY_LEVELS
-    // (currently 64), or outbound queueing here inflates aiCallRoundTripTimeMs /
-    // estimatedNetworkOverheadMs indistinguishably from real network/Python cost.
+    // Must exceed peak VUs to prevent outbound queueing from inflating network/Python metrics.
+    // Scripts export 2x peak VUs; this fallback default applies to manual execution only.
     @Value("${python.service.max-connections:128}")
     private int maxConnections;
 

@@ -1,29 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Isolates which mechanism drives Thread Dispatch time at high concurrency
-# (figure5_decomposition_vs_concurrency), by varying one candidate cause at a
-# time while holding the other two at a fixed control value. Fixed at
-# TARGET=28, VUS=64 -- the cell where Thread Dispatch was largest.
-#
-# Arms (see README "Thread-dispatch mechanism ablation"):
-#   thread_limiter : THREAD_LIMITER_TOKENS in {40, 64, 128} -- AnyIO's cap on
-#                    concurrent run_in_threadpool() calls.
-#   cpuset         : PYTHON_CPUSET in {0-2, 8-13, 8-15} (3/6/8 cores) -- the
-#                    physical-core ceiling available to python-service. Uses
-#                    cores 8+ instead of widening from 0-2, since 0-5/0-7
-#                    would overlap transaction-service (3-5) and k6 (6-7).
-#   workers        : UVICORN_WORKERS in {1, 2, 3} -- process count. Each
-#                    worker gets its own interpreter (own GIL); this is the
-#                    direct GIL test.
-#
-# Arms thread_limiter and cpuset fix UVICORN_WORKERS=1 so each isolates its
-# own mechanism without a multi-process confound. This means their absolute
-# Thread Dispatch numbers will NOT match figure5 (recorded at workers=3);
-# only the workers=3 cell in the workers arm is directly comparable to it.
-#
-# Same clean-slate-per-rep methodology as run-suite.sh: independent restart,
-# no shared warm state, cpu-pin and tier verification every rep.
+# Isolates thread dispatch drivers at VUS=64/TARGET=28 across thread_limiter, cpuset, and workers.
+# Pins python-service to interleaved even physical cores to ensure complete SMT isolation from Java and k6.
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -58,22 +37,34 @@ CPU_PIN_LOG="${RESULTS_DIR}/ablation_cpu_pin_check_log.txt"
 ABLATION_TARGET="${ABLATION_TARGET_OVERRIDE:-28}"
 ABLATION_VUS="${ABLATION_VUS_OVERRIDE:-64}"
 ITERATIONS_PER_VU="${ABLATION_ITERATIONS_PER_VU_OVERRIDE:-100}"
-REPS_ABLATION="${REPS_ABLATION_OVERRIDE:-5}"
+# Sets default replicate count to n=7 per arm to ensure statistical power for Mann-Whitney tests and bootstrap CIs.
+REPS_ABLATION="${REPS_ABLATION_OVERRIDE:-7}"
 COOLDOWN_S=10
 ANYIO_DEFAULT_TOKENS=40
 
-# arm:value:cpuset:cpus:workers:thread_limiter -- the fixed control setting
-# for each arm, with one field swept per row. cpus is core count in cpuset.
+# Sized off the ablation's own VUS so the Java outbound pool is never the
+# bottleneck under test. Consumed by docker-compose.yml.
+export PYTHON_SERVICE_MAX_CONNECTIONS=$((ABLATION_VUS * 2))
+
+ENV_TRACE_LOG="${RESULTS_DIR}/ablation_env_trace_log.txt"
+: > "$ENV_TRACE_LOG"
+
+# Sets transaction-service cpuset to odd physical cores (1, 3) to align with docker-compose.yml and SMT validation.
+JAVA_CPUSET="2-3,6-7"
+# Physical cores 5, 7 (CPUs 10-11, 14-15) -- fully disjoint from both services.
+K6_CPUSET="10-11,14-15"
+
+# Sets ablation matrix parameters, pinning python-service to even physical cores (2, 6, or 8 logical CPUs).
 CELLS=(
-  "thread_limiter:40:0-2:3.0:1:40"
-  "thread_limiter:64:0-2:3.0:1:64"
-  "thread_limiter:128:0-2:3.0:1:128"
-  "cpuset:0-2:0-2:3.0:1:${ANYIO_DEFAULT_TOKENS}"
-  "cpuset:8-13:8-13:6.0:1:${ANYIO_DEFAULT_TOKENS}"
-  "cpuset:8-15:8-15:8.0:1:${ANYIO_DEFAULT_TOKENS}"
-  "workers:1:0-2:3.0:1:${ANYIO_DEFAULT_TOKENS}"
-  "workers:2:0-2:3.0:2:${ANYIO_DEFAULT_TOKENS}"
-  "workers:3:0-2:3.0:3:${ANYIO_DEFAULT_TOKENS}"
+  "thread_limiter:40:0-1,4-5,8-9:6.0:1:40"
+  "thread_limiter:64:0-1,4-5,8-9:6.0:1:64"
+  "thread_limiter:128:0-1,4-5,8-9:6.0:1:128"
+  "cpuset:0-1:0-1:2.0:1:${ANYIO_DEFAULT_TOKENS}"
+  "cpuset:0-1,4-5,8-9:0-1,4-5,8-9:6.0:1:${ANYIO_DEFAULT_TOKENS}"
+  "cpuset:0-1,4-5,8-9,12-13:0-1,4-5,8-9,12-13:8.0:1:${ANYIO_DEFAULT_TOKENS}"
+  "workers:1:0-1,4-5,8-9:6.0:1:${ANYIO_DEFAULT_TOKENS}"
+  "workers:2:0-1,4-5,8-9:6.0:2:${ANYIO_DEFAULT_TOKENS}"
+  "workers:3:0-1,4-5,8-9:6.0:3:${ANYIO_DEFAULT_TOKENS}"
 )
 
 capture_run_metadata() {
@@ -175,6 +166,78 @@ read_live_cpuset() {
     2>/dev/null || echo ""
 }
 
+expand_cpuset() {
+  local part lo hi i
+  IFS=',' read -ra _parts <<< "$1"
+  for part in "${_parts[@]}"; do
+    if [[ "$part" == *-* ]]; then
+      lo="${part%-*}"; hi="${part#*-}"
+      for ((i = lo; i <= hi; i++)); do echo "$i"; done
+    elif [ -n "$part" ]; then
+      echo "$part"
+    fi
+  done
+}
+
+# Lowest-numbered member of a logical CPU's SMT sibling list -- a stable key for
+# the physical core behind it.
+core_key_of_cpu() {
+  local siblings="/sys/devices/system/cpu/cpu${1}/topology/thread_siblings_list"
+  [ -r "$siblings" ] || return 0
+  sed 's/[,-].*//' "$siblings" | tr -d ' \n'
+}
+
+core_keys_of_cpuset() {
+  local cpu key
+  while read -r cpu; do
+    [ -n "$cpu" ] || continue
+    key=$(core_key_of_cpu "$cpu")
+    [ -n "$key" ] && echo "$key"
+  done < <(expand_cpuset "$1") | sort -un | paste -sd, -
+}
+
+# Validates python-service cpusets per cell before load runs to prevent SMT sibling contention.
+# Ensures widening CPU allocation measures true hardware scaling rather than shared-core contention.
+verify_smt_isolation() {
+  local label="$1" py_cpuset="$2"
+
+  if [ ! -r /sys/devices/system/cpu/cpu0/topology/thread_siblings_list ]; then
+    echo "  [smt] ${label}: WARNING -- SMT topology not exposed (common under WSL2);" \
+         "physical-core disjointness is UNVERIFIED for this cell."
+    echo "smt_check label=${label} status=unverifiable reason=topology_not_exposed" >> "$CPU_PIN_LOG"
+    return 0
+  fi
+
+  local py_keys java_keys k6_keys shared
+  py_keys=$(core_keys_of_cpuset "$py_cpuset")
+  java_keys=$(core_keys_of_cpuset "$JAVA_CPUSET")
+  k6_keys=$(core_keys_of_cpuset "$K6_CPUSET")
+
+  echo "  [smt] ${label}: physical cores python(${py_keys:-EMPTY}) java(${java_keys:-EMPTY}) k6(${k6_keys:-EMPTY})"
+  echo "smt_check label=${label} python_cores=${py_keys:-EMPTY} java_cores=${java_keys:-EMPTY} k6_cores=${k6_keys:-EMPTY}" \
+    >> "$CPU_PIN_LOG"
+
+  shared=$(comm -12 \
+    <(tr ',' '\n' <<< "$py_keys" | sort -u) \
+    <(cat <(tr ',' '\n' <<< "$java_keys") <(tr ',' '\n' <<< "$k6_keys") | sort -u) | paste -sd, -)
+
+  if [ -n "$shared" ]; then
+    abort_suite "[smt] ${label}" "python-service's cpuset (${py_cpuset}) shares physical core(s) ${shared}" \
+      "with transaction-service (${JAVA_CPUSET}) and/or k6 (${K6_CPUSET}) via SMT siblings. The cpuset" \
+      "arm would then vary contention rather than core count, so its result would be uninterpretable." \
+      "Pick cpuset values whose thread_siblings_list entries are disjoint from ${JAVA_CPUSET} and ${K6_CPUSET}" \
+      "(inspect with: cat /sys/devices/system/cpu/cpu*/topology/thread_siblings_list)."
+  fi
+}
+
+record_env_sample() {
+  local governor freqs
+  governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")
+  freqs=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | paste -sd, -)
+  echo "env_sample label=${1} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) governor=${governor} freqs_khz=${freqs:-unavailable}" \
+    >> "$ENV_TRACE_LOG"
+}
+
 # Trimmed from run-suite.sh's verify_cpu_pinning: python-service's cpuset
 # varies per cell here, so this compares live-vs-requested only (still the
 # check that matters -- whether the cgroup driver honored what was asked).
@@ -232,6 +295,27 @@ except Exception:
   fi
 }
 
+# Re-reads n_jobs as observed after real inference; run post-warm-up, once the
+# target tier has served traffic. Mirrors run-suite.sh's check of the same name.
+verify_tiers_runtime() {
+  local label="$1" runtime_state
+  runtime_state=$(curl -s http://localhost:8000/health 2>/dev/null | python3 -c '
+import json, sys
+try:
+    verified = json.load(sys.stdin).get("nJobsRuntimeVerified", {})
+except Exception:
+    print("unreadable")
+else:
+    failed = [tier for tier, ok in verified.items() if ok is False]
+    print("failed:" + ",".join(failed) if failed else "ok")
+')
+  echo "  [health] ${label}: n_jobs_runtime(${runtime_state})"
+  echo "cpu_pin_check label=${label} n_jobs_runtime=${runtime_state}" >> "$CPU_PIN_LOG"
+  if [ "$runtime_state" != "ok" ]; then
+    abort_suite "[health] ${label}" "nJobsRuntimeVerified reports ${runtime_state} after serving inference."
+  fi
+}
+
 restart_stack() {
   local cpuset="$1" cpus="$2" workers="$3" tokens="$4"
   echo "  [restart] cpuset=${cpuset} cpus=${cpus} workers=${workers} thread_limiter_tokens=${tokens}"
@@ -278,7 +362,7 @@ shuffled() { printf '%s\n' "$@" | shuf | tr '\n' ' '; }
 
 capture_run_metadata
 
-echo "[*] Ablation: 3 arms x ${#CELLS[@]} cells / arm-value x ${REPS_ABLATION} reps, target=${ABLATION_TARGET} vus=${ABLATION_VUS}"
+echo "[*] Ablation: ${#CELLS[@]} cells x ${REPS_ABLATION} reps, target=${ABLATION_TARGET} vus=${ABLATION_VUS}"
 for rep in $(seq 1 "$REPS_ABLATION"); do
   echo "[*] --- Ablation repetition ${rep}/${REPS_ABLATION} ---"
   read -ra CELLS_THIS_REP <<< "$(shuffled "${CELLS[@]}")"
@@ -289,6 +373,8 @@ for rep in $(seq 1 "$REPS_ABLATION"); do
     label="arm=${arm} value=${value} rep=${rep}"
     echo "  -> ${label}"
 
+    record_env_sample "${arm}_${value}_rep${rep}_start"
+    verify_smt_isolation "$label" "$cpuset"
     restart_stack "$cpuset" "$cpus" "$workers" "$tokens"
     wait_for_ready
     verify_cpu_pinning "$label"
@@ -297,6 +383,7 @@ for rep in $(seq 1 "$REPS_ABLATION"); do
     echo "  [warm-up] VUS=${ABLATION_VUS}..."
     k6_run warm-up.js WARMUP_TARGETS="$ABLATION_TARGET" WARMUP_VUS="$ABLATION_VUS" -- \
       --out "json=/results/ablation_warmup_${arm}_${value}_rep${rep}.json"
+    verify_tiers_runtime "$label"
     sleep "$COOLDOWN_S"
 
     if ! k6_run run-target.js \
@@ -307,10 +394,13 @@ for rep in $(seq 1 "$REPS_ABLATION"); do
       abort_suite "[cell] ${label}" "k6 exited non-zero."
     fi
     check_oom_killed "$label"
+    record_env_sample "${arm}_${value}_rep${rep}_end"
     sleep "$COOLDOWN_S"
   done
 done
 
 docker compose -f "$COMPOSE_FILE" down
 echo "[+] Ablation complete. Raw results in ${RESULTS_DIR}/ablation_*.json"
+echo "    SMT topology and pinning checks logged to ${CPU_PIN_LOG}"
+echo "    Per-cell governor/frequency samples logged to ${ENV_TRACE_LOG}"
 echo "    Run: python3 ../analysis/analyze-ablation.py"

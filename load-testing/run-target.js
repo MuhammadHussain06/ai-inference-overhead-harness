@@ -1,24 +1,7 @@
 import { sendTransaction, TARGETS } from './lib/common.js';
 
-// Single-target k6 script executed per (target, concurrency, rep) cell.
-//
-// Env Vars:
-//   TARGET            : Endpoint key ('mock' | 'calibration' | '5' | '10' | '20' | '28') [Required]
-//   VUS               : Concurrent virtual users [Required]
-//   ITERATIONS_PER_VU : Requests per VU; used by the concurrency scan to keep
-//                       the per-VU sample count constant as VUS varies. Total
-//                       N therefore grows with VUS (100 at VUS=1, 6400 at
-//                       VUS=64) -- intentional, since higher-VUS cells need
-//                       more samples to resolve tail percentiles under
-//                       contention. VUS=1 here is intentionally thin; the
-//                       baseline (E1) phase already covers VUS=1 densely. [Optional]
-//   ITERATIONS        : Total request budget divided across VUs; used by the
-//                       baseline (VUS=1) cells [Optional, default: 500]
-//   PHASE             : Experiment phase tag ('baseline', 'scan', 'ablation') [Optional]
-//   REP               : Repetition index for session variance tagging [Default: '1']
-//   ARM               : Ablation mechanism name, e.g. 'thread_limiter' [Optional]
-//   ARM_VALUE         : Value under test for ARM, e.g. '64' [Optional]
-//   BASE_URL          : Target API endpoint [Default: http://localhost:8080/api/v1/transactions]
+// Executes single-target k6 load tests per (target, VUs, rep) cell.
+// Uses ITERATIONS_PER_VU for concurrency scans and fixed ITERATIONS for VUS=1 baseline.
 
 const targetKey = __ENV.TARGET;
 if (!targetKey || !(targetKey in TARGETS)) {

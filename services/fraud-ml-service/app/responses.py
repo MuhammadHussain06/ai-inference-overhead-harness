@@ -28,6 +28,11 @@ def calibrate_serialization_estimate(n_warmup: int = 20) -> float:
     return _serialization_estimate_ms
 
 
+def get_serialization_estimate() -> float:
+    """Current EWMA estimate, exposed on /health so its magnitude is reportable."""
+    return _serialization_estimate_ms if _serialization_estimate_ms is not None else 0.0
+
+
 def build_response(payload, is_fraud, risk_score, parsing_time_ms, comp_time_ms, start_total,
                    dataframe_construction_time_ms=0.0, model_inference_time_ms=0.0,
                    thread_dispatch_time_ms=0.0, compute_stall_time_ms=0.0):

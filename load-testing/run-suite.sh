@@ -1,19 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Orchestrates empirical load tests across clean-slate stack restarts.
-#
-# Isolation & Controls:
-#   - Isolates session noise (JIT, GC, OS) via per-rep stack restarts.
-#   - Randomizes execution order per rep to prevent drift (logged to run_order_log.txt).
-#   - Captures system provenance to run_metadata.json for traceability.
-#   - Verifies runtime container cgroup cpusets and JVM thread-pool detection via
-#     `docker inspect` per rep (logged to cpu_pin_check_log.txt).
-#
-# Suite Execution:
-#   - Clean-slate stack restarts per rep; sequential cell runs within reps.
-#   - Rep counts: Baseline = REPS_BASELINE | Concurrency Scan = REPS_SCAN.
-#   - Depends on APP_DB_SAVE_ENABLED=false configured in docker-compose.yml.
+# Orchestrates clean-slate stack restarts, randomized execution order, system provenance logging,
+# and verification of CPU pinning, thread caps (n_jobs, BLAS/OpenMP), and CPU governor frequencies.
 
 # Anchor execution directory to the script's location for path stability.
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -37,6 +26,9 @@ if grep -qi microsoft /proc/version 2>/dev/null; then
   echo "    verify_cpu_pinning() reports OK (see README Limitations). Recorded" >&2
   echo "    in run_metadata.json for this run." >&2
 fi
+
+# Set by verify_smt_isolation() during metadata capture; recorded in run_metadata.json.
+SMT_TOPOLOGY_STATUS="not checked"
 
 COMPOSE_FILE="../docker-compose.yml"
 RESULTS_DIR="../results"
@@ -63,6 +55,11 @@ FAILURES_LOG="${RESULTS_DIR}/run_failures_log.txt"
 : > "$FAILURES_LOG"   # truncate/create fresh each suite run
 CPU_PIN_LOG="${RESULTS_DIR}/cpu_pin_check_log.txt"
 : > "$CPU_PIN_LOG"   # truncate/create fresh each suite run
+# Governor/frequency sampled at both ends of every rep, so mid-suite thermal
+# throttling or a governor change can be attributed to a specific rep rather
+# than inferred from a single snapshot taken before the run started.
+ENV_TRACE_LOG="${RESULTS_DIR}/env_trace_log.txt"
+: > "$ENV_TRACE_LOG"   # truncate/create fresh each suite run
 
 TARGETS=(${TARGETS_OVERRIDE:-mock calibration 5 10 20 28})
 CONCURRENCY_LEVELS=(${CONCURRENCY_OVERRIDE:-1 2 4 8 16 32 64})
@@ -77,7 +74,7 @@ for _lvl in "${CONCURRENCY_LEVELS[@]}"; do
 done
 BASELINE_ITERATIONS="${BASELINE_ITERATIONS_OVERRIDE:-500}"
 SCAN_ITERATIONS_PER_VU="${SCAN_ITERATIONS_PER_VU_OVERRIDE:-100}"
-# Unset by default -- warm-up.js's own 1500 default applies for the full suite.
+# Unset by default -- warm-up.js's own 3000 default applies for the full suite.
 # Set for a reduced-scale run (e.g. the smoke test) so warm-up doesn't dwarf it.
 WARMUP_ITERATIONS_PER_TARGET_OVERRIDE="${WARMUP_ITERATIONS_PER_TARGET_OVERRIDE:-}"
 
@@ -85,18 +82,24 @@ WARMUP_ITERATIONS_PER_TARGET_OVERRIDE="${WARMUP_ITERATIONS_PER_TARGET_OVERRIDE:-
 # actual TARGETS (matters when TARGETS_OVERRIDE reduces it, e.g. the smoke
 # test) instead of always warming all 6 targets regardless of what's being
 # tested. WARMUP_ITERATIONS_PER_TARGET only passed if explicitly overridden,
-# so the full suite keeps warm-up.js's own 1500 default untouched.
+# so the full suite keeps warm-up.js's own 3000 default untouched.
 WARMUP_ENV_ARGS=("WARMUP_TARGETS=${TARGETS[*]}")
 if [ -n "$WARMUP_ITERATIONS_PER_TARGET_OVERRIDE" ]; then
   WARMUP_ENV_ARGS+=("WARMUP_ITERATIONS_PER_TARGET=${WARMUP_ITERATIONS_PER_TARGET_OVERRIDE}")
 fi
 COOLDOWN_S=10
-REPS_BASELINE="${REPS_BASELINE_OVERRIDE:-5}"
-# n=5 vs 5 keeps the minimum achievable two-sided Mann-Whitney p-value
-# (0.0079) below alpha=0.05, matching REPS_BASELINE's power for table5/table6.
-# Overriding below 5 (e.g. for a smoke test) drops below that power -- fine
+# n=7 vs 7 puts the minimum achievable two-sided Mann-Whitney p-value at
+# 2/C(14,7) = 0.00058, which still clears alpha=0.05 after Holm correction
+# across the five adjacent-tier comparisons (0.00058 x 5 = 0.0029). n=5 vs 5
+# reaches only 0.0079, or 0.0397 corrected -- significant, but with no margin
+# for a single noisy rep. Overriding below 7 (e.g. for a smoke test) is fine
 # for a pipeline check, not for a rep count you intend to analyze for real.
-REPS_SCAN="${REPS_SCAN_OVERRIDE:-5}"
+REPS_BASELINE="${REPS_BASELINE_OVERRIDE:-7}"
+REPS_SCAN="${REPS_SCAN_OVERRIDE:-7}"
+
+# Sized off this run's own peak VUS so the Java outbound pool can never become
+# the bottleneck being measured. Consumed by docker-compose.yml.
+export PYTHON_SERVICE_MAX_CONNECTIONS=$((MAX_VUS * 2))
 
 
 capture_run_metadata() {
@@ -143,8 +146,8 @@ capture_run_metadata() {
     total_mem_kb="unknown"
   fi
 
-  # Single snapshot at capture time, not a per-rep trace -- can flag a rep as
-  # suspect but can't catch mid-run throttling under sustained load.
+  # Opening snapshot only; record_env_sample() traces both ends of every rep
+  # to env_trace_log.txt, which is what catches mid-suite throttling.
   local cpu_governor cpu_freq_khz
   if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
     cpu_governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")
@@ -185,6 +188,9 @@ capture_run_metadata() {
   k6_cores=$(count_cpuset_cores "${k6_cpuset:-}")
   total_pinned_cores=$((py_cores + java_cores + k6_cores))
 
+  # Aborts before any container starts if the three cpusets share physical cores.
+  verify_smt_isolation "${py_cpuset:-}" "${java_cpuset:-}" "${k6_cpuset:-}"
+
   cat > "$METADATA_FILE" <<EOF
 {
   "timestamp_utc": "$(json_escape "$timestamp")",
@@ -207,7 +213,8 @@ capture_run_metadata() {
     "k6_cpuset": "$(json_escape "${k6_cpuset:-unknown}")",
     "k6_cores": ${k6_cores},
     "total_pinned_cores": ${total_pinned_cores},
-    "host_cores_available": "$(json_escape "$cpu_count")"
+    "host_cores_available": "$(json_escape "$cpu_count")",
+    "physical_core_isolation": "$(json_escape "$SMT_TOPOLOGY_STATUS")"
   },
   "suite_config": {
     "targets": [$(printf '"%s",' "${TARGETS[@]}" | sed 's/,$//')],
@@ -218,7 +225,8 @@ capture_run_metadata() {
     "scan_iterations_per_vu": ${SCAN_ITERATIONS_PER_VU},
     "cooldown_s": ${COOLDOWN_S},
     "reps_baseline": ${REPS_BASELINE},
-    "reps_scan": ${REPS_SCAN}
+    "reps_scan": ${REPS_SCAN},
+    "java_outbound_max_connections": ${PYTHON_SERVICE_MAX_CONNECTIONS}
   }
 }
 EOF
@@ -242,6 +250,88 @@ count_cpuset_cores() {
     fi
   done
   echo "$total"
+}
+
+# Expands a cpuset string ("0-2" or "0,2,4") into one logical CPU id per line.
+expand_cpuset() {
+  local part lo hi i
+  IFS=',' read -ra _parts <<< "$1"
+  for part in "${_parts[@]}"; do
+    if [[ "$part" == *-* ]]; then
+      lo="${part%-*}"; hi="${part#*-}"
+      for ((i = lo; i <= hi; i++)); do echo "$i"; done
+    elif [ -n "$part" ]; then
+      echo "$part"
+    fi
+  done
+}
+
+# Maps a logical CPU to its physical core via the lowest-numbered SMT sibling.
+# Guarantees CPU pinning isolates hardware execution units between services.
+core_key_of_cpu() {
+  local siblings="/sys/devices/system/cpu/cpu${1}/topology/thread_siblings_list"
+  [ -r "$siblings" ] || return 0
+  sed 's/[,-].*//' "$siblings" | tr -d ' \n'
+}
+
+# Comma-joined, deduplicated physical-core keys backing a cpuset.
+core_keys_of_cpuset() {
+  local cpu key
+  while read -r cpu; do
+    [ -n "$cpu" ] || continue
+    key=$(core_key_of_cpu "$cpu")
+    [ -n "$key" ] && echo "$key"
+  done < <(expand_cpuset "$1") | sort -un | paste -sd, -
+}
+
+# Aborts if cpuset assignments share physical cores via SMT siblings.
+# Prevents hyperthread contention from inflating measured inference latency.
+verify_smt_isolation() {
+  local py_cpuset="$1" java_cpuset="$2" k6_cpuset="$3"
+
+  if [ ! -r /sys/devices/system/cpu/cpu0/topology/thread_siblings_list ]; then
+    echo "  [smt] WARNING: SMT topology is not exposed on this host (common under WSL2)."
+    echo "  [smt] Physical-core disjointness is UNVERIFIED for this run; recorded in run_metadata.json."
+    echo "smt_check status=unverifiable reason=topology_not_exposed" >> "$CPU_PIN_LOG"
+    SMT_TOPOLOGY_STATUS="unverifiable (thread_siblings_list not exposed)"
+    return 0
+  fi
+
+  local py_keys java_keys k6_keys
+  py_keys=$(core_keys_of_cpuset "$py_cpuset")
+  java_keys=$(core_keys_of_cpuset "$java_cpuset")
+  k6_keys=$(core_keys_of_cpuset "$k6_cpuset")
+
+  echo "  [smt] physical cores -- python(${py_keys:-EMPTY}) java(${java_keys:-EMPTY}) k6(${k6_keys:-EMPTY})"
+  echo "smt_check python_cores=${py_keys:-EMPTY} java_cores=${java_keys:-EMPTY} k6_cores=${k6_keys:-EMPTY}" >> "$CPU_PIN_LOG"
+  SMT_TOPOLOGY_STATUS="python=${py_keys:-EMPTY} java=${java_keys:-EMPTY} k6=${k6_keys:-EMPTY}"
+
+  local pair_a pair_b shared
+  for pair in "python:${py_keys}:java:${java_keys}" \
+              "python:${py_keys}:k6:${k6_keys}" \
+              "java:${java_keys}:k6:${k6_keys}"; do
+    IFS=':' read -r name_a pair_a name_b pair_b <<< "$pair"
+    shared=$(comm -12 \
+      <(tr ',' '\n' <<< "$pair_a" | sort -u) \
+      <(tr ',' '\n' <<< "$pair_b" | sort -u) | paste -sd, -)
+    if [ -n "$shared" ]; then
+      abort_suite "[smt]" "${name_a} and ${name_b} are pinned to SMT siblings of the same physical" \
+        "core(s) (${shared}). Their cpusets are disjoint but the hardware is not, so neither" \
+        "service is actually isolated. Re-pick cpusets in docker-compose.yml using one logical" \
+        "CPU per physical core (see thread_siblings_list)."
+    fi
+  done
+
+  echo "  [smt] OK -- python, java and k6 occupy disjoint physical cores."
+}
+
+# Samples governor and per-core frequency at a named point in the run.
+record_env_sample() {
+  local governor freqs
+  governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")
+  freqs=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | paste -sd, -)
+  echo "env_sample label=${1} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) governor=${governor} freqs_khz=${freqs:-unavailable}" \
+    >> "$ENV_TRACE_LOG"
 }
 
 # Reads the cpuset a container was actually assigned by the kernel, not what
@@ -374,12 +464,57 @@ except Exception:
   echo "  [tier-check] ${label}: loaded(${loaded_tiers:-EMPTY}) expected(${EXPECTED_TIERS}) n_jobs_verified(${all_verified})"
   echo "cpu_pin_check label=${label} tiers_loaded=${loaded_tiers:-EMPTY} tiers_expected=${EXPECTED_TIERS} n_jobs_verified=${all_verified}" >> "$CPU_PIN_LOG"
 
+  local thread_env
+  thread_env=$(echo "$health_json" | python3 -c '
+import json, sys
+try:
+    env = json.load(sys.stdin).get("numericThreadEnv", {})
+    print(",".join(f"{k}={v}" for k, v in sorted(env.items())))
+except Exception:
+    print("")
+')
+  echo "  [tier-check] ${label}: numeric_thread_env(${thread_env:-EMPTY})"
+  echo "cpu_pin_check label=${label} numeric_thread_env=${thread_env:-EMPTY}" >> "$CPU_PIN_LOG"
+
   if [ "$loaded_tiers" != "$EXPECTED_TIERS" ]; then
     abort_suite "[tier-check] ${label}" "python-service's /health loadedTiers (${loaded_tiers:-EMPTY})" \
       "does not match expected (${EXPECTED_TIERS})."
   elif [ "$all_verified" != "true" ]; then
     abort_suite "[tier-check] ${label}" "python-service's /health nJobsVerified reports at least one" \
       "tier without n_jobs pinned to 1 -- single-threaded inference guarantee not met."
+  fi
+
+  # Pin BLAS/OpenMP layers to 1 thread alongside n_jobs=1 to guarantee true single-threaded inference for CPU pinning.
+  case "$thread_env" in
+    *OMP_NUM_THREADS=1*) ;;
+    *) abort_suite "[tier-check] ${label}" "python-service reports OMP_NUM_THREADS not pinned to 1" \
+         "(${thread_env:-EMPTY}) -- numeric libraries may spawn threads outside the measured cpuset." ;;
+  esac
+}
+
+# Re-checks n_jobs post-warm-up to verify runtime concurrency setting per active test tier.
+verify_tiers_runtime() {
+  local label="$1"
+  local runtime_state
+  runtime_state=$(curl -s http://localhost:8000/health 2>/dev/null | python3 -c '
+import json, sys
+try:
+    verified = json.load(sys.stdin).get("nJobsRuntimeVerified", {})
+except Exception:
+    print("unreadable")
+else:
+    failed = [tier for tier, ok in verified.items() if ok is False]
+    print("failed:" + ",".join(failed) if failed else "ok")
+')
+
+  echo "  [tier-runtime] ${label}: ${runtime_state}"
+  echo "cpu_pin_check label=${label} n_jobs_runtime=${runtime_state}" >> "$CPU_PIN_LOG"
+
+  if [ "$runtime_state" = "unreadable" ]; then
+    abort_suite "[tier-runtime] ${label}" "could not read nJobsRuntimeVerified from python-service's /health."
+  elif [ "$runtime_state" != "ok" ]; then
+    abort_suite "[tier-runtime] ${label}" "tier(s) reported n_jobs != 1 after serving inference" \
+      "(${runtime_state}) -- the single-threaded guarantee held at load time but not at run time."
   fi
 }
 
@@ -472,12 +607,14 @@ capture_run_metadata
 echo "[*] E1: baseline decomposition x ${REPS_BASELINE} independent repetitions"
 for rep in $(seq 1 "$REPS_BASELINE"); do
   echo "[*] --- Baseline repetition ${rep}/${REPS_BASELINE} ---"
+  record_env_sample "baseline_rep${rep}_start"
   restart_stack
   wait_for_ready
   verify_cpu_pinning "baseline rep=${rep}"
   verify_tiers "baseline rep=${rep}"
   echo "[*] Warming up JIT / connection pools..."
   k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" -- --out "json=/results/warmup_baseline_rep${rep}.json"
+  verify_tiers_runtime "baseline rep=${rep}"
   sleep "$COOLDOWN_S"
 
   # Independent per-rep shuffle of target order.
@@ -493,18 +630,21 @@ for rep in $(seq 1 "$REPS_BASELINE"); do
       --out "json=/results/baseline_${target}_rep${rep}.json"
     sleep "$COOLDOWN_S"
   done
+  record_env_sample "baseline_rep${rep}_end"
   archive_gc_log "baseline_rep${rep}"
 done
 
 echo "[*] E2: concurrency scan x ${REPS_SCAN} independent repetitions"
 for rep in $(seq 1 "$REPS_SCAN"); do
   echo "[*] --- Scan repetition ${rep}/${REPS_SCAN} ---"
+  record_env_sample "scan_rep${rep}_start"
   restart_stack
   wait_for_ready
   verify_cpu_pinning "scan rep=${rep}"
   verify_tiers "scan rep=${rep}"
   echo "[*] Warming up JIT / connection pools (default VUS)..."
   k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" -- --out "json=/results/warmup_scan_rep${rep}.json"
+  verify_tiers_runtime "scan rep=${rep}"
   sleep "$COOLDOWN_S"
 
   # Matches warm-up concurrency to the scan's peak VUS; separate output
@@ -532,13 +672,15 @@ for rep in $(seq 1 "$REPS_SCAN"); do
       sleep "$COOLDOWN_S"
     done
   done
+  record_env_sample "scan_rep${rep}_end"
   archive_gc_log "scan_rep${rep}"
 done
 
 echo "[+] Suite complete. Raw results in ${RESULTS_DIR}/"
 echo "    Per-rep cell order logged to ${ORDER_LOG}"
-echo "    Host/toolchain fingerprint (incl. CPU governor/freq snapshot) logged to ${METADATA_FILE}"
-echo "    CPU pinning verification (per-rep cgroup check) logged to ${CPU_PIN_LOG}"
+echo "    Host/toolchain fingerprint (incl. physical-core isolation) logged to ${METADATA_FILE}"
+echo "    CPU pinning, SMT topology and thread-env checks logged to ${CPU_PIN_LOG}"
+echo "    Per-rep governor/frequency samples logged to ${ENV_TRACE_LOG}"
 echo "    Warm-up JSON output (for post-hoc convergence check) saved as warmup_baseline_rep*.json,"
 echo "    warmup_scan_rep*.json (default VUS), and warmup_scan_maxvus_rep*.json (VUS=${MAX_VUS})"
 echo "    'calibration' target included alongside mock/5/10/20/28 -- isolates instrumentation overhead"

@@ -21,12 +21,12 @@ services:
             timeout: 3s
             retries: 10
             start_period: 10s
-        # Both overridable by run-ablation.sh's cpuset arm; defaults match the main suite.
-        cpuset: "${PYTHON_CPUSET:-0-2}"
+        # Sets default Python cpuset to physical cores 0, 2, and 4 (6 logical CPUs) for physical isolation from Java and k6.
+        cpuset: "${PYTHON_CPUSET:-0-1,4-5,8-9}"
         # Enforced by plain `docker compose up` (unlike deploy.resources.limits).
         mem_limit: 3g
         mem_reservation: 1g
-        cpus: ${PYTHON_CPUS:-3.0}
+        cpus: ${PYTHON_CPUS:-6.0}
         networks:
             - testbed-net
 
@@ -38,6 +38,9 @@ services:
         environment:
             - PYTHON_SERVICE_URL=http://python:8000
             - APP_DB_SAVE_ENABLED=false
+            # Outbound pool to python-service. Both harness scripts export 2x their
+            # own peak VUS so the pool can never become the bottleneck being measured.
+            - PYTHON_SERVICE_MAX_CONNECTIONS=${PYTHON_SERVICE_MAX_CONNECTIONS:-128}
             # Fixed heap for reproducible sizing across hosts/reps. GC log lets
             # tail-latency spikes be cross-checked against GC pauses.
             - JAVA_TOOL_OPTIONS=-Xms1536m -Xmx1536m -Xlog:gc*:file=/gc-logs/gc.log:time,uptime,level,tags:filecount=0
@@ -46,10 +49,12 @@ services:
         depends_on:
             python-service:
                 condition: service_healthy
-        cpuset: "3-5"
+        # Physical cores 1, 3 (CPUs 2-3, 6-7) — interleaved with python-service's
+        # even-numbered cores so no physical core is shared between the two services.
+        cpuset: "2-3,6-7"
         mem_limit: 3g
         mem_reservation: 1g
-        cpus: 3.0
+        cpus: 4.0
         networks:
             - testbed-net
 
@@ -66,9 +71,10 @@ services:
             - ./results:/results
         environment:
             - BASE_URL=http://java:8080/api/v1/transactions
-        cpuset: "6-7"
+        # Physical cores 5, 7 (CPUs 10-11, 14-15) — disjoint from both services.
+        cpuset: "10-11,14-15"
         mem_limit: 1g
-        cpus: 2.0
+        cpus: 4.0
         networks:
             - testbed-net
 
