@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Isolates thread dispatch drivers at VUS=64/TARGET=28 across thread_limiter, cpuset, and workers.
-# Pins python-service to interleaved even physical cores to ensure complete SMT isolation from Java and k6.
+# Isolates the drivers of thread-dispatch time at VUS=64 / TARGET=28 across four arms:
+# thread_limiter, cpuset, workers, and workers with aggregate token capacity held constant.
+# python-service takes interleaved even physical cores so it stays SMT-disjoint from Java and k6.
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -41,6 +42,13 @@ ITERATIONS_PER_VU="${ABLATION_ITERATIONS_PER_VU_OVERRIDE:-100}"
 REPS_ABLATION="${REPS_ABLATION_OVERRIDE:-7}"
 COOLDOWN_S=10
 ANYIO_DEFAULT_TOKENS=40
+EXPECTED_TIERS="5,10,20,28"
+# Matches docker-compose.yml's default, so every arm's control cell is the same
+# configuration E1 and E2 measured. An ablation run at a different worker count would
+# characterise a service the main suite never benchmarked.
+CONTROL_WORKERS=3
+CONTROL_CPUSET="0-1,4-5,8-9"
+CONTROL_CPUS="6.0"
 
 # Sized off the ablation's own VUS so the Java outbound pool is never the
 # bottleneck under test. Consumed by docker-compose.yml.
@@ -54,18 +62,36 @@ JAVA_CPUSET="2-3,6-7"
 # Physical cores 5, 7 (CPUs 10-11, 14-15) -- fully disjoint from both services.
 K6_CPUSET="10-11,14-15"
 
-# Sets ablation matrix parameters, pinning python-service to even physical cores (2, 6, or 8 logical CPUs).
-CELLS=(
-  "thread_limiter:40:0-1,4-5,8-9:6.0:1:40"
-  "thread_limiter:64:0-1,4-5,8-9:6.0:1:64"
-  "thread_limiter:128:0-1,4-5,8-9:6.0:1:128"
-  "cpuset:0-1:0-1:2.0:1:${ANYIO_DEFAULT_TOKENS}"
-  "cpuset:0-1,4-5,8-9:0-1,4-5,8-9:6.0:1:${ANYIO_DEFAULT_TOKENS}"
-  "cpuset:0-1,4-5,8-9,12-13:0-1,4-5,8-9,12-13:8.0:1:${ANYIO_DEFAULT_TOKENS}"
-  "workers:1:0-1,4-5,8-9:6.0:1:${ANYIO_DEFAULT_TOKENS}"
-  "workers:2:0-1,4-5,8-9:6.0:2:${ANYIO_DEFAULT_TOKENS}"
-  "workers:3:0-1,4-5,8-9:6.0:3:${ANYIO_DEFAULT_TOKENS}"
-)
+# arm:value:cpuset:cpus:workers:tokens
+# Each arm holds the other mechanisms at the control values above and sweeps one.
+# python-service takes whole physical cores (2, 6 or 8 logical CPUs); verify_smt_isolation
+# re-checks disjointness per cell because the cpuset arm changes it.
+#
+# The thread limiter is per process, so the workers arm varies GIL count and aggregate
+# token capacity together (3 workers = 3 x 40 tokens). workers_token_matched repeats
+# the endpoints with tokens scaled to hold the aggregate near 40, which separates the
+# two explanations.
+CELLS=(${ABLATION_CELLS_OVERRIDE:-
+  "thread_limiter:40:${CONTROL_CPUSET}:${CONTROL_CPUS}:${CONTROL_WORKERS}:40"
+  "thread_limiter:64:${CONTROL_CPUSET}:${CONTROL_CPUS}:${CONTROL_WORKERS}:64"
+  "thread_limiter:128:${CONTROL_CPUSET}:${CONTROL_CPUS}:${CONTROL_WORKERS}:128"
+  "cpuset:0-1:0-1:2.0:${CONTROL_WORKERS}:${ANYIO_DEFAULT_TOKENS}"
+  "cpuset:${CONTROL_CPUSET}:${CONTROL_CPUSET}:${CONTROL_CPUS}:${CONTROL_WORKERS}:${ANYIO_DEFAULT_TOKENS}"
+  "cpuset:0-1,4-5,8-9,12-13:0-1,4-5,8-9,12-13:8.0:${CONTROL_WORKERS}:${ANYIO_DEFAULT_TOKENS}"
+  "workers:1:${CONTROL_CPUSET}:${CONTROL_CPUS}:1:${ANYIO_DEFAULT_TOKENS}"
+  "workers:2:${CONTROL_CPUSET}:${CONTROL_CPUS}:2:${ANYIO_DEFAULT_TOKENS}"
+  "workers:3:${CONTROL_CPUSET}:${CONTROL_CPUS}:3:${ANYIO_DEFAULT_TOKENS}"
+  "workers_token_matched:1:${CONTROL_CPUSET}:${CONTROL_CPUS}:1:40"
+  "workers_token_matched:3:${CONTROL_CPUSET}:${CONTROL_CPUS}:3:13"
+})
+
+# Unset by default -- warm-up.js's own 3000 default applies for the full ablation.
+# Set for a reduced-scale run so warm-up doesn't dwarf it.
+WARMUP_ITERATIONS_PER_TARGET_OVERRIDE="${WARMUP_ITERATIONS_PER_TARGET_OVERRIDE:-}"
+WARMUP_ENV_ARGS=(WARMUP_TARGETS="$ABLATION_TARGET" WARMUP_VUS="$ABLATION_VUS")
+if [ -n "$WARMUP_ITERATIONS_PER_TARGET_OVERRIDE" ]; then
+  WARMUP_ENV_ARGS+=("WARMUP_ITERATIONS_PER_TARGET=${WARMUP_ITERATIONS_PER_TARGET_OVERRIDE}")
+fi
 
 capture_run_metadata() {
   local timestamp git_commit git_dirty cpu_model cpu_count total_mem_kb
@@ -257,7 +283,7 @@ verify_cpu_pinning() {
 
 verify_tiers_and_limiter() {
   local label="$1" expected_tokens="$2"
-  local health_json loaded_tiers all_verified live_tokens
+  local health_json loaded_tiers all_verified live_tokens thread_env
   health_json=$(curl -s http://localhost:8000/health 2>/dev/null || echo "")
   [ -z "$health_json" ] && abort_suite "[health] ${label}" "could not reach python-service's /health."
 
@@ -285,14 +311,32 @@ except Exception:
     print("")
 ')
 
+  thread_env=$(echo "$health_json" | python3 -c '
+import json, sys
+try:
+    env = json.load(sys.stdin).get("numericThreadEnv", {})
+    print(",".join(f"{k}={v}" for k, v in sorted(env.items())))
+except Exception:
+    print("")
+')
+
   echo "  [health] ${label}: tiers(${loaded_tiers:-EMPTY}) n_jobs_verified(${all_verified}) thread_limiter_tokens(${live_tokens:-EMPTY} expected ${expected_tokens})"
-  if [ "$loaded_tiers" != "5,10,20,28" ]; then
-    abort_suite "[health] ${label}" "loadedTiers (${loaded_tiers:-EMPTY}) != expected."
+  echo "cpu_pin_check label=${label} tiers_loaded=${loaded_tiers:-EMPTY} tiers_expected=${EXPECTED_TIERS} n_jobs_verified=${all_verified} numeric_thread_env=${thread_env:-EMPTY}" >> "$CPU_PIN_LOG"
+
+  if [ "$loaded_tiers" != "$EXPECTED_TIERS" ]; then
+    abort_suite "[health] ${label}" "loadedTiers (${loaded_tiers:-EMPTY}) != expected (${EXPECTED_TIERS})."
   elif [ "$all_verified" != "true" ]; then
     abort_suite "[health] ${label}" "nJobsVerified reports at least one tier without n_jobs=1."
   elif [ "$live_tokens" != "$expected_tokens" ]; then
     abort_suite "[health] ${label}" "threadLimiterTokens (${live_tokens:-EMPTY}) != expected (${expected_tokens}) -- override did not take effect."
   fi
+
+  # Matches run-suite.sh: n_jobs=1 alone does not constrain the OpenMP layer beneath it.
+  case "$thread_env" in
+    *OMP_NUM_THREADS=1*) ;;
+    *) abort_suite "[health] ${label}" "OMP_NUM_THREADS is not pinned to 1 (${thread_env:-EMPTY})" \
+         "-- numeric libraries may spawn threads outside the measured cpuset." ;;
+  esac
 }
 
 # Re-reads n_jobs as observed after real inference; run post-warm-up, once the
@@ -334,8 +378,10 @@ wait_for_ready() {
     [ "$status" = "200" ] && { echo "  [ready] after ${i} attempt(s)."; return 0; }
     sleep 2
   done
-  echo "  [!] transaction-service did not become ready in time." >&2
-  return 1
+  # Routed through abort_suite so a readiness timeout reaches the failures log that
+  # analyze-ablation.py gates on, rather than exiting with that log still clean.
+  abort_suite "[ready]" "transaction-service did not respond 200 within 60 attempts" \
+    "(last status ${status:-none}) -- the stack never became ready for this cell."
 }
 
 check_oom_killed() {
@@ -381,7 +427,7 @@ for rep in $(seq 1 "$REPS_ABLATION"); do
     verify_tiers_and_limiter "$label" "$tokens"
 
     echo "  [warm-up] VUS=${ABLATION_VUS}..."
-    k6_run warm-up.js WARMUP_TARGETS="$ABLATION_TARGET" WARMUP_VUS="$ABLATION_VUS" -- \
+    k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" -- \
       --out "json=/results/ablation_warmup_${arm}_${value}_rep${rep}.json"
     verify_tiers_runtime "$label"
     sleep "$COOLDOWN_S"

@@ -3,8 +3,6 @@ import os
 
 class Settings:
 
-    APP_NAME = "Fraud Detection ML"
-
     FEATURE_TIERS = [int(n) for n in os.getenv("FEATURE_TIERS", "5,10,20,28").split(",")]
 
     MODEL_DIR = os.getenv("MODEL_DIR", "models")
@@ -14,13 +12,13 @@ class Settings:
 
     FRAUD_THRESHOLD = float(os.getenv("FRAUD_THRESHOLD", "0.50"))
 
-    # Overrides anyio's default thread-limiter capacity (40) used by run_in_threadpool.
-    # Unset (default) leaves anyio's own default in place. Ablation-only knob (see
-    # run-ablation.sh); the main suite never sets this.
+    # Ablation-only knob. Unset leaves anyio's own default thread-limiter capacity
+    # in place, so the main suite measures the stock configuration.
     _thread_limiter_env = os.getenv("THREAD_LIMITER_TOKENS", "").strip()
     THREAD_LIMITER_TOKENS = int(_thread_limiter_env) if _thread_limiter_env else None
 
-    # Exports Dockerfile thread caps to /health so the harness verifies single-threaded numeric settings for CPU pinning.
+    # Reported on /health so the harness verifies single-threaded numeric libraries
+    # each rep. n_jobs alone does not constrain the BLAS/OpenMP layer beneath it.
     NUMERIC_THREAD_ENV_VARS = (
         "OMP_NUM_THREADS",
         "OPENBLAS_NUM_THREADS",

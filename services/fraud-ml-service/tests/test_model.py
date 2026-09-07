@@ -78,6 +78,9 @@ def test_unloaded_tier_raises_500(payload):
     with pytest.raises(HTTPException) as exc:
         FraudMLTier(5).predict(payload)
     assert exc.value.status_code == 500
+    # Detail intact, so the `except HTTPException: raise` clause has not been
+    # replaced by the generic handler below it.
+    assert "Model not initialized" in exc.value.detail
 
 
 def test_runtime_n_jobs_is_verified_on_first_predict(tier, payload):

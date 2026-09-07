@@ -1,9 +1,11 @@
 """Endpoint-level guards, including the telemetry symmetry the three-strategy design rests on."""
 
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import TimingMiddleware, app
 from app.model import FraudMLTier, model_registry
 
 from stubs import StubModel
@@ -35,11 +37,22 @@ def _telemetry(client, endpoint, body=None):
     return response.json()["pythonTelemetry"]
 
 
+def test_timing_middleware_is_the_outermost_user_middleware():
+    """A middleware added after this one would run before the stamp, and its cost
+    would leave totalPythonExecutionTimeMs for estimatedNetworkOverheadMs instead."""
+    assert app.user_middleware[0].cls is TimingMiddleware
+
+
 def test_health_reports_loaded_tiers_and_pinning(client):
     body = client.get("/health").json()
     assert body["status"] == "ok"
     assert body["loadedTiers"] == [5]
     assert body["nJobsVerified"] == {"5": True}
+
+
+def test_health_identifies_the_answering_worker(client):
+    """Uvicorn runs several workers; the harness polls until it has seen each one."""
+    assert client.get("/health").json()["workerPid"] == os.getpid()
 
 
 def test_health_reports_numeric_thread_env(client, monkeypatch):

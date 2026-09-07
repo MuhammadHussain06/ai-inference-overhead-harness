@@ -4,12 +4,16 @@ from fastapi import Response
 
 from .schemas import PythonTelemetryDto, TransactionResponse
 
+# Serialization cost cannot be measured in the live path: the field reporting it sits
+# inside the object being serialized. An EWMA of previous requests' measured cost
+# stands in. build_response runs on the event loop, so this global has one writer
+# per worker process.
 _serialization_estimate_ms = None
 _EWMA_ALPHA = 0.1
 
 
 def calibrate_serialization_estimate(n_warmup: int = 20) -> float:
-    """Seeds _serialization_estimate_ms by serializing a template response n_warmup times."""
+    """Seeds the estimate by serializing a structurally identical template response."""
     global _serialization_estimate_ms
 
     template = TransactionResponse(
@@ -38,8 +42,10 @@ def build_response(payload, is_fraud, risk_score, parsing_time_ms, comp_time_ms,
                    thread_dispatch_time_ms=0.0, compute_stall_time_ms=0.0):
     global _serialization_estimate_ms
     if _serialization_estimate_ms is None:
-        calibrate_serialization_estimate()  # fallback if startup calibration was skipped
+        calibrate_serialization_estimate()  # fallback when startup seeding was skipped
 
+    # Snapshots the estimate before the update below, so the value the response
+    # reports is the same one folded into its own total.
     telemetry = PythonTelemetryDto(
         parsingRequestTimeMs=parsing_time_ms,
         threadDispatchTimeMs=thread_dispatch_time_ms,
@@ -57,7 +63,8 @@ def build_response(payload, is_fraud, risk_score, parsing_time_ms, comp_time_ms,
         pythonTelemetry=telemetry,
     )
 
-    # Must be set before the one serialize call below; the bytes it produces are final.
+    # start_total is the middleware stamp, so this spans the full Python-side wall
+    # time. Set before the one serialize call below; those bytes are final.
     response_model.pythonTelemetry.totalPythonExecutionTimeMs = (
             (time.perf_counter() - start_total) * 1000 + _serialization_estimate_ms
     )

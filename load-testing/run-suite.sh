@@ -117,6 +117,13 @@ capture_run_metadata() {
   local compose_version
   compose_version=$(docker compose version 2>/dev/null || echo "unknown")
 
+  # The load generator is the one image pulled by tag rather than built from this
+  # tree, so its resolved digest is what makes the run reproducible.
+  local k6_image k6_digest
+  k6_image=$(docker compose -f "$COMPOSE_FILE" config --images 2>/dev/null | grep -i 'k6' | head -1)
+  k6_digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "${k6_image:-grafana/k6}" 2>/dev/null \
+    || echo "unknown (image not pulled yet)")
+
   local git_commit git_dirty
   if command -v git >/dev/null 2>&1 && git -C .. rev-parse HEAD >/dev/null 2>&1; then
     git_commit=$(git -C .. rev-parse HEAD)
@@ -198,6 +205,8 @@ capture_run_metadata() {
   "wsl2_detected": "${IS_WSL2}",
   "docker_version": "$(json_escape "$docker_version")",
   "docker_compose_version": "$(json_escape "$compose_version")",
+  "k6_image": "$(json_escape "${k6_image:-unknown}")",
+  "k6_image_digest": "$(json_escape "$k6_digest")",
   "git_commit": "$(json_escape "$git_commit")",
   "git_dirty": "$(json_escape "$git_dirty")",
   "cpu_model": "$(json_escape "$cpu_model")",
@@ -409,8 +418,9 @@ verify_cpu_pinning() {
       "(${java_requested:-EMPTY}) -- cannot verify JVM core detection for this rep."
   elif [ "$java_cpus" != "$expected_java_cpus" ]; then
     abort_suite "[cpu-pin] ${label}" "JVM reports ${java_cpus} effective CPUs, expected ${expected_java_cpus}" \
-      "(derived from requested cpuset ${java_requested}) -- Netty's event-loop thread count" \
-      "(availableProcessors() * 2 by default) would be sized off the wrong core count for this rep."
+      "(derived from requested cpuset ${java_requested}). availableProcessors() sizes Reactor Netty's" \
+      "event-loop pool (max(availableProcessors(), 4)), ForkJoinPool.commonPool, the G1 worker threads" \
+      "and the JIT compiler threads -- all of them would be sized off the wrong core count for this rep."
   fi
 
   # Verifies the k6 container's own cpuset, matching the compose file's
@@ -493,29 +503,54 @@ except Exception:
   esac
 }
 
-# Re-checks n_jobs post-warm-up to verify runtime concurrency setting per active test tier.
+# Re-checks n_jobs after warm-up, when every tier in this run has served inference.
+# /health is answered by one uvicorn worker, so this polls until it has seen the
+# configured worker count or exhausts its attempts, and reports how many it covered.
 verify_tiers_runtime() {
   local label="$1"
-  local runtime_state
-  runtime_state=$(curl -s http://localhost:8000/health 2>/dev/null | python3 -c '
+  local expected_workers="${UVICORN_WORKERS:-3}"
+  local seen_pids="" runtime_state sample pid
+  local attempts=$((expected_workers * 10))
+
+  for _ in $(seq 1 "$attempts"); do
+    sample=$(curl -s http://localhost:8000/health 2>/dev/null | python3 -c '
 import json, sys
 try:
-    verified = json.load(sys.stdin).get("nJobsRuntimeVerified", {})
+    d = json.load(sys.stdin)
+    verified = d.get("nJobsRuntimeVerified", {})
 except Exception:
-    print("unreadable")
+    print("unreadable ")
 else:
     failed = [tier for tier, ok in verified.items() if ok is False]
-    print("failed:" + ",".join(failed) if failed else "ok")
-')
+    print(("failed:" + ",".join(failed) if failed else "ok"), d.get("workerPid", ""))
+') || sample="unreadable "
+    runtime_state="${sample%% *}"
+    pid="${sample##* }"
 
-  echo "  [tier-runtime] ${label}: ${runtime_state}"
-  echo "cpu_pin_check label=${label} n_jobs_runtime=${runtime_state}" >> "$CPU_PIN_LOG"
+    if [ "$runtime_state" = "unreadable" ]; then
+      abort_suite "[tier-runtime] ${label}" "could not read nJobsRuntimeVerified from python-service's /health."
+    elif [ "$runtime_state" != "ok" ]; then
+      abort_suite "[tier-runtime] ${label}" "tier(s) reported n_jobs != 1 after serving inference" \
+        "(${runtime_state}) on worker ${pid:-unknown} -- the single-threaded guarantee held at load" \
+        "time but not at run time."
+    fi
 
-  if [ "$runtime_state" = "unreadable" ]; then
-    abort_suite "[tier-runtime] ${label}" "could not read nJobsRuntimeVerified from python-service's /health."
-  elif [ "$runtime_state" != "ok" ]; then
-    abort_suite "[tier-runtime] ${label}" "tier(s) reported n_jobs != 1 after serving inference" \
-      "(${runtime_state}) -- the single-threaded guarantee held at load time but not at run time."
+    case " ${seen_pids} " in
+      *" ${pid} "*) ;;
+      *) seen_pids="${seen_pids}${pid} " ;;
+    esac
+    [ "$(echo "$seen_pids" | wc -w)" -ge "$expected_workers" ] && break
+  done
+
+  local n_seen
+  n_seen=$(echo "$seen_pids" | wc -w)
+  echo "  [tier-runtime] ${label}: ok on ${n_seen}/${expected_workers} worker(s) (pids: ${seen_pids% })"
+  echo "cpu_pin_check label=${label} n_jobs_runtime=ok workers_checked=${n_seen} workers_expected=${expected_workers}" \
+    >> "$CPU_PIN_LOG"
+
+  if [ "$n_seen" -lt "$expected_workers" ]; then
+    echo "  [tier-runtime] ${label}: WARN -- only ${n_seen} of ${expected_workers} workers answered /health" \
+         "across ${attempts} polls; the others are unverified for this rep." >&2
   fi
 }
 
@@ -542,8 +577,11 @@ wait_for_ready() {
     fi
     sleep 2
   done
-  echo "  [!] transaction-service did not become ready in time." >&2
-  return 1
+  # Routed through abort_suite so a readiness timeout lands in the failures log like
+  # any other invalidating condition; a bare non-zero exit would leave that log clean
+  # and let analyze-results.py accept the partial dataset.
+  abort_suite "[ready]" "transaction-service did not respond 200 within ${max_attempts} attempts" \
+    "(last status ${status:-none}) -- the stack never became ready for this rep."
 }
 
 shuffled() {
@@ -588,7 +626,10 @@ archive_gc_log() {
   if [ -f "$src" ]; then
     mv "$src" "$dest"
   else
-    echo "  [!] No GC log found at ${src} for ${label}" | tee -a "$FAILURES_LOG"
+    # Not written to FAILURES_LOG: a missing GC log leaves that rep out of the GC
+    # table but does not invalidate its latency data, and any entry in that log
+    # makes analyze-results.py refuse the whole dataset.
+    echo "  [!] No GC log found at ${src} for ${label}; GC overhead is unreported for this rep." >&2
   fi
 }
 

@@ -16,10 +16,9 @@ def _noop():
 
 @router.post("/predict/calibrate", response_model=TransactionResponse, response_model_by_alias=True)
 async def predict_calibrate(payload: TransactionPayload, request: Request):
-    """
-   Dispatches a no-op handler via run_in_threadpool to measure pure framework,
-   serialization, and dispatch overhead as a baseline calibration floor.
-   """
+    """Measures framework, dispatch and serialization overhead with zero computation
+    behind it. Still goes through run_in_threadpool: the calibration arm must traverse
+    every layer the AI arm does, so the difference isolates computation alone."""
     start_total = request.state.start_time
 
     parsing_time_ms = (time.perf_counter() - start_total) * 1000

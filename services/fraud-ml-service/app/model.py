@@ -10,13 +10,14 @@ from .config import settings
 
 class FraudMLTier:
 
-
     def __init__(self, n_features: int):
         self.n_features = n_features
         self.model = None
+        # Matches the training schema exactly; XGBoost validates feature names at predict time.
         self.column_names = [f"V{i}" for i in range(1, n_features + 1)] + ["Amount"]
         self.n_jobs_verified = False
-        # Re-verifies off the timed path on initial predict() to catch libraries resetting n_jobs at runtime.
+        # Tri-state: None until this tier serves a request, so the harness can tell
+        # "not yet exercised" from "exercised and unpinned".
         self.n_jobs_runtime_verified = None
 
     def load(self):
@@ -37,6 +38,7 @@ class FraudMLTier:
         except Exception as e:
             print(f"[fraud-ml-service] Warning: could not pin n_jobs=1 on v{self.n_features} model: {e}")
 
+        # Reads the value back rather than trusting set_params to have applied it.
         actual_n_jobs = getattr(self.model, "n_jobs", None)
         self.n_jobs_verified = (actual_n_jobs == 1)
         if self.n_jobs_verified:
@@ -49,6 +51,8 @@ class FraudMLTier:
         if self.model is None:
             raise HTTPException(status_code=500, detail="Model not initialized.")
 
+        # Paired clocks: perf_counter gives elapsed time, thread_time gives CPU time
+        # on this worker thread only. Their difference is off-CPU time.
         start_comp = time.perf_counter()
         cpu_start = time.thread_time()
         try:
@@ -57,6 +61,7 @@ class FraudMLTier:
                     f"Expected at least {self.n_features} feature values, got {len(payload.features)}"
                 )
 
+            # log1p matches the transform train_model.py applies to Amount.
             log_amount = np.log1p(payload.amount)
             row = list(payload.features[: self.n_features]) + [log_amount]
 
@@ -64,6 +69,8 @@ class FraudMLTier:
             df_input = pd.DataFrame([row], columns=self.column_names)
             dataframe_construction_time_ms = (time.perf_counter() - start_df) * 1000
 
+            # Covers the whole predict_proba call: feature validation, the pandas to
+            # DMatrix conversion, and tree traversal. The conversion dominates.
             start_infer = time.perf_counter()
             risk_score = float(self.model.predict_proba(df_input)[0][1])
             model_inference_time_ms = (time.perf_counter() - start_infer) * 1000
@@ -77,10 +84,14 @@ class FraudMLTier:
             raise HTTPException(status_code=500, detail=f"Inference failed: {e}")  # server fault, not client error
 
         computation_time_ms = (time.perf_counter() - start_comp) * 1000
-        # Off-CPU time during computation (GIL contention / OS scheduling), floored at 0.
         cpu_time_ms = (time.thread_time() - cpu_start) * 1000
+        # Off-CPU time within the computation window (GIL contention, scheduling).
+        # Floored at 0 because the two clocks are read a line apart and can skew.
+        # This decomposes computation_time_ms rather than adding to it.
         compute_stall_time_ms = max(0.0, computation_time_ms - cpu_time_ms)
 
+        # Runs after every timing window, once per tier per process, to catch a
+        # library that resets n_jobs when the booster is first exercised.
         if self.n_jobs_runtime_verified is None:
             self.n_jobs_runtime_verified = (getattr(self.model, "n_jobs", None) == 1)
             if not self.n_jobs_runtime_verified:
@@ -99,6 +110,7 @@ class FraudModelRegistry:
     def load_all(self):
         for n in settings.FEATURE_TIERS:
             tier = FraudMLTier(n)
+            # Assigns only after load() returns, so a partially loaded registry cannot exist.
             tier.load()
             self.tiers[n] = tier
 
