@@ -120,7 +120,7 @@ capture_run_metadata() {
   # The load generator is the one image pulled by tag rather than built from this
   # tree, so its resolved digest is what makes the run reproducible.
   local k6_image k6_digest
-  k6_image=$(docker compose -f "$COMPOSE_FILE" config --images 2>/dev/null | grep -i 'k6' | head -1)
+  k6_image=$(docker compose -f "$COMPOSE_FILE" --profile loadgen config --images 2>/dev/null | grep -i 'k6' | head -1 || true)
   k6_digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "${k6_image:-grafana/k6}" 2>/dev/null \
     || echo "unknown (image not pulled yet)")
 
@@ -338,7 +338,7 @@ verify_smt_isolation() {
 record_env_sample() {
   local governor freqs
   governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")
-  freqs=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | paste -sd, -)
+  freqs=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | paste -sd, - || true)
   echo "env_sample label=${1} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) governor=${governor} freqs_khz=${freqs:-unavailable}" \
     >> "$ENV_TRACE_LOG"
 }
