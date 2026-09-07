@@ -174,7 +174,7 @@ capture_run_metadata() {
   # PYTHON_CPUSET overrides, though run-suite.sh never sets one) and sum
   # cores pinned across the stack, to verify against cpu_count above.
   local resolved_config
-  resolved_config=$(docker compose -f "$COMPOSE_FILE" config 2>/dev/null || echo "")
+  resolved_config=$(docker compose -f "$COMPOSE_FILE" --profile loadgen config 2>/dev/null || echo "")
 
   extract_cpuset() {
     printf '%s\n' "$resolved_config" | awk -v svc="  ${1}:" '

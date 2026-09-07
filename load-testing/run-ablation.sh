@@ -110,7 +110,7 @@ capture_run_metadata() {
   # python-service's cpuset varies per cell during the ablation run; this
   # records the baseline/control value (0-2) written in docker-compose.yml.
   local resolved_config
-  resolved_config=$(docker compose -f "$COMPOSE_FILE" config 2>/dev/null || echo "")
+  resolved_config=$(docker compose -f "$COMPOSE_FILE" --profile loadgen config 2>/dev/null || echo "")
 
   extract_cpuset() {
     printf '%s\n' "$resolved_config" | awk -v svc="  ${1}:" '
