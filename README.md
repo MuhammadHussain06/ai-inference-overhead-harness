@@ -63,7 +63,7 @@ This separation lets you attribute latency precisely:
 |---|---|---|
 | **RQ1** | In a synchronous microservice call, how does end-to-end latency decompose across model inference, DataFrame construction, thread dispatch, framework overhead, and the network hop? | E1 baseline (`run-suite.sh`), tables 1–3, figures 1–2 |
 | **RQ2** | How does that decomposition shift with model complexity (feature-count tier) and with request concurrency? | E1 across tiers + E2 concurrency scan, tables 4–5, figures 3–5 |
-| **RQ3** | Which system-level mechanism — thread-limiter capacity, available core count, or process count (GIL) — drives the thread-dispatch cost that dominates at high concurrency? | Ablation (`run-ablation.sh`), `analyze-ablation.py` |
+| **RQ3** | Which system-level mechanism — thread-limiter capacity, available core count, or process count (GIL) — drives the thread-dispatch cost that dominates at high concurrency? | Ablation (`run-ablation.sh`), `analyze-ablation.py`. Four arms: the three mechanisms, plus a repeat of the worker sweep with aggregate token capacity held constant, since the limiter is per process and a worker-count change moves both at once |
 
 The three-strategy design is what makes RQ1 answerable by subtraction: `calibration` bounds the
 framework and transport floor, `mock` adds the thread-dispatch path without compute, and the AI
@@ -129,9 +129,9 @@ Each service runs in its own container, pinned to a disjoint CPU range, so they 
 <details>
 <summary><b>Orchestration and analysis</b></summary>
 
-- `run-suite.sh`: full baseline + concurrency-scan suite across clean-slate restarts, with per-repetition target/concurrency shuffling, CPU-pin verification, host/toolchain provenance fingerprinting, and a failures log so one broken cell doesn't abort the run.
+- `run-suite.sh`: full baseline + concurrency-scan suite across clean-slate restarts, with per-repetition target/concurrency shuffling, CPU-pin verification, host/toolchain provenance fingerprinting, and a failures log. Any invalidating condition — a failed cell, an OOM kill, a pinning or tier mismatch, a readiness timeout — aborts the suite rather than being logged and skipped; `analyze-results.py` rejects the whole dataset if that log has any entries, so there is nothing to gain by continuing.
 - `warm-up.js`: JIT/pool warm-up once per restart, hitting every target sequentially in its own window (plus a second max-VUS pass before the concurrency scan). Shares code with `run-target.js` so warm-up traffic is tagged and classified identically to measured traffic.
-- `analyze-results.py`: P50/P95/P99 tables and histograms per strategy/tier, Mann-Whitney U significance testing (Holm-Bonferroni corrected, rank-biserial effect sizes), cluster-level bootstrap CIs, reproducibility (CoV% across reps), paired error/timeout tables, client-contention diagnostics, warm-up convergence checks, throughput-vs-concurrency figures, and an optional open-loop-vs-closed-loop validity check (see [Running](#running)) when `openloop_*.json` files are present.
+- `analyze-results.py`: P50/P95/P99 tables and histograms per strategy/tier, Mann-Whitney U significance testing (Holm-Bonferroni corrected, rank-biserial effect sizes), cluster-level bootstrap CIs, reproducibility (CoV% across reps), paired error/timeout tables, client-contention diagnostics, warm-up convergence checks, throughput-vs-concurrency figures, and an optional open-loop-vs-closed-loop validity check (see [Running](#running)) when `openloop_*.json` files are present. Throughput is measured within each repetition and then averaged — a span pooled across repetitions would include the restarts and cooldowns between them. Both analysis scripts have their own pytest suite under `analysis/tests/`.
 </details>
 
 ---
@@ -229,8 +229,8 @@ Content-Type: application/json
 | `parsingRequestTimeMs` | Request parsing/validation |
 | `threadDispatchTimeMs` | Thread-pool queueing before the handler runs (measured for all three strategies) |
 | `computationTimeMs` | `dataframeConstructionTimeMs` + `modelInferenceTimeMs`; `0.0` for mock/calibration |
-| `dataframeConstructionTimeMs` | Time to build the single-row pandas `DataFrame` |
-| `modelInferenceTimeMs` | Time inside `model.predict_proba` |
+| `dataframeConstructionTimeMs` | The `pd.DataFrame()` call only. XGBoost's later ingestion of that frame is counted in `modelInferenceTimeMs` |
+| `modelInferenceTimeMs` | The complete `predict_proba` call: feature-name validation, conversion of the pandas DataFrame into XGBoost's internal `DMatrix`, and booster tree traversal. The conversion dominates — see [Threats to validity](#threats-to-validity) |
 | `computeStallMs` | Portion of compute time the thread was off-CPU (GIL/OS scheduling) |
 | `serializationResponseTimeMs` | Estimated response-serialization cost |
 | `totalPythonExecutionTimeMs` | Total self-reported Python execution time |
@@ -245,8 +245,8 @@ Content-Type: application/json
 |---|---|---|---|
 | Image | `python:3.11-slim` | build `eclipse-temurin:21-jdk-alpine`, run `21-jre-alpine` | `grafana/k6` |
 | Port | `8000` | `8080` | — |
-| Cores | `0-2` | `3-5` | `6-7` |
-| Limit / reserved | 3.0 CPU / 3G RAM (1.0 / 1G) | 3.0 CPU / 3G RAM (1.0 / 1G) | 2.0 CPU / 1G RAM |
+| Cores (`cpuset`) | `0-1,4-5,8-9` (physical 0, 2, 4) | `2-3,6-7` (physical 1, 3) | `10-11,14-15` (physical 5, 7) |
+| Limit / reserved | 6.0 CPU / 3G RAM (1G reserved) | 4.0 CPU / 3G RAM (1G reserved) | 4.0 CPU / 1G RAM |
 | Notes | `UVICORN_WORKERS=3` at benchmark time; `n_jobs=1` + BLAS env vars keep each `predict_proba` call single-threaded — independent from the 3-worker concurrency | Outbound pool to Python sized via `python.service.max-connections` (default `128`); must stay ≥ highest VUS in `run-suite.sh`'s `CONCURRENCY_LEVELS` (currently `64`) or queueing inflates `estimatedNetworkOverheadMs`. `python.service.pending-acquire-timeout-ms` (default `5000`) bounds the wait. Feature-tier set fetched from Python's `/health` at startup, retrying up to 60s. Heap fixed via `JAVA_TOOL_OPTIONS=-Xms1536m -Xmx1536m` for reproducible sizing across hosts/reps | Runs in its own container on a disjoint cpuset. Gated behind the `loadgen` Compose profile; invoked per-cell by `run-suite.sh` via `docker compose run`, not started by `docker compose up` |
 
 Resource limits (`mem_limit`/`mem_reservation`/`cpus`) use Compose's plain (non-Swarm) top-level keys rather than `deploy.resources.limits`, which is a Swarm-only directive silently unenforced by `docker compose up`.
@@ -254,7 +254,7 @@ Resource limits (`mem_limit`/`mem_reservation`/`cpus`) use Compose's plain (non-
 **Requirements**
 
 - Docker + Docker Compose v2 (`docker compose`)
-- 8+ logical cores (`cpuset` hardcoded to `0-2`/`3-5`/`6-7` across the three containers — adjust or drop on smaller machines)
+- 16 logical cores. The `cpuset` values span CPUs 0–15 and are chosen for a host whose SMT siblings are *adjacent* logical CPUs, so that each service owns whole physical cores. On a host that enumerates siblings differently (Intel's classic `N` / `N+8` layout, for instance), `verify_smt_isolation()` resolves each cpuset through `thread_siblings_list` and aborts before any container starts rather than producing incomparable data — re-pick the values for your topology with `cat /sys/devices/system/cpu/cpu*/topology/thread_siblings_list`
 - ~7GB free RAM
 - k6 runs containerized (`grafana/k6`, pulled automatically on first `run-suite.sh` invocation) — no host install needed
 - Python 3 on the host — required by `run-suite.sh` itself (tier verification) in addition to `pip install -r analysis/requirements.txt` (pandas, numpy, matplotlib, scipy, statsmodels, tabulate) for the analysis phase. `requirements.txt` pins floors, not ceilings — recent CPython (3.13+) needs recent-enough wheels of these anyway, and older exact pins can fail a from-source build on a newer compiler toolchain
@@ -266,7 +266,7 @@ Resource limits (`mem_limit`/`mem_reservation`/`cpus`) use Compose's plain (non-
 
 ### Smoke test (recommended before the full suite)
 
-A small, fast pass through the same verified pipeline — 2 targets, 2 concurrency levels, 2 reps, reduced iteration counts — to catch a structural problem (bad config, a broken tag, a mislabeled tier) in minutes instead of hours into a real run. Also fires one deliberately over-rate open-loop request to confirm `dropped_iterations` is actually detected.
+A small, fast pass through the same verified pipeline — 2 targets, 2 concurrency levels, 2 reps, reduced iteration counts — to catch a structural problem (bad config, a broken tag, a mislabeled tier) in minutes instead of hours into a real run. It also fires one deliberately over-rate open-loop request to confirm `dropped_iterations` is actually detected, runs a two-cell slice of the ablation (the `cpuset` arm, whose values are cpuset strings rather than integers), and runs **both** analysis scripts. Every path the full suite depends on is exercised.
 
 ```bash
 docker compose up -d
@@ -276,7 +276,7 @@ cd load-testing
 
 Check `run_failures_log.txt` and `cpu_pin_check_log.txt` afterward, and confirm `table7_openloop_validity_check` shows a nonzero dropped-iterations count for the smoke-openloop cell. Clean here means the pipeline is trustworthy, not that any given rep count is sufficient — re-run the smoke test after any fix until it passes, then move to the full suite.
 
-`run-suite.sh`'s `TARGETS`, `CONCURRENCY_LEVELS`, `REPS_BASELINE`, `REPS_SCAN`, `BASELINE_ITERATIONS`, and `SCAN_ITERATIONS_PER_VU` are all overridable via `TARGETS_OVERRIDE`, `CONCURRENCY_OVERRIDE`, `REPS_BASELINE_OVERRIDE`, `REPS_SCAN_OVERRIDE`, `BASELINE_ITERATIONS_OVERRIDE`, and `SCAN_ITERATIONS_PER_VU_OVERRIDE` env vars — `run-smoke-test.sh` is a thin wrapper setting these to a small slice; unset, `run-suite.sh` behaves exactly as before.
+`run-suite.sh`'s `TARGETS`, `CONCURRENCY_LEVELS`, `REPS_BASELINE`, `REPS_SCAN`, `BASELINE_ITERATIONS`, and `SCAN_ITERATIONS_PER_VU` are all overridable via `TARGETS_OVERRIDE`, `CONCURRENCY_OVERRIDE`, `REPS_BASELINE_OVERRIDE`, `REPS_SCAN_OVERRIDE`, `BASELINE_ITERATIONS_OVERRIDE`, and `SCAN_ITERATIONS_PER_VU_OVERRIDE` env vars. `run-ablation.sh` takes `ABLATION_CELLS_OVERRIDE`, `REPS_ABLATION_OVERRIDE`, `ABLATION_VUS_OVERRIDE`, `ABLATION_TARGET_OVERRIDE` and `ABLATION_ITERATIONS_PER_VU_OVERRIDE`. `run-smoke-test.sh` is a thin wrapper setting both to a small slice; unset, each script behaves exactly as before.
 
 ### Full suite (recommended)
 
@@ -351,10 +351,15 @@ being correct. Neither suite runs during the Docker build — the images stay fr
 tooling and the measured containers stay identical to what is shipped.
 
 ```bash
-# Python service (47 tests): timing invariants, EWMA convergence,
+# Python service (49 tests): timing invariants, EWMA convergence,
 # n_jobs pinning, telemetry symmetry across the three strategies
 cd services/fraud-ml-service
 pip install -r requirements-dev.txt
+python3 -m pytest tests/ -q
+
+# Analysis pipeline (22 tests): cell-value parsing, throughput measurement,
+# cluster bootstrap, effect size, GC log parsing, k6 JSON loading
+cd analysis
 python3 -m pytest tests/ -q
 
 # Java service: network-overhead derivation, telemetry pass-through,
@@ -402,6 +407,7 @@ What they guard, and why it matters for the results:
 ### Construct validity — does the instrumentation measure what it claims?
 
 - **Instrumentation overhead is measured, not removed.** The `calibration` target bounds it as a floor; it stays baked into the AI and mock numbers.
+- **`modelInferenceTimeMs` is the cost of obtaining a prediction, not the cost of tree traversal.** It covers the whole `predict_proba` call, and on this software stack that call is dominated by XGBoost's ingestion of the pandas DataFrame rather than by the booster. Micro-benchmarked against the committed artifacts at the pinned dependency versions, tier 28: the complete call is ~3.0 ms, of which the DataFrame→`DMatrix` conversion is ~2.9 ms (95%) and booster traversal is ~0.05 ms (2%). The conversion cost is linear in column count, because XGBoost's dtype-inspection path runs per column per call — so the *tier scaling* of this field is predominantly a scaling of framework-level input marshalling. Reported as measured, because that is what a service written this way pays; read it as such rather than as model-evaluation cost.
 - **The serialization figure is a self-referential estimate.** `totalPythonExecutionTimeMs` includes an EWMA estimate of the cost of serializing the very response that carries it. Table 2's `Serialization (% of total)` column bounds how much that circularity can matter — sub-1% of total on every AI tier in practice.
 - **`estimatedNetworkOverheadMs` is a derived difference across two independent clocks**, so it can go negative. It is deliberately not clamped; table 2 reports the negative rate and minimum per tier. A small, tier-consistent rate is timer noise between processes, a large or tier-clustered rate would be a real measurement fault.
 - **"Network overhead" is Docker bridge-network overhead**, not a real network hop — the bridge/NAT path between two containers on one host, plus that serialization-estimation error. It is constant across strategies, so it cancels in differential comparisons but should not be read as a WAN figure.
@@ -423,7 +429,7 @@ What they guard, and why it matters for the results:
 
 - **Single-node only** — no multi-region or real network-hop path.
 - **Every inference call is one row in, one prediction out.** There is no batching path anywhere in `fraud-ml-service`. Results characterize unbatched synchronous-call overhead and say nothing about batched or dynamically-batched serving.
-- **Synthetic, uniformly-random feature vectors.** The licensed dataset cannot be bundled, so `randomFeatures()` draws in a roughly PCA-shaped range. XGBoost traversal cost is dominated by tree structure rather than input values, but this is an assumption the results rest on rather than a verified property.
+- **Synthetic, uniformly-random feature vectors.** The licensed dataset cannot be bundled, so `randomFeatures()` draws in a roughly PCA-shaped range. Two things bound the exposure: booster traversal is structure-dominated (measured flat at 0.04–0.05 ms across all four tiers, against a depth-4, 100-tree model), and the term that actually dominates `modelInferenceTimeMs` — the DataFrame→`DMatrix` conversion — is a dtype-and-shape operation independent of the values. The feature distribution therefore has little influence on the measured cost, though the models were trained on real data and their tree structure reflects it.
 - **Reduced feature space even at the largest tier** — `V1..V28` + `Amount` is the full PCA set available, but the source dataset is itself a reduced anonymized representation.
 - **Core pinning is host-specific.** Results are not comparable across different core counts or SMT settings without re-picking `cpuset` values, and the SMT check will abort rather than silently produce incomparable numbers.
 - **Concurrency-scan P99s are not uniformly powered.** `ITERATIONS_PER_VU` holds per-VU sample count constant while total N grows with VUS (100 at VUS=1, 6400 at VUS=64, by design, to resolve tails under contention). P99 confidence intervals widen at lower concurrency; do not read a row of per-concurrency P99s as equally precise.
@@ -440,10 +446,11 @@ What they guard, and why it matters for the results:
 ├── analysis/
 │   ├── analyze-results.py        # tables, figures, significance tests
 │   ├── analyze-ablation.py       # thread-dispatch mechanism sweep
+│   ├── tests/                    # pytest: cell-value parsing, throughput, bootstrap, GC parsing
 │   └── requirements.txt
 ├── load-testing/
 │   ├── run-suite.sh              # full baseline + concurrency-scan orchestrator
-│   ├── run-ablation.sh           # three-arm thread-dispatch mechanism sweep
+│   ├── run-ablation.sh           # four-arm thread-dispatch mechanism sweep
 │   ├── run-smoke-test.sh         # small pipeline-check pass before the full suite
 │   ├── warm-up.js                # per-target sequential JIT/pool warm-up
 │   ├── run-target.js             # single (target, concurrency, rep) cell runner (closed-loop)
