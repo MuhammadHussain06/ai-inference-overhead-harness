@@ -51,10 +51,11 @@ COLOR_CYCLE = ['#2b5c8f', '#c0392b', '#27ae60', '#8e44ad', '#e67e22', '#16a085']
 
 
 def _tier_label(tier):
-    if tier in (None, "", "mock"):
-        return "mock"
-    if tier == "calibration":
-        return "calibration"
+    if tier in (None, ""):
+        # An untagged row is a harness fault, not the mock arm; keep the two distinguishable.
+        return "unknown"
+    if tier in ("mock", "calibration"):
+        return tier
     return f"v{tier}"
 
 
@@ -95,22 +96,36 @@ def check_cpu_pin_log(results_dir):
     ]
     n_checks = n_mismatches = 0
     mismatch_lines = []
+    smt_unverifiable = 0
     with open(log_path) as f:
         for line in f:
+            line = line.strip()
+            if line.startswith("smt_check"):
+                # Physical-core disjointness: run-suite.sh aborts on an overlap, so the
+                # only outcome worth surfacing here is a host that could not be checked.
+                n_checks += 1
+                if kv(line).get("status") == "unverifiable":
+                    smt_unverifiable += 1
+                continue
             if not line.startswith("cpu_pin_check"):
                 continue
-            fields = kv(line.strip())
+            fields = kv(line)
             for expected_key, live_key in pairs:
                 if expected_key in fields and live_key in fields:
                     n_checks += 1
                     if fields[expected_key] != fields[live_key]:
                         n_mismatches += 1
-                        mismatch_lines.append(line.strip())
+                        mismatch_lines.append(line)
             if "n_jobs_verified" in fields:
                 n_checks += 1
                 if fields["n_jobs_verified"] != "true":
                     n_mismatches += 1
-                    mismatch_lines.append(line.strip())
+                    mismatch_lines.append(line)
+
+    if smt_unverifiable:
+        print(f"[cpu-pin] NOTE: {smt_unverifiable} SMT topology check(s) reported 'unverifiable' "
+              f"(thread_siblings_list not exposed, common under WSL2). Physical-core isolation is "
+              f"undemonstrated for this dataset; see run_metadata.json.")
 
     if n_mismatches:
         print(f"[cpu-pin] WARNING: {n_mismatches}/{n_checks} checks mismatched "
@@ -197,6 +212,20 @@ def load_results(results_dir, prefixes=None):
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df["vus"] = pd.to_numeric(df["vus"], errors="coerce")
     df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
+
+    # to_datetime infers one format from the first row and coerces the rest to NaT.
+    # Unparsed timestamps silently blank the throughput column, so surface them here.
+    n_unparsed = int(df["time"].isna().sum())
+    if n_unparsed:
+        print(f"[!] {n_unparsed}/{len(df)} timestamps did not parse and became NaT. "
+              f"Throughput and warm-up convergence depend on them; check the k6 output format.")
+
+    # A missing rep tag would merge every repetition into one cluster and silently
+    # revert the whole analysis to pseudoreplication.
+    n_untagged_reps = int(df["rep"].isna().sum())
+    if n_untagged_reps:
+        print(f"[!] {n_untagged_reps} metric point(s) carry no 'rep' tag and are being treated as "
+              f"rep=1. Rep-level statistics assume one repetition per clean-slate restart.")
     df["rep"] = df["rep"].fillna("1")
 
     # Low-cardinality columns (a handful of distinct tiers/phases/metrics/etc.,
@@ -260,13 +289,13 @@ def summarize(sub_df, label, n_boot=2000):
 
 
 def error_summary(df, phase, group_cols, label_fn):
-    # Convert low-cardinality columns to pandas categorical to reduce memory overhead
-    # while preserving identical behavior for comparisons and groupbys.
     sub = df[(df["metric"] == "http_req_duration") & (df["phase"] == phase)].copy()
     if sub.empty:
         return pd.DataFrame()
 
-    sub["status"] = sub["status"].fillna("0")
+    # status is categorical; filling with a value outside its categories raises,
+    # so drop back to plain strings first.
+    sub["status"] = sub["status"].astype("object").fillna("0")
     is_timeout = sub["status"] == "0"
     is_success = sub["status"] == "200"
     is_http_error = (~is_timeout) & (~is_success)
@@ -325,15 +354,23 @@ def crosscheck_error_counters(df, phase, group_cols, label_fn, table_from_durati
         print(f"[+] Error-count cross-check OK for phase='{phase}'.")
 
 
-def _throughput_reqs_per_s(subset_df):
+def _throughput_reqs_per_s(subset_df, rep_col="rep"):
+    """Mean of per-repetition throughput.
 
-    times = subset_df["time"].dropna()
-    if len(times) < 2:
-        return np.nan
-    span_s = (times.max() - times.min()).total_seconds()
-    if span_s <= 0:
-        return np.nan
-    return len(times) / span_s
+    Measured over each repetition separately and then averaged. Pooling the
+    repetitions first is invalid: the span would then run from the first
+    repetition's first request to the last repetition's last request, which
+    includes every stack restart, warm-up and cooldown in between.
+    """
+    per_rep = []
+    for _, g in subset_df.groupby(rep_col, observed=True):
+        times = g["time"].dropna()
+        if len(times) < 2:
+            continue
+        span_s = (times.max() - times.min()).total_seconds()
+        if span_s > 0:
+            per_rep.append(len(times) / span_s)
+    return float(np.mean(per_rep)) if per_rep else np.nan
 
 
 def client_diagnostics_summary(df, phase, group_cols, label_fn, blocked_warn_ms=5.0):
@@ -496,14 +533,15 @@ def save_table(df, name, output_dir, caption=None, label=None):
     with open(md_path, "w") as f:
         f.write(df.to_markdown(index=False))
 
-    latex_body = df.to_latex(index=False, escape=True)
     with open(tex_path, "w") as f:
         f.write("\\begin{table}[t]\n\\centering\n")
-        f.write(latex_body)
+        # Caption precedes the tabular body so it renders above the table,
+        # matching Elsevier/JSS style.
         if caption:
             f.write(f"\\caption{{{caption}}}\n")
         if label:
             f.write(f"\\label{{{label}}}\n")
+        f.write(df.to_latex(index=False, escape=True))
         f.write("\\end{table}\n")
 
     print(f"[+] Table  -> {csv_path} / .md / .tex")
@@ -683,7 +721,7 @@ def analyze_baseline(df, output_dir):
                        "clean-slate repetitions of the baseline phase.",
                label="tab:baseline-between-run")
 
-    # Omits the status=="200" filter because custom transaction-service Trend metrics lack k6 status tags.
+
     decomp_rows = []
     for t in order:
         row = {"Group": _tier_label(t)}
@@ -717,8 +755,7 @@ def analyze_baseline(df, output_dir):
 
     analyze_measurement_floor(e2e, order, output_dir)
 
-    # Table 3: DataFrame-construction share of measured computation time
-    # (no status=="200" filter -- see Table 2 comment above)
+    # Table 3: cost of building the DataFrame, as a share of measured computation.
     share_rows = []
     for t in order:
         if t in ("mock", "calibration"):
@@ -731,15 +768,20 @@ def analyze_baseline(df, output_dir):
         comp_mean = float(comp_t.mean())
         share_rows.append({
             "Tier": _tier_label(t),
-            "Mean DataFrame Construction (ms)": round(float(df_t.mean()), 3),
-            "Mean Model Inference (ms)": round(float(inf_t.mean()), 3),
+            "Mean pd.DataFrame() Construction (ms)": round(float(df_t.mean()), 3),
+            "Mean predict_proba() Call (ms)": round(float(inf_t.mean()), 3),
             "Mean Computation Total (ms)": round(comp_mean, 3),
-            "DataFrame Share of Computation (%)": round(100 * float(df_t.mean()) / comp_mean, 1) if comp_mean else np.nan,
+            "pd.DataFrame() Construction Share of Computation (%)":
+                round(100 * float(df_t.mean()) / comp_mean, 1) if comp_mean else np.nan,
         })
     table3 = pd.DataFrame(share_rows)
     save_table(table3, "table3_dataframe_share_of_computation", output_dir,
-               caption="DataFrame construction as a share of total measured computation time, by tier "
-                       "(pooled across all repetitions).",
+               caption="Cost of constructing the single-row pandas DataFrame, as a share of total "
+                       "measured computation time, by tier (pooled across all repetitions). This "
+                       "column covers the \\texttt{pd.DataFrame()} call only. The larger "
+                       "pandas-related cost -- XGBoost's conversion of that DataFrame into its "
+                       "internal DMatrix representation -- occurs inside \\texttt{predict\\_proba} "
+                       "and is therefore counted in the \\texttt{predict\\_proba()} column, not here.",
                label="tab:df-share")
 
     # Compares significance between adjacent tiers using only successful requests (status==200) to exclude errors from latency comparisons.
@@ -752,15 +794,17 @@ def analyze_baseline(df, output_dir):
                        "alongside significance. Pooled-request p-value included for reference only.",
                label="tab:baseline-mannwhitney")
 
-    # Figure 1: stacked bar of Python-side decomposition, AI tiers only
+    # Figure 1: stacked bar of Python-side decomposition, AI tiers only.
+    # computeStallMs is deliberately absent: it is the off-CPU portion of the
+    # computation window, so it is already inside the DataFrame-construction and
+    # predict_proba wall clocks and stacking it would count that time twice.
     ai_order = [t for t in order if t not in ("mock", "calibration")]
     if ai_order:
         stages = [
             ("python_parsing_time_ms", "Request Parsing"),
             ("python_thread_dispatch_time_ms", "Thread Dispatch"),
             ("python_dataframe_construction_time_ms", "DataFrame Construction"),
-            ("python_model_inference_time_ms", "Model Inference"),
-            ("python_compute_stall_time_ms", "Compute Stall (GIL/scheduling)"),
+            ("python_model_inference_time_ms", "predict_proba() Call"),
             ("python_serialization_time_ms", "Response Serialization"),
         ]
         fig, ax = plt.subplots(figsize=(7, 4.5), dpi=300)
@@ -775,6 +819,16 @@ def analyze_baseline(df, output_dir):
             ax.bar(x_labels, vals, bottom=bottoms, label=label,
                    color=COLOR_CYCLE[i % len(COLOR_CYCLE)], edgecolor="black", linewidth=0.5)
             bottoms += vals
+
+        # Residual against the measured total, so the bars sum to what Python reported
+        # rather than to the sum of the stages that happen to be instrumented.
+        totals = np.nan_to_num(np.array([
+            base[(base["metric"] == "python_total_time_ms") & (base["tier"] == t)]["value"].mean()
+            for t in ai_order
+        ]))
+        ax.bar(x_labels, np.maximum(totals - bottoms, 0), bottom=bottoms, label="Other (unattributed)",
+               color="#95a5a6", edgecolor="black", linewidth=0.5)
+
         ax.set_xlabel("Feature Tier")
         ax.set_ylabel("Mean Latency (ms)")
         ax.set_title("Python-Side Latency Decomposition by Feature Tier (VUS=1, pooled)", fontweight="bold")
@@ -828,7 +882,10 @@ def analyze_scan(df, output_dir):
 
     order = [t for t in TIER_ORDER if t in scan["tier"].unique()]
     seen_levels = sorted(int(v) for v in scan["vus"].dropna().unique())
-    levels = [v for v in CONCURRENCY_ORDER if v in seen_levels] or seen_levels
+    # Canonical levels first, then anything else the run used, so a CONCURRENCY_OVERRIDE
+    # containing non-default values cannot silently drop those cells from every table.
+    levels = ([v for v in CONCURRENCY_ORDER if v in seen_levels]
+              + [v for v in seen_levels if v not in CONCURRENCY_ORDER])
     if not order or not levels:
         print("[!] No recognized tiers/concurrency levels in scan data; skipping E2 analysis.")
         return
@@ -873,20 +930,30 @@ def analyze_scan(df, output_dir):
             if not s:
                 continue
             group_label = f"{_tier_label(t)} @ VUS={vus}"
-            error_rate = error_rate_lookup.get(group_label, 0.0)
+            # NaN rather than 0.0: a missing lookup means the two tables disagree
+            # about which cells exist, which should be visible, not read as "no errors".
+            error_rate = error_rate_lookup.get(group_label, np.nan)
             throughput = _throughput_reqs_per_s(cell)
+            per_rep_throughput = [_throughput_reqs_per_s(g) for _, g in cell.groupby("rep", observed=True)]
+            per_rep_throughput = [v for v in per_rep_throughput if not np.isnan(v)]
+            throughput_sd = (float(np.std(per_rep_throughput, ddof=1))
+                             if len(per_rep_throughput) > 1 else 0.0)
             rows.append({
                 "Tier": _tier_label(t),
                 "Concurrency (VUS)": vus,
                 **s,
                 "Throughput (req/s)": round(throughput, 2) if not np.isnan(throughput) else np.nan,
+                "Throughput SD across reps (req/s)": round(throughput_sd, 2),
                 "Error Rate (%)": error_rate,
             })
     table4 = pd.DataFrame(rows)
     save_table(table4, "table4_concurrency_scan_summary_pooled", output_dir,
                caption="Latency (successful requests only), throughput, and error rate across the "
-                       "concurrency sweep, by tier, pooled across all repetitions (see Table 4b for "
-                       "between-run reproducibility and Table 4c for the full error/timeout breakdown).",
+                       "concurrency sweep, by tier. Latency percentiles pool all repetitions; "
+                       "throughput is measured within each repetition and then averaged, since a "
+                       "pooled span would include the restarts and cooldowns between repetitions. "
+                       "See Table 4b for between-run reproducibility and Table 4c for the full "
+                       "error/timeout breakdown.",
                label="tab:scan-summary-pooled")
 
     # Table 4b: between-run consistency per (tier, concurrency) cell.
@@ -966,28 +1033,37 @@ def analyze_scan(df, output_dir):
     ax.grid(True, which="both", linestyle="--", alpha=0.4)
     save_figure(fig, "figure4_throughput_vs_concurrency", output_dir)
 
-    # Figure 5: Compute decomposition under load for feature tier 28. Isolate thread-pool
-    # queueing (Thread Dispatch) from invariant steps (DataFrame Construction, Inference).
+    # Figure 5: compute decomposition under load for the heaviest tier. Isolates thread-pool
+    # queueing (Thread Dispatch) from the invariant steps (DataFrame construction, predict_proba).
+    # Compute stall is drawn as an overlaid line rather than a stacked segment: it is the
+    # off-CPU portion of the computation window, already inside the two wall clocks below it.
     heaviest = "28" if "28" in order else next((t for t in reversed(order) if t not in ("mock", "calibration")), None)
     if heaviest:
         stages = [
             ("python_thread_dispatch_time_ms", "Thread Dispatch"),
             ("python_dataframe_construction_time_ms", "DataFrame Construction"),
-            ("python_model_inference_time_ms", "Model Inference"),
-            ("python_compute_stall_time_ms", "Compute Stall (GIL/scheduling)"),
+            ("python_model_inference_time_ms", "predict_proba() Call"),
         ]
+
+        def _stage_means(metric):
+            return np.nan_to_num(np.array([
+                scan[(scan["metric"] == metric) & (scan["tier"] == heaviest) & (scan["vus"] == vus)]["value"].mean()
+                for vus in levels
+            ]))
+
         fig, ax = plt.subplots(figsize=(7, 4.5), dpi=300)
         bottoms = np.zeros(len(levels))
         x_labels = [str(v) for v in levels]
         for i, (metric, label) in enumerate(stages):
-            vals = np.array([
-                scan[(scan["metric"] == metric) & (scan["tier"] == heaviest) & (scan["vus"] == vus)]["value"].mean()
-                for vus in levels
-            ])
-            vals = np.nan_to_num(vals)
+            vals = _stage_means(metric)
             ax.bar(x_labels, vals, bottom=bottoms, label=label,
                    color=COLOR_CYCLE[i % len(COLOR_CYCLE)], edgecolor="black", linewidth=0.5)
             bottoms += vals
+
+        stall = _stage_means("python_compute_stall_time_ms")
+        ax.plot(x_labels, stall, marker="o", linestyle="--", linewidth=1.6, color="#c0392b",
+                label="Compute Stall (of which; GIL/scheduling)")
+
         ax.set_xlabel("Concurrency (VUs)")
         ax.set_ylabel("Mean Latency (ms)")
         ax.set_title(f"Compute Decomposition vs. Concurrency (Tier v{heaviest}, pooled)", fontweight="bold")
@@ -1009,11 +1085,13 @@ def parse_gc_log(path):
     """Extracts (uptime_s, pause_ms) for each G1 pause event."""
     pauses = []
     first_uptime = last_uptime = None
+    n_lines = 0
     with open(path, errors="replace") as f:
         for line in f:
             m = GC_LINE_RE.match(line)
             if not m:
                 continue
+            n_lines += 1
             uptime = float(m.group("uptime"))
             first_uptime = first_uptime if first_uptime is not None else uptime
             last_uptime = uptime
@@ -1025,6 +1103,14 @@ def parse_gc_log(path):
             dm = GC_DUR_RE.search(msg)
             if dm:
                 pauses.append((uptime, float(dm.group("dur_ms"))))
+
+    # The pause pattern is G1's. A log with content but no matches means the JVM
+    # selected a different collector, which would otherwise read as "no GC occurred".
+    if n_lines and not pauses:
+        print(f"[gc] WARNING: {os.path.basename(path)} has {n_lines} parsable lines but no G1 pause "
+              f"events. The JVM may have selected a non-G1 collector; GC overhead is unmeasured "
+              f"for this rep, not zero.")
+
     window_s = (last_uptime - first_uptime) if first_uptime is not None else None
     return pauses, window_s
 
@@ -1108,16 +1194,20 @@ def analyze_openloop_check(df, output_dir):
         rows.append({"Tier": _tier_label(tier), "Model": "Open-loop (constant-arrival-rate)",
                      "P95 (ms)": ol_stats["P95 (ms)"], "P99 (ms)": ol_stats["P99 (ms)"],
                      "N": ol_stats["N (pooled, all reps)"],
-                     "Dropped iterations": dropped_count})
+                     "Dropped iterations": str(dropped_count)})
 
-        for vus in (32, 64):
+        # Compare against the top of whatever concurrency sweep this run actually used.
+        scan_levels = sorted(int(v) for v in df.loc[df["phase"] == "scan", "vus"].dropna().unique())
+        for vus in scan_levels[-2:]:
             cl_cell = df[(df["phase"] == "scan") & (df["metric"] == "http_req_duration") &
                          (df["status"] == "200") & (df["tier"] == tier) & (df["vus"] == vus)]
             cl_stats = summarize(cl_cell, f"{_tier_label(tier)} closed-loop VUS={vus}")
             if cl_stats:
                 rows.append({"Tier": _tier_label(tier), "Model": f"Closed-loop VUS={vus}",
                              "P95 (ms)": cl_stats["P95 (ms)"], "P99 (ms)": cl_stats["P99 (ms)"],
-                             "N": cl_stats["N (pooled, all reps)"], "Dropped iterations": "n/a"})
+                             "N": cl_stats["N (pooled, all reps)"],
+                             # Written as a string, not "n/a": pandas reads that back as NaN.
+                             "Dropped iterations": "not applicable"})
 
     if not rows:
         return

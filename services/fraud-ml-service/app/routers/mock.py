@@ -12,8 +12,9 @@ router = APIRouter()
 
 
 def _score_mock():
-    # computationTimeMs stays 0.0, matching calibration._noop(): the field means
-    # dataframeConstructionTimeMs + modelInferenceTimeMs, neither of which applies here.
+    # computationTimeMs stays 0.0: the field means dataframeConstructionTimeMs plus
+    # modelInferenceTimeMs, neither of which applies here. The random draw's own cost
+    # therefore lands in threadDispatchTimeMs.
     risk_score = random.uniform(0.0, 1.0)
     is_fraud = risk_score >= settings.FRAUD_THRESHOLD
     return is_fraud, risk_score, 0.0

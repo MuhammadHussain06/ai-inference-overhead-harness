@@ -85,13 +85,17 @@ public class TransactionService {
 
         double requestParsingTimeMs = (System.nanoTime() - requestStartNanos) / 1_000_000.0;
 
-        long netStart = System.nanoTime();
-
+        // Forwards the full feature list unsliced, so the request body is the same size
+        // for every tier and payload size cannot explain a tier difference.
         AiRequestDto aiPayload = new AiRequestDto(
                 request.getTransactionId(),
                 request.getAmount().doubleValue(),
                 request.getFeatures()
         );
+
+        // Taken immediately before the call so aiCallRoundTripTimeMs covers the wire
+        // and the peer, not local object construction.
+        long netStart = System.nanoTime();
 
         return webClient.post()
                 .uri(endpoint)
@@ -178,8 +182,10 @@ public class TransactionService {
     private ResponseDto buildResponse(RequestDto request, double riskScore, String status, String strategy,
                                       Integer featureTier, long overallStartTime, double parseTime, double netTime,
                                       double dbTime, ResponseDto.PythonTelemetryDto pythonTelemetry) {
-        long responseBuildStart = System.nanoTime();
+        // executionTimeMs first, so responseObjectBuildTimeMs measures the DTO assembly
+        // alone. Neither includes WebFlux's serialization of the response body.
         double executionTimeMs = (System.nanoTime() - overallStartTime) / 1_000_000.0;
+        long responseBuildStart = System.nanoTime();
 
         ResponseDto response = new ResponseDto(
                 request.getTransactionId(),
@@ -195,8 +201,9 @@ public class TransactionService {
         response.setRequestParsingTimeMs(parseTime);
         response.setAiCallRoundTripTimeMs(netTime);
 
-        // Unclamped: negative values signal Python runtime exceeding Java round trip (calibration fault).
-        // analyze-results.py reports the occurrence rate.
+        // Unclamped: a negative value means Python's reported total exceeded Java's round
+        // trip, which is a measurement signal. Clamping would hide it and bias the mean
+        // upward. analyze-results.py reports the rate and minimum per tier.
         double estimatedNetworkOverheadMs = netTime - pythonTelemetry.getTotalPythonExecutionTimeMs();
         response.setEstimatedNetworkOverheadMs(estimatedNetworkOverheadMs);
         response.setDbWriteTimeMs(dbTime);

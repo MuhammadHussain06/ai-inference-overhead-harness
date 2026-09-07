@@ -1,3 +1,4 @@
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -12,8 +13,9 @@ from .routers import calibration, mock, predict
 
 
 class TimingMiddleware(BaseHTTPMiddleware):
-    # request.state.start_time marks early event-loop entry, allowing async routes to
-    # isolate thread-dispatch overhead from end-to-end Python latency metrics.
+    # Stamps the earliest point the ASGI stack exposes, so totalPythonExecutionTimeMs
+    # covers framework ingress (routing, body read, validation) rather than starting
+    # at the route handler. Must stay the outermost user middleware.
     async def dispatch(self, request, call_next):
         request.state.start_time = time.perf_counter()
         return await call_next(request)
@@ -21,12 +23,11 @@ class TimingMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
+    # Everything here runs before the first request is served: model loading and
+    # estimator seeding must not land inside a measured request, and the thread
+    # limiter must hold one value for the whole process lifetime.
     model_registry.load_all()
-    calibrate_serialization_estimate()  # seed before serving traffic
-    # run_in_threadpool (used by predict.py) draws on anyio's default thread
-    # limiter; override its capacity here, before traffic starts, when the
-    # ablation harness requests a non-default value.
+    calibrate_serialization_estimate()
     if settings.THREAD_LIMITER_TOKENS is not None:
         to_thread.current_default_thread_limiter().total_tokens = settings.THREAD_LIMITER_TOKENS
     yield
@@ -41,6 +42,9 @@ app.add_middleware(TimingMiddleware)
 async def health():
     return {
         "status": "ok",
+        # Uvicorn runs several worker processes; this response describes whichever
+        # one answered. workerPid lets the harness tell them apart across polls.
+        "workerPid": os.getpid(),
         "loadedTiers": list(model_registry.tiers.keys()),
         "nJobsVerified": {n: tier.n_jobs_verified for n, tier in model_registry.tiers.items()},
         # null until a tier has served its first request; the harness checks it

@@ -22,7 +22,8 @@ public class FeatureTierRegistry {
     private static final Duration RETRY_DELAY = Duration.ofSeconds(2);
 
     private final WebClient webClient;
-    private Set<Integer> validTiers;
+    // Written once in @PostConstruct, read from every event-loop thread thereafter.
+    private volatile Set<Integer> validTiers;
 
     public FeatureTierRegistry(WebClient webClient) {
         this.webClient = webClient;

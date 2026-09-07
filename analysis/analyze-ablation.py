@@ -3,7 +3,7 @@ Analyzes run-ablation.sh's output: isolates which of three candidate
 mechanisms (AnyIO thread-limiter capacity, physical-core ceiling, GIL
 contention via process count) drives Thread Dispatch time at VUS=64.
 
-Each arm holds two mechanisms at a control value and sweeps the third.
+Each arm holds the other mechanisms at their control value and sweeps one.
 Rep-level stats use the same cluster-bootstrap and Mann-Whitney approach
 as analyze-results.py, applied to one pairwise comparison per arm
 (control vs. its most extreme value) rather than a full pairwise grid,
@@ -17,6 +17,7 @@ import argparse
 import glob
 import json
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -30,6 +31,7 @@ ARM_LABELS = {
     "thread_limiter": "Thread-Limiter Tokens",
     "cpuset": "CPU Cores",
     "workers": "Uvicorn Workers",
+    "workers_token_matched": "Uvicorn Workers (aggregate tokens held constant)",
 }
 METRICS = {
     "python_thread_dispatch_time_ms": "Thread Dispatch",
@@ -37,22 +39,53 @@ METRICS = {
     "python_total_time_ms": "Total",
 }
 
+# ablation_<arm>_<value>_rep<N>.json. Gating on a known arm also rejects
+# ablation_warmup_* and ablation_run_metadata.json, which share the prefix.
+CELL_FILE_RE = re.compile(r"^ablation_(?P<arm>[a-z_]+)_(?P<value>[^_]+)_rep(?P<rep>\d+)\.json$")
+
+# The one configuration every arm holds as its control, so the cells that
+# realize it can be cross-checked against each other.
+CONTROL_CELL = {"thread_limiter": "40", "cpuset": "0-1,4-5,8-9", "workers": "3"}
+
+
+def _cpu_count_of(cpuset):
+    """Counts logical CPUs in a cpuset string ('0-1', '0-1,4-5,8-9')."""
+    total = 0
+    for part in cpuset.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            total += int(hi) - int(lo) + 1
+        else:
+            total += 1
+    return total
+
 
 def _value_sort_key(v):
-    """Sorts '0-2'/'8-13'/'8-15' by core count, plain numbers numerically."""
-    if "-" in v:
-        lo, hi = v.split("-")
-        return int(hi) - int(lo) + 1
+    """Sorts cpuset strings by logical-CPU count and plain numbers numerically.
+    run-ablation.sh emits multi-range cpusets, so single-range parsing is not enough."""
+    if "-" in v or "," in v:
+        try:
+            return _cpu_count_of(v)
+        except ValueError:
+            return v
     try:
         return int(v)
     except ValueError:
         return v
 
 
+def _is_cell_file(path):
+    m = CELL_FILE_RE.match(os.path.basename(path))
+    return m is not None and m.group("arm") in ARM_LABELS
+
+
 def load_ablation_cells(results_dir):
-    """Loads ablation_<arm>_<value>_rep<N>.json files (excludes ablation_warmup_*)."""
-    files = sorted(glob.glob(os.path.join(results_dir, "ablation_*.json")))
-    files = [f for f in files if "warmup" not in os.path.basename(f)]
+    """Loads ablation_<arm>_<value>_rep<N>.json cell files."""
+    files = [f for f in sorted(glob.glob(os.path.join(results_dir, "ablation_*.json")))
+             if _is_cell_file(f)]
     if not files:
         return None
 
@@ -102,6 +135,24 @@ def cluster_bootstrap_ci(sub_df, n_boot=2000, ci=0.95, seed=42):
     return (float(lo), float(hi))
 
 
+def rank_biserial_effect_size(U, n1, n2):
+    """Rank-biserial correlation from a Mann-Whitney U statistic (equivalent to
+    Cliff's delta). Ranges [-1, 1]; 0 = no separation between groups."""
+    return 1 - (2 * U) / (n1 * n2)
+
+
+def _effect_magnitude(delta):
+    """Romano et al. (2006) thresholds for Cliff's delta."""
+    d = abs(delta)
+    if d < 0.147:
+        return "negligible"
+    elif d < 0.33:
+        return "small"
+    elif d < 0.474:
+        return "medium"
+    return "large"
+
+
 def build_decomposition_table(df):
     rows = []
     for arm in sorted(df["arm"].unique()):
@@ -133,9 +184,37 @@ def build_decomposition_table(df):
     return pd.DataFrame(rows)
 
 
+def build_control_agreement_table(df, metric="python_thread_dispatch_time_ms"):
+    """Compares the cells that realize the shared control configuration.
+
+    Every arm holds the other mechanisms at CONTROL_CELL, so those cells are
+    repeated measurements of one configuration. Disagreement between them is
+    drift or an order effect rather than the manipulated factor.
+    """
+    rows = []
+    for arm, value in CONTROL_CELL.items():
+        cell = df[(df["arm"] == arm) & (df["arm_value"] == value) & (df["metric"] == metric)]
+        if cell.empty:
+            continue
+        rep_means = cell.groupby("rep")["value"].mean()
+        rows.append({
+            "Arm holding this as control": ARM_LABELS.get(arm, arm),
+            "Value": value,
+            "N reps": len(rep_means),
+            "Mean Thread Dispatch (ms)": round(float(rep_means.mean()), 3),
+            "SD across reps (ms)": round(float(rep_means.std(ddof=1)), 3) if len(rep_means) > 1 else 0.0,
+        })
+    table = pd.DataFrame(rows)
+    if len(table) > 1:
+        means = table["Mean Thread Dispatch (ms)"]
+        spread = 100 * (means.max() - means.min()) / means.mean() if means.mean() else np.nan
+        table["Spread across control cells (%)"] = round(spread, 1)
+    return table
+
+
 def control_vs_extreme_test(df, metric="python_thread_dispatch_time_ms"):
     """Rep-level Mann-Whitney, control value vs. the arm's most extreme value.
-    One comparison per arm, so no multiple-comparison correction is needed."""
+    One planned comparison per arm, so no multiple-comparison correction applies."""
     rows = []
     for arm in sorted(df["arm"].unique()):
         arm_df = df[(df["arm"] == arm) & (df["metric"] == metric)]
@@ -148,6 +227,7 @@ def control_vs_extreme_test(df, metric="python_thread_dispatch_time_ms"):
         if len(control_means) < 2 or len(extreme_means) < 2:
             continue
         u_stat, p = mannwhitneyu(control_means, extreme_means, alternative="two-sided")
+        effect = rank_biserial_effect_size(u_stat, len(control_means), len(extreme_means))
         rows.append({
             "Arm": ARM_LABELS.get(arm, arm),
             "Control": control, "Extreme": extreme,
@@ -155,7 +235,10 @@ def control_vs_extreme_test(df, metric="python_thread_dispatch_time_ms"):
             "Extreme Mean (ms)": round(extreme_means.mean(), 3),
             "Delta (ms)": round(extreme_means.mean() - control_means.mean(), 3),
             "N reps (control/extreme)": f"{len(control_means)}/{len(extreme_means)}",
+            "U statistic": round(float(u_stat), 1),
             "p-value": round(p, 4),
+            "Effect size (rank-biserial r)": round(float(effect), 3),
+            "Effect magnitude": _effect_magnitude(effect),
         })
     return pd.DataFrame(rows)
 
@@ -172,11 +255,13 @@ def save_table(df, name, output_dir, caption=None, label=None):
         f.write(df.to_markdown(index=False))
     with open(os.path.join(tables_dir, f"{name}.tex"), "w") as f:
         f.write("\\begin{table}[t]\n\\centering\n")
-        f.write(df.to_latex(index=False, escape=True))
+        # Caption precedes the tabular body so it renders above the table,
+        # matching Elsevier/JSS style.
         if caption:
             f.write(f"\\caption{{{caption}}}\n")
         if label:
             f.write(f"\\label{{{label}}}\n")
+        f.write(df.to_latex(index=False, escape=True))
         f.write("\\end{table}\n")
     print(f"[+] Table  -> {tables_dir}/{name}.csv / .md / .tex")
 
@@ -190,31 +275,34 @@ def plot_ablation(df, output_dir):
     for ax, arm in zip(axes, arms):
         arm_df = df[df["arm"] == arm]
         values = sorted(arm_df["arm_value"].unique(), key=_value_sort_key)
-        dispatch_means, other_means, total_errs = [], [], []
+        dispatch_means, other_means, dispatch_errs = [], [], []
         for value in values:
             cell = arm_df[arm_df["arm_value"] == value]
-            total_points = cell[cell["metric"] == "python_total_time_ms"]
-            total = total_points["value"].mean()
-            dispatch = cell.loc[cell["metric"] == "python_thread_dispatch_time_ms", "value"].mean()
+            dispatch_points = cell[cell["metric"] == "python_thread_dispatch_time_ms"]
+            total = cell.loc[cell["metric"] == "python_total_time_ms", "value"].mean()
+            dispatch = dispatch_points["value"].mean()
             dispatch_means.append(dispatch)
+            # Defined as a residual so the two segments sum to the measured total.
             other_means.append(max(total - dispatch, 0))
-            # SD of per-rep means: between-run spread, not within-run request spread.
-            rep_means = total_points.groupby("rep")["value"].mean()
-            total_errs.append(float(rep_means.std(ddof=1)) if len(rep_means) > 1 else 0.0)
+            # SD of per-rep means: between-run spread of the compared segment.
+            rep_means = dispatch_points.groupby("rep")["value"].mean()
+            dispatch_errs.append(float(rep_means.std(ddof=1)) if len(rep_means) > 1 else 0.0)
 
         x = np.arange(len(values))
+        tick_labels = [f"{v}\n({_cpu_count_of(v)} CPUs)" if ("-" in v or "," in v) else v
+                       for v in values]
         ax.bar(x, other_means, label="Rest of Total", color="#2b5c8f")
         ax.bar(x, dispatch_means, bottom=other_means, label="Thread Dispatch", color="#c0392b",
-               yerr=total_errs, capsize=4, ecolor="#333333")
+               yerr=dispatch_errs, capsize=4, ecolor="#333333")
         ax.set_xticks(x)
-        ax.set_xticklabels(values)
-        ax.set_title(ARM_LABELS.get(arm, arm))
+        ax.set_xticklabels(tick_labels, fontsize=8)
+        ax.set_title(ARM_LABELS.get(arm, arm), fontsize=9)
         ax.set_xlabel("Value")
     axes[0].set_ylabel("Mean Latency (ms)")
     axes[0].legend()
     n_reps = df["rep"].nunique()
     fig.suptitle(f"Thread Dispatch vs. Candidate Mechanism "
-                 f"(VUS=64, N={n_reps} runs, error bars = SD of total across runs)")
+                 f"(VUS=64, N={n_reps} runs, error bars = SD of thread dispatch across runs)")
     fig.tight_layout()
 
     figures_dir = os.path.join(output_dir, "figures")
@@ -238,7 +326,7 @@ def main():
 
     df = load_ablation_cells(args.results_dir)
     if df is None:
-        print(f"[!] No ablation_*.json files found in {args.results_dir}. Run run-ablation.sh first.")
+        print(f"[!] No ablation_*.json cell files found in {args.results_dir}. Run run-ablation.sh first.")
         return
 
     n_reps = df["rep"].nunique()
@@ -256,15 +344,23 @@ def main():
               f"be significant regardless of effect size. Re-run with REPS_ABLATION_OVERRIDE>=7.")
 
     save_table(build_decomposition_table(df), "table_ablation_decomposition", args.output_dir,
-               caption="Per-arm latency decomposition at VUS=64. Each arm holds the other two "
+               caption="Per-arm latency decomposition at VUS=64. Each arm holds the other "
                        "mechanisms at their control value and sweeps one. CIs are 95\\% cluster "
                        "bootstraps resampling whole repetitions, so they reflect between-run "
                        "variation rather than within-run request spread.",
                label="tab:ablation-decomposition")
+    save_table(build_control_agreement_table(df), "table_ablation_control_agreement", args.output_dir,
+               caption="Agreement between the cells that realize the shared control configuration. "
+                       "Each arm holds the other two mechanisms at this configuration, so these "
+                       "cells are repeated measurements of one setup; the spread between them "
+                       "bounds how much of any arm's effect could be drift or order rather than "
+                       "the manipulated factor.",
+               label="tab:ablation-control-agreement")
     save_table(control_vs_extreme_test(df), "table_ablation_control_vs_extreme", args.output_dir,
                caption="Rep-level two-sided Mann-Whitney comparing each arm's control value to its "
                        "most extreme value, on mean thread-dispatch time. One planned comparison per "
-                       "arm, so no multiple-comparison correction is applied.",
+                       "arm, so no multiple-comparison correction is applied. Rank-biserial effect "
+                       "size reported alongside significance.",
                label="tab:ablation-significance")
     plot_ablation(df, args.output_dir)
 

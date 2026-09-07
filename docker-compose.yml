@@ -62,7 +62,10 @@ services:
     # `docker compose up` doesn't start it; run-suite.sh invokes it per-cell
     # via `docker compose run`.
     k6:
-        image: grafana/k6:latest
+        # Pinned rather than :latest -- the only image not built from this tree, so a
+        # floating tag would be the one uncontrolled dependency in the measurement.
+        # run_metadata.json records the resolved digest for each run.
+        image: grafana/k6:0.54.0
         profiles: ["loadgen"]
         entrypoint: ["k6"]
         working_dir: /scripts
