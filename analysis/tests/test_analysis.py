@@ -149,12 +149,34 @@ def test_parse_gc_log_extracts_only_bare_gc_pause_lines(tmp_path):
     assert window_s == pytest.approx(59.488)
 
 
-def test_parse_gc_log_warns_when_no_g1_pauses_are_found(tmp_path, capsys):
+def test_parse_gc_log_confirmed_g1_zero_pauses_is_informational_not_a_warning(tmp_path, capsys):
+    log = tmp_path / "gc_scan_rep2.log"
+    log.write_text("[2026-01-01T12:00:00.100+0000][0.001s][info][gc     ] Using G1\n")
+    pauses, _ = results.parse_gc_log(str(log))
+    assert pauses == []
+    out = capsys.readouterr().out
+    assert "G1 confirmed selected" in out
+    assert "WARNING" not in out
+
+
+def test_parse_gc_log_warns_by_name_when_a_different_collector_is_confirmed(tmp_path, capsys):
+    log = tmp_path / "gc_scan_rep2.log"
+    log.write_text("[2026-01-01T12:00:00.100+0000][0.001s][info][gc     ] Using Serial\n")
+    pauses, _ = results.parse_gc_log(str(log))
+    assert pauses == []
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "selected 'Serial', not G1" in out
+
+
+def test_parse_gc_log_warns_unknown_when_no_startup_line_is_present(tmp_path, capsys):
     log = tmp_path / "gc_scan_rep2.log"
     log.write_text("[2026-01-01T12:00:00.100+0000][0.512s][info][gc,init] Version: 21.0.5+11\n")
     pauses, _ = results.parse_gc_log(str(log))
     assert pauses == []
-    assert "non-G1 collector" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "Collector identity unknown" in out
 
 
 # k6 JSON loading

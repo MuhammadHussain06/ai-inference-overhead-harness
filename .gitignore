@@ -5,6 +5,7 @@ services/transaction-service/target/
 services/fraud-ml-service/**/__pycache__/
 services/fraud-ml-service/training/venv/
 services/fraud-ml-service/training/data/
+analysis/**/__pycache__/
 analysis/venv/
 
 # Benchmark raw output -- keep dirs via .gitkeep, ignore their contents.
