@@ -1079,6 +1079,8 @@ GC_LINE_RE = re.compile(
 GC_DUR_RE = re.compile(r"(?P<dur_ms>[\d.]+)ms\s*$")
 # G1 messages are prefixed "GC(N) Pause ..."; startswith("Pause") never matches this.
 GC_PAUSE_RE = re.compile(r"^GC\(\d+\)\s+Pause")
+# Matches the JVM's one-line startup log, e.g. "Using G1".
+GC_COLLECTOR_RE = re.compile(r"^Using (?P<collector>\S.*)$")
 
 
 def parse_gc_log(path):
@@ -1086,6 +1088,7 @@ def parse_gc_log(path):
     pauses = []
     first_uptime = last_uptime = None
     n_lines = 0
+    collector = None
     with open(path, errors="replace") as f:
         for line in f:
             m = GC_LINE_RE.match(line)
@@ -1098,18 +1101,31 @@ def parse_gc_log(path):
             if m.group("level") != "info" or m.group("tags") != "gc":
                 continue
             msg = m.group("msg")
+            cm = GC_COLLECTOR_RE.match(msg)
+            if cm:
+                collector = cm.group("collector").strip()
+                continue
             if not GC_PAUSE_RE.match(msg):
                 continue
             dm = GC_DUR_RE.search(msg)
             if dm:
                 pauses.append((uptime, float(dm.group("dur_ms"))))
 
-    # The pause pattern is G1's. A log with content but no matches means the JVM
-    # selected a different collector, which would otherwise read as "no GC occurred".
+    # No pause matches doesn't by itself mean a non-G1 collector -- could just be
+    # a quiet rep. The startup "Using <Collector>" line settles which it is.
     if n_lines and not pauses:
-        print(f"[gc] WARNING: {os.path.basename(path)} has {n_lines} parsable lines but no G1 pause "
-              f"events. The JVM may have selected a non-G1 collector; GC overhead is unmeasured "
-              f"for this rep, not zero.")
+        if collector == "G1":
+            print(f"[gc] {os.path.basename(path)}: G1 confirmed selected (startup log), "
+                  f"but 0 pause events in this rep's {n_lines}-line window -- read as "
+                  f"'no GC cycle ran' (e.g. light load), not as unmeasured overhead.")
+        elif collector:
+            print(f"[gc] WARNING: {os.path.basename(path)} selected '{collector}', not G1. "
+                  f"This parser only recognizes G1's pause-log format, so GC overhead is "
+                  f"unmeasured for this rep under a different collector, not zero.")
+        else:
+            print(f"[gc] WARNING: {os.path.basename(path)} has {n_lines} parsable lines but no G1 "
+                  f"pause events, and no 'Using <Collector>' startup line was found either. "
+                  f"Collector identity unknown; GC overhead is unmeasured for this rep, not zero.")
 
     window_s = (last_uptime - first_uptime) if first_uptime is not None else None
     return pauses, window_s

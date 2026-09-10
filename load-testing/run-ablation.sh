@@ -461,7 +461,7 @@ for rep in $(seq 1 "$REPS_ABLATION"); do
     verify_tiers_and_limiter "$label" "$tokens"
 
     echo "  [warm-up] VUS=${ABLATION_VUS}..."
-    k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" -- \
+    k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" "REP=${rep}" -- \
       --out "json=/results/ablation_warmup_${arm}_${value}_rep${rep}.json"
     verify_tiers_runtime "$label"
     sleep "$COOLDOWN_S"
@@ -483,4 +483,4 @@ docker compose -f "$COMPOSE_FILE" down
 echo "[+] Ablation complete. Raw results in ${RESULTS_DIR}/ablation_*.json"
 echo "    SMT topology and pinning checks logged to ${CPU_PIN_LOG}"
 echo "    Per-cell governor/frequency samples logged to ${ENV_TRACE_LOG}"
-echo "    Run: python3 ../analysis/analyze-ablation.py"
+echo "    Run: ../analysis/venv/bin/python3 ../analysis/analyze-ablation.py"

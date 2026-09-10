@@ -13,6 +13,9 @@ const SLOT_S = MAX_DURATION_S + 5;
 
 const ORDER = (__ENV.WARMUP_TARGETS || 'mock calibration 5 10 20 28').trim().split(/\s+/);
 
+// Same convention as run-target.js.
+const rep = __ENV.REP || '1';
+
 export const options = {
     scenarios: Object.fromEntries(
         ORDER.map((key, i) => [
@@ -30,7 +33,7 @@ export const options = {
 };
 
 function warm(key) {
-    sendTransaction(TARGETS[key], { phase: 'warmup' });
+    sendTransaction(TARGETS[key], { phase: 'warmup', rep });
 }
 
 

@@ -655,7 +655,7 @@ for rep in $(seq 1 "$REPS_BASELINE"); do
   verify_cpu_pinning "baseline rep=${rep}"
   verify_tiers "baseline rep=${rep}"
   echo "[*] Warming up JIT / connection pools..."
-  k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" -- --out "json=/results/warmup_baseline_rep${rep}.json"
+  k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" "REP=${rep}" -- --out "json=/results/warmup_baseline_rep${rep}.json"
   verify_tiers_runtime "baseline rep=${rep}"
   sleep "$COOLDOWN_S"
 
@@ -685,14 +685,14 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   verify_cpu_pinning "scan rep=${rep}"
   verify_tiers "scan rep=${rep}"
   echo "[*] Warming up JIT / connection pools (default VUS)..."
-  k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" -- --out "json=/results/warmup_scan_rep${rep}.json"
+  k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" "REP=${rep}" -- --out "json=/results/warmup_scan_rep${rep}.json"
   verify_tiers_runtime "scan rep=${rep}"
   sleep "$COOLDOWN_S"
 
   # Matches warm-up concurrency to the scan's peak VUS; separate output
   # file so table0's convergence check can report on it distinctly.
   echo "[*] Warming up JIT / connection pools (MAX_VUS=${MAX_VUS})..."
-  k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" WARMUP_VUS="$MAX_VUS" -- \
+  k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" WARMUP_VUS="$MAX_VUS" "REP=${rep}" -- \
     --out "json=/results/warmup_scan_maxvus_rep${rep}.json"
   sleep "$COOLDOWN_S"
 
@@ -727,4 +727,4 @@ echo "    Warm-up JSON output (for post-hoc convergence check) saved as warmup_b
 echo "    warmup_scan_rep*.json (default VUS), and warmup_scan_maxvus_rep*.json (VUS=${MAX_VUS})"
 echo "    'calibration' target included alongside mock/5/10/20/28 -- isolates instrumentation overhead"
 echo "    No cell failures -- every rep passed cpu-pin and tier verification."
-echo "    Run: python3 ../analysis/analyze-results.py"
+echo "    Run: ../analysis/venv/bin/python3 ../analysis/analyze-results.py"

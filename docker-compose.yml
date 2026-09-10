@@ -2,6 +2,8 @@ services:
     python-service:
         build: ./services/fraud-ml-service
         container_name: python
+        # No USER in the Dockerfile -- pins bind-mount writes to the host user (see setup.sh).
+        user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
         ports:
             - "8000:8000"
         volumes:
@@ -33,6 +35,8 @@ services:
     transaction-service:
         build: ./services/transaction-service
         container_name: java
+        # Same reason as python-service, for results/gc-logs/.
+        user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
         ports:
             - "8080:8080"
         environment:
@@ -69,6 +73,8 @@ services:
         profiles: ["loadgen"]
         entrypoint: ["k6"]
         working_dir: /scripts
+        # Upstream image's own fixed non-root UID doesn't match the host either.
+        user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
         volumes:
             - ./load-testing:/scripts
             - ./results:/results

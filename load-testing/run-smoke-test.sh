@@ -36,8 +36,9 @@ WARMUP_ITERATIONS_PER_TARGET_OVERRIDE=20 \
 ./run-ablation.sh
 
 echo "[*] Smoke test 4/4: both analysis scripts"
-python3 ../analysis/analyze-results.py
-python3 ../analysis/analyze-ablation.py
+# Same venv setup.sh builds (PEP 668 blocks a bare pip install/system python3 here).
+../analysis/venv/bin/python3 ../analysis/analyze-results.py
+../analysis/venv/bin/python3 ../analysis/analyze-ablation.py
 
 echo "[+] Smoke test complete. Before trusting this run, check:"
 echo "    ../results/run_failures_log.txt and ../results/ablation_run_failures_log.txt (both empty)"
