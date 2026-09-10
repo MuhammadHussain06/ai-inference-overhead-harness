@@ -3,9 +3,10 @@
 A containerized testbed that measures the **latency and throughput cost of a live AI fraud-inference call**, benchmarked against a network-equivalent mock and a zero-work calibration floor.
 
 ```bash
-docker compose up          # bring up the stack
-./load-testing/run-suite.sh              # run the full benchmark suite
-python3 analysis/analyze-results.py      # generate tables + figures
+./setup.sh                                   # once per machine
+docker compose up                            # bring up the stack
+./load-testing/run-suite.sh                  # run the full benchmark suite
+analysis/venv/bin/python3 analysis/analyze-results.py   # generate tables + figures
 ```
 
 ---
@@ -264,6 +265,14 @@ Resource limits (`mem_limit`/`mem_reservation`/`cpus`) use Compose's plain (non-
 
 ## Running
 
+### First-time setup (once per machine)
+
+```bash
+./setup.sh
+```
+
+Neither service's Dockerfile sets a non-root `USER`, and the upstream `k6` image runs as its own fixed non-root UID -- without this step, `docker compose up` auto-creates `results/` and `results/gc-logs/` owned by root (or by a UID that isn't yours), and later writes into them from the `k6` container fail outright. `setup.sh` writes a `.env` with your UID/GID (which `docker-compose.yml` picks up via `user: ${HOST_UID:-1000}:${HOST_GID:-1000}` on all three services), pre-creates `results/gc-logs/` so it's host-owned from the start, and creates `analysis/venv/` with `analysis/requirements.txt` installed into it (Ubuntu 24.04+ refuses a bare `pip install` against the system Python). Safe to re-run.
+
 ### Smoke test (recommended before the full suite)
 
 A small, fast pass through the same verified pipeline — 2 targets, 2 concurrency levels, 2 reps, reduced iteration counts — to catch a structural problem (bad config, a broken tag, a mislabeled tier) in minutes instead of hours into a real run. It also fires one deliberately over-rate open-loop request to confirm `dropped_iterations` is actually detected, runs a two-cell slice of the ablation (the `cpuset` arm, whose values are cpuset strings rather than integers), and runs **both** analysis scripts. Every path the full suite depends on is exercised.
@@ -283,11 +292,11 @@ Check `run_failures_log.txt` and `cpu_pin_check_log.txt` afterward, and confirm 
 Restarts the stack per repetition, shuffles order, logs provenance.
 
 ```bash
+./setup.sh          # once per machine -- see "First-time setup" above
 docker compose build
-pip install -r analysis/requirements.txt
 cd load-testing
-./run-suite.sh                              # baseline + concurrency scan, all reps
-python3 ../analysis/analyze-results.py      # tables + figures
+./run-suite.sh                                       # baseline + concurrency scan, all reps
+../analysis/venv/bin/python3 ../analysis/analyze-results.py   # tables + figures
 ```
 
 Requires `APP_DB_SAVE_ENABLED=false` in `docker-compose.yml`.
@@ -322,7 +331,7 @@ Any cell failure (dropped connection, transient error, OOM kill) aborts the suit
 docker compose up                                    # waits for python health check
 k6 run load-testing/warm-up.js                       # JIT warm-up
 k6 run --out json=results/results.json your-test.js  # real load test
-python3 analysis/analyze-results.py                  # tables + figures
+analysis/venv/bin/python3 analysis/analyze-results.py   # tables + figures
 ```
 
 `warm-up.js` is tunable via `WARMUP_ITERATIONS_PER_TARGET`, `WARMUP_VUS`, `WARMUP_MAX_DURATION_S`, and reads `BASE_URL` (falls back to `http://localhost:8080/api/v1/transactions`).
@@ -357,10 +366,10 @@ cd services/fraud-ml-service
 pip install -r requirements-dev.txt
 python3 -m pytest tests/ -q
 
-# Analysis pipeline (22 tests): cell-value parsing, throughput measurement,
+# Analysis pipeline (24 tests): cell-value parsing, throughput measurement,
 # cluster bootstrap, effect size, GC log parsing, k6 JSON loading
 cd analysis
-python3 -m pytest tests/ -q
+venv/bin/python3 -m pytest tests/ -q
 
 # Java service: network-overhead derivation, telemetry pass-through,
 # strategy routing, request-timing filter ordering
@@ -383,9 +392,11 @@ What they guard, and why it matters for the results:
 
 ### Troubleshooting
 
-- **`permission denied` writing to `/results/*.json` from inside the k6 container.** The `grafana/k6` image runs as a non-root user internally, so a host `results/` directory owned by your user with default permissions can block its writes on a bind mount. Fix with `chmod -R 777 results/` before running.
-- **`Conflict. The container name "/..." is already in use`** on `docker compose up`. Leftover stopped containers from an earlier interrupted run are holding a name. `docker ps -a`, then `docker rm` the stale container(s), then retry.
-- **`pip install -r analysis/requirements.txt` fails building from source.** Usually means no prebuilt wheel exists for your Python version at these floors — this is more likely on very new or very old CPython. Upgrading pip first (`pip install --upgrade pip`) often surfaces a compatible wheel; if it still falls back to a source build and fails, installing without version constraints (`pip install pandas numpy matplotlib scipy tabulate statsmodels`) is a safe fallback — the analysis phase isn't sensitive to exact versions of these.
+- **`permission denied` writing to `/results/*.json` or `/gc-logs/*` from inside a container.** Means `./setup.sh` wasn't run (or its `.env` predates a fresh clone) — neither service's Dockerfile sets a non-root `USER`, and `grafana/k6` runs as its own fixed non-root UID either way, so without `HOST_UID`/`HOST_GID` in `.env` the bind-mounted directories end up owned by root or the wrong UID. Run `./setup.sh`, confirm `.env` exists and matches `id -u`/`id -g`, then retry. If `results/` was already created root-owned before `setup.sh` ever ran, `sudo chown -R $(id -u):$(id -g) results/` once to reclaim it.
+- **`./setup.sh` or `./run-suite.sh` (etc.) fails with `Permission denied` before even starting.** The executable bit didn't survive however you got the repo onto this machine — a plain `git clone` carries it, but GitHub's "Download ZIP" button does not, and some Windows-side file transfers strip it too. Fix once: `chmod +x setup.sh load-testing/*.sh`.
+- **`Conflict. The container name "/..." is already in use`** on `docker compose up`. Leftover stopped containers from an earlier interrupted run — or from a *different clone or directory* of this same repo, since `container_name` in `docker-compose.yml` is fixed (`python`/`java`), not project-scoped — are holding the name. `docker rm -f python java`, then retry.
+- **`error: externally-managed-environment` from `pip install`.** Ubuntu 24.04+ (PEP 668) refuses a bare `pip install` against the system Python. This is what `./setup.sh` exists to avoid — it builds `analysis/venv` and installs `analysis/requirements.txt` into that instead. Use `analysis/venv/bin/python3`/`pip` for anything analysis-related rather than the bare `python3`/`pip3` on `PATH`.
+- **`pip install` fails building from source inside `analysis/venv`.** Usually means no prebuilt wheel exists for your Python version at these floors — more likely on very new or very old CPython. `analysis/venv/bin/pip install --upgrade pip` first often surfaces a compatible wheel; if it still falls back to a source build and fails, installing without version constraints (`analysis/venv/bin/pip install pandas numpy matplotlib scipy tabulate statsmodels`) is a safe fallback — the analysis phase isn't sensitive to exact versions of these.
 - **Docker/Compose issues in general** (daemon unreachable, `docker compose` vs `docker-compose`, WSL2-specific PATH quirks) are environment setup, not something this project can account for — consult Docker's own docs for your OS if `docker info` itself isn't working before troubleshooting anything here.
 
 ---
