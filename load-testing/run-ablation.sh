@@ -31,6 +31,18 @@ ORDER_LOG="${RESULTS_DIR}/ablation_run_order_log.txt"
 : > "$ORDER_LOG"
 METADATA_FILE="${RESULTS_DIR}/ablation_run_metadata.json"
 FAILURES_LOG="${RESULTS_DIR}/ablation_run_failures_log.txt"
+# Both analysis scripts refuse to run if this log is non-empty, so any abort must write to
+# it. This catch-all fires last, only when nothing more specific already logged a reason.
+_log_uncaught_exit() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ ! -s "$FAILURES_LOG" ]; then
+    echo "  [FATAL] [uncaught] run aborted with status ${rc} before any cell-level check logged a" \
+         "reason -- treat this dataset as incomplete." >> "$FAILURES_LOG"
+  fi
+  return 0
+}
+trap _log_uncaught_exit EXIT
+
 : > "$FAILURES_LOG"
 CPU_PIN_LOG="${RESULTS_DIR}/ablation_cpu_pin_check_log.txt"
 : > "$CPU_PIN_LOG"
@@ -40,6 +52,15 @@ ABLATION_VUS="${ABLATION_VUS_OVERRIDE:-64}"
 ITERATIONS_PER_VU="${ABLATION_ITERATIONS_PER_VU_OVERRIDE:-100}"
 # Sets default replicate count to n=7 per arm to ensure statistical power for Mann-Whitney tests and bootstrap CIs.
 REPS_ABLATION="${REPS_ABLATION_OVERRIDE:-7}"
+
+# Command substitution in a for word-list is not an errexit context, so integer overrides
+# must be validated explicitly before use.
+for _intvar in REPS_ABLATION ABLATION_VUS ITERATIONS_PER_VU; do
+  if [ -n "${!_intvar+x}" ] && { ! [[ "${!_intvar}" =~ ^[0-9]+$ ]] || [ "${!_intvar}" -lt 1 ]; }; then
+    echo "[!] ${_intvar} must be a positive integer, got '${!_intvar}'." >&2
+    exit 1
+  fi
+done
 COOLDOWN_S=10
 ANYIO_DEFAULT_TOKENS=40
 EXPECTED_TIERS="5,10,20,28"
@@ -84,6 +105,11 @@ CELLS=(${ABLATION_CELLS_OVERRIDE:-
   "workers_token_matched:1:${CONTROL_CPUSET}:${CONTROL_CPUS}:1:40"
   "workers_token_matched:3:${CONTROL_CPUSET}:${CONTROL_CPUS}:3:13"
 })
+
+if [ "${#CELLS[@]}" -eq 0 ]; then
+  echo "[!] CELLS resolved to no cells -- check ABLATION_CELLS_OVERRIDE." >&2
+  exit 1
+fi
 
 # Unset by default -- warm-up.js's own 3000 default applies for the full ablation.
 # Set for a reduced-scale run so warm-up doesn't dwarf it.
@@ -221,8 +247,21 @@ core_keys_of_cpuset() {
   while read -r cpu; do
     [ -n "$cpu" ] || continue
     key=$(core_key_of_cpu "$cpu")
-    [ -n "$key" ] && echo "$key"
+    # Plain `if`, not `[ -n ... ] && echo`: a false test as the loop's last command would
+    # make the while-loop exit 1, which pipefail turns into a set -e abort.
+    if [ -n "$key" ]; then echo "$key"; fi
   done < <(expand_cpuset "$1") | sort -un | paste -sd, -
+}
+
+# Counts logical CPUs in a cpuset whose physical core cannot be resolved. Dropping one
+# would shrink the set compared for overlap, so an unresolved CPU aborts instead.
+unresolved_cpus_in_cpuset() {
+  local cpu n=0
+  while read -r cpu; do
+    [ -n "$cpu" ] || continue
+    if [ -z "$(core_key_of_cpu "$cpu")" ]; then n=$((n + 1)); fi
+  done < <(expand_cpuset "$1")
+  echo "$n"
 }
 
 # Validates python-service cpusets per cell before load runs to prevent SMT sibling contention.
@@ -241,6 +280,21 @@ verify_smt_isolation() {
   py_keys=$(core_keys_of_cpuset "$py_cpuset")
   java_keys=$(core_keys_of_cpuset "$JAVA_CPUSET")
   k6_keys=$(core_keys_of_cpuset "$K6_CPUSET")
+
+  local py_unres java_unres k6_unres
+  py_unres=$(unresolved_cpus_in_cpuset "$py_cpuset")
+  java_unres=$(unresolved_cpus_in_cpuset "$JAVA_CPUSET")
+  k6_unres=$(unresolved_cpus_in_cpuset "$K6_CPUSET")
+  if [ "$py_unres" -gt 0 ] || [ "$java_unres" -gt 0 ] || [ "$k6_unres" -gt 0 ]; then
+    abort_suite "[smt] ${label}" "could not resolve a physical core for every pinned CPU" \
+      "(unresolved: python=${py_unres} java=${java_unres} k6=${k6_unres}). Those CPUs would be dropped" \
+      "from the overlap comparison, which could report isolation that does not hold."
+  fi
+  if [ -z "$py_keys" ] || [ -z "$java_keys" ] || [ -z "$k6_keys" ]; then
+    abort_suite "[smt] ${label}" "at least one cpuset resolved to no physical cores at all" \
+      "(python=${py_keys:-EMPTY} java=${java_keys:-EMPTY} k6=${k6_keys:-EMPTY}). An empty cpuset means" \
+      "the configuration was never read, not that the services are disjoint."
+  fi
 
   echo "  [smt] ${label}: physical cores python(${py_keys:-EMPTY}) java(${java_keys:-EMPTY}) k6(${k6_keys:-EMPTY})"
   echo "smt_check label=${label} python_cores=${py_keys:-EMPTY} java_cores=${java_keys:-EMPTY} k6_cores=${k6_keys:-EMPTY}" \
@@ -304,7 +358,10 @@ except Exception:
 import json, sys
 try:
     d = json.load(sys.stdin)
-    print("true" if all(d.get("nJobsVerified", {}).values()) else "false")
+    v = d.get("nJobsVerified", {})
+    # Requires real booleans: all({}.values()) is True for an empty mapping, and a
+    # truthy non-bool (e.g. "false") would pass too.
+    print("true" if isinstance(v, dict) and v and all(x is True for x in v.values()) else "false")
 except Exception:
     print("false")
 ')
@@ -337,11 +394,16 @@ except Exception:
   fi
 
   # Matches run-suite.sh: n_jobs=1 alone does not constrain the OpenMP layer beneath it.
-  case "$thread_env" in
-    *OMP_NUM_THREADS=1*) ;;
-    *) abort_suite "[health] ${label}" "OMP_NUM_THREADS is not pinned to 1 (${thread_env:-EMPTY})" \
-         "-- numeric libraries may spawn threads outside the measured cpuset." ;;
-  esac
+  # Comma-delimited match: a bare substring match on *OMP_NUM_THREADS=1* also accepts 10, 16,
+  # 100, 1024. All four variables are asserted, per the README.
+  local tvar
+  for tvar in OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS NUMEXPR_NUM_THREADS; do
+    case ",${thread_env}," in
+      *",${tvar}=1,"*) ;;
+      *) abort_suite "[health] ${label}" "${tvar} is not pinned to exactly 1 (${thread_env:-EMPTY})" \
+           "-- numeric libraries may spawn threads outside the measured cpuset." ;;
+    esac
+  done
 }
 
 # Polls for workerPid coverage across $workers workers (the caller's loop variable,
@@ -362,8 +424,12 @@ try:
 except Exception:
     print("unreadable ")
 else:
-    failed = [tier for tier, ok in verified.items() if ok is False]
-    print(("failed:" + ",".join(failed) if failed else "ok"), d.get("workerPid", ""))
+    # Requires an explicit key: an absent key, empty mapping, or null would read as success.
+    if not isinstance(verified, dict) or not verified:
+        print("unreadable", d.get("workerPid", ""))
+    else:
+        failed = [tier for tier, ok in verified.items() if ok is not True and ok is not None]
+        print(("failed:" + ",".join(failed) if failed else "ok"), d.get("workerPid", ""))
 ') || sample="unreadable "
     runtime_state="${sample%% *}"
     pid="${sample##* }"
@@ -424,6 +490,11 @@ check_oom_killed() {
   java_container=$(docker compose -f "$COMPOSE_FILE" ps -q transaction-service 2>/dev/null || echo "")
   py_oom=$(docker inspect --format '{{.State.OOMKilled}}' "$py_container" 2>/dev/null || echo "unknown")
   java_oom=$(docker inspect --format '{{.State.OOMKilled}}' "$java_container" 2>/dev/null || echo "unknown")
+  if [ "$py_oom" = "unknown" ] || [ "$java_oom" = "unknown" ]; then
+    abort_suite "[oom]" "could not determine OOM-kill state (python=${py_oom} java=${java_oom})." \
+      "A container that OOM-died and was removed also reports unknown, which is the case this" \
+      "check exists to catch -- refusing to treat it as clean."
+  fi
   if [ "$py_oom" = "true" ] || [ "$java_oom" = "true" ]; then
     abort_suite "[cell] ${label}" "OOM-killed: python=${py_oom} java=${java_oom}"
   fi
@@ -480,6 +551,14 @@ for rep in $(seq 1 "$REPS_ABLATION"); do
 done
 
 docker compose -f "$COMPOSE_FILE" down
+# Guards against an empty run: the completion banner would otherwise report success after
+# executing no cells at all.
+_n_cells=$(find "$RESULTS_DIR" -maxdepth 1 -name 'ablation_*_rep*.json' 2>/dev/null | wc -l)
+if [ "$_n_cells" -eq 0 ]; then
+  abort_suite "[ablation]" "no ablation cells were executed -- check ABLATION_CELLS_OVERRIDE and" \
+    "REPS_ABLATION_OVERRIDE. Not reporting this run as successful."
+fi
+
 echo "[+] Ablation complete. Raw results in ${RESULTS_DIR}/ablation_*.json"
 echo "    SMT topology and pinning checks logged to ${CPU_PIN_LOG}"
 echo "    Per-cell governor/frequency samples logged to ${ENV_TRACE_LOG}"

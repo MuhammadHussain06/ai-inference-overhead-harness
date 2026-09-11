@@ -62,7 +62,9 @@ def test_rep_sort_key_orders_numerically_not_lexically():
 
 # effect size
 
-@pytest.mark.parametrize("u_stat,expected", [(0, 1.0), (49, -1.0), (24.5, 0.0)])
+# Cliff's delta convention: U is scipy's U for the FIRST sample, so U=0 (A entirely below B)
+# is delta=-1.
+@pytest.mark.parametrize("u_stat,expected", [(0, -1.0), (49, 1.0), (24.5, 0.0)])
 def test_rank_biserial_spans_minus_one_to_one(u_stat, expected):
     assert results.rank_biserial_effect_size(u_stat, 7, 7) == pytest.approx(expected)
 
@@ -107,7 +109,9 @@ def _timed_cell(reps, n_per_rep, cell_span_s, gap_s):
 def test_throughput_is_measured_within_reps_not_across_them():
     """Pooling reps would put the restarts and cooldowns between them in the span."""
     cell = _timed_cell(reps=3, n_per_rep=100, cell_span_s=1.0, gap_s=3600)
-    assert results._throughput_reqs_per_s(cell) == pytest.approx(100.0, rel=0.05)
+    # 100 completions spanning exactly 1.0s bound 99 inter-completion intervals, so the
+    # rate is 99/s. Asserted exactly, not with a loose tolerance.
+    assert results._throughput_reqs_per_s(cell) == pytest.approx(99.0, rel=1e-9)
 
 
 def test_throughput_is_unaffected_by_the_gap_between_reps():
@@ -144,7 +148,7 @@ GC_LOG = """[2026-01-01T12:00:00.100+0000][0.512s][info][gc,init] Version: 21.0.
 def test_parse_gc_log_extracts_only_bare_gc_pause_lines(tmp_path):
     log = tmp_path / "gc_scan_rep1.log"
     log.write_text(GC_LOG)
-    pauses, window_s = results.parse_gc_log(str(log))
+    pauses, window_s, _ = results.parse_gc_log(str(log))
     assert [d for _, d in pauses] == [2.5, 3.75]
     assert window_s == pytest.approx(59.488)
 
@@ -152,7 +156,7 @@ def test_parse_gc_log_extracts_only_bare_gc_pause_lines(tmp_path):
 def test_parse_gc_log_confirmed_g1_zero_pauses_is_informational_not_a_warning(tmp_path, capsys):
     log = tmp_path / "gc_scan_rep2.log"
     log.write_text("[2026-01-01T12:00:00.100+0000][0.001s][info][gc     ] Using G1\n")
-    pauses, _ = results.parse_gc_log(str(log))
+    pauses, _, _ = results.parse_gc_log(str(log))
     assert pauses == []
     out = capsys.readouterr().out
     assert "G1 confirmed selected" in out
@@ -162,7 +166,7 @@ def test_parse_gc_log_confirmed_g1_zero_pauses_is_informational_not_a_warning(tm
 def test_parse_gc_log_warns_by_name_when_a_different_collector_is_confirmed(tmp_path, capsys):
     log = tmp_path / "gc_scan_rep2.log"
     log.write_text("[2026-01-01T12:00:00.100+0000][0.001s][info][gc     ] Using Serial\n")
-    pauses, _ = results.parse_gc_log(str(log))
+    pauses, _, _ = results.parse_gc_log(str(log))
     assert pauses == []
     out = capsys.readouterr().out
     assert "WARNING" in out
@@ -172,7 +176,7 @@ def test_parse_gc_log_warns_by_name_when_a_different_collector_is_confirmed(tmp_
 def test_parse_gc_log_warns_unknown_when_no_startup_line_is_present(tmp_path, capsys):
     log = tmp_path / "gc_scan_rep2.log"
     log.write_text("[2026-01-01T12:00:00.100+0000][0.512s][info][gc,init] Version: 21.0.5+11\n")
-    pauses, _ = results.parse_gc_log(str(log))
+    pauses, _, _ = results.parse_gc_log(str(log))
     assert pauses == []
     out = capsys.readouterr().out
     assert "WARNING" in out
@@ -228,3 +232,84 @@ def test_error_summary_splits_timeouts_from_http_errors(tmp_path):
     assert row["HTTP Errors (non-200 response)"] == 2
     assert row["Timeouts / Network Errors (no response)"] == 1
     assert row["Error Rate (%)"] == pytest.approx(30.0)
+
+
+# --- GC log parsing, effect size, and throughput edge cases ---
+
+SERIAL_PAUSE_LOG = (
+    "[2026-01-01T12:00:00.000+0000][0.005s][info][gc     ] Using Serial\n"
+    "[2026-01-01T12:00:00.100+0000][0.105s][info][gc          ] "
+    "GC(0) Pause Young (Allocation Failure) 18M->2M(61M) 1.146ms\n"
+)
+
+
+def test_parse_gc_log_warns_when_a_non_g1_collector_produced_parsable_pauses(tmp_path, capsys):
+    """Serial/Parallel/Shenandoah emit the same generic "GC(N) Pause ..." record as G1.
+
+    Verified on JDK 21.0.10: their pauses parse cleanly, so checking the collector only in
+    the zero-pause branch reported them as G1's with no warning at all.
+    """
+    log = tmp_path / "gc_scan_rep1.log"
+    log.write_text(SERIAL_PAUSE_LOG)
+    pauses, _, collector = results.parse_gc_log(str(log))
+    assert len(pauses) == 1                 # the pause really does parse
+    assert collector == "Serial"
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "Serial" in out and "not G1" in out
+
+
+def test_parse_gc_log_reports_the_collector_it_found(tmp_path):
+    """GC_LOG deliberately has no startup line, so this needs its own fixture."""
+    log = tmp_path / "gc_scan_rep1.log"
+    log.write_text("[2026-01-01T12:00:00.000+0000][0.005s][info][gc     ] Using G1\n"
+                   "[2026-01-01T12:00:01.000+0000][1.000s][info][gc          ] "
+                   "GC(0) Pause Young (Normal) (G1 Evacuation Pause) 128M->40M(1536M) 2.500ms\n")
+    pauses, _, collector = results.parse_gc_log(str(log))
+    assert collector == "G1" and len(pauses) == 1
+
+
+def test_effect_size_matches_brute_force_cliffs_delta():
+    """Guards the sign convention, which a magnitude-only test cannot."""
+    from scipy.stats import mannwhitneyu
+    a, b = np.arange(1.0, 8.0), np.arange(10.0, 17.0)
+    u, _ = mannwhitneyu(a, b, alternative="two-sided")
+    brute = np.mean([np.sign(x - y) for x in a for y in b])
+    assert results.rank_biserial_effect_size(u, len(a), len(b)) == pytest.approx(brute)
+    assert brute < 0                        # A below B must be negative, as Cliff's delta
+
+
+def test_untagged_rep_warning_ignores_k6_engine_metrics(tmp_path, capsys):
+    """k6 engine metrics carry no request tags by design and enter no reported statistic."""
+    rows = [json.dumps({"type": "Point", "metric": m, "data": {
+        "time": "2026-01-01T00:00:00.000000Z", "value": 1.0, "tags": {"scenario": "s"}}})
+            for m in ("data_sent", "iterations", "vus")]
+    (tmp_path / "scan_28_vus1_rep1.json").write_text("\n".join(rows) + "\n")
+    results.load_results(str(tmp_path), prefixes=("scan_",))
+    assert "carry no 'rep' tag" not in capsys.readouterr().out
+
+
+def test_dropped_iterations_outside_openloop_are_reported(tmp_path, capsys):
+    """A cell that hits maxDuration exits 0 and books the unrun iterations as drops."""
+    pt = json.dumps({"type": "Point", "metric": "dropped_iterations", "data": {
+        "time": "2026-01-01T00:00:00.000000Z", "value": 7.0, "tags": {"scenario": "s"}}})
+    (tmp_path / "warmup_baseline_rep1.json").write_text(pt + "\n")
+    results.load_results(str(tmp_path), prefixes=("warmup_",))
+    out = capsys.readouterr().out
+    assert "dropped in non-open-loop cell" in out and "warmup_baseline_rep1" in out
+
+
+def test_between_run_sd_is_not_estimable_from_one_rep():
+    """0.0 would read as perfect consistency rather than "not estimable"."""
+    one = pd.DataFrame([{"metric": "m", "phase": "baseline", "tier": "v5",
+                         "rep": "1", "value": 10.0}])
+    out = results.between_run_consistency(one, "m", "baseline", ["tier"], lambda k: k[0])
+    assert np.isnan(out["StdDev Across Reps (ms)"].iloc[0])
+
+
+def test_warmup_skip_distinguishes_absent_data_from_a_failed_warmup(tmp_path, capsys):
+    df = pd.DataFrame([{"phase": "warmup", "metric": "http_req_duration", "value": 5.0,
+                        "status": "500", "tier": "v28", "source_file": "warmup_baseline_rep1",
+                        "time": pd.Timestamp("2026-01-01T00:00:00Z"), "rep": "1"}])
+    results.analyze_warmup(df, str(tmp_path))
+    out = capsys.readouterr().out
+    assert "none returned HTTP 200" in out and "run without" not in out
