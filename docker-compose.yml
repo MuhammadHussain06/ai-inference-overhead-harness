@@ -60,10 +60,13 @@ services:
                 condition: service_healthy
         # Physical cores 1, 3 (CPUs 2-3, 6-7) — interleaved with python-service's
         # even-numbered cores so no physical core is shared between the two services.
-        cpuset: "2-3,6-7"
+        # These numbers name whole physical cores on the host they were picked for and
+        # nowhere else; load-testing/recommend-cpusets.sh prints values for another host,
+        # and verify_service_cpuset() refuses a run whose cpusets split a core.
+        cpuset: "${JAVA_CPUSET:-2-3,6-7}"
         mem_limit: 3g
         mem_reservation: 1g
-        cpus: 4.0
+        cpus: ${JAVA_CPUS:-4.0}
         networks:
             - testbed-net
 
@@ -86,9 +89,9 @@ services:
         environment:
             - BASE_URL=http://java:8080/api/v1/transactions
         # Physical cores 5, 7 (CPUs 10-11, 14-15) — disjoint from both services.
-        cpuset: "10-11,14-15"
+        cpuset: "${K6_CPUSET:-10-11,14-15}"
         mem_limit: 1g
-        cpus: 4.0
+        cpus: ${K6_CPUS:-4.0}
         networks:
             - testbed-net
 

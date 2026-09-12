@@ -1,0 +1,7 @@
+# A different collector. Pause records still parse and still populate the GC table, so the
+# figure would report another collector's pauses as G1's.
+DESCRIPTION="collector swapped from G1 to Parallel"
+STAGE="stack"
+EXPECT_GUARD="[jvm-pin]"
+ENV=""
+PATCH_SET_ENV="transaction-service:JAVA_TOOL_OPTIONS:-Xms1536m -Xmx1536m -XX:+UseParallelGC -XX:ParallelGCThreads=4 -Dreactor.netty.ioWorkerCount=4 -Xlog:gc*:file=/gc-logs/gc.log:time,uptime,level,tags:filecount=0"

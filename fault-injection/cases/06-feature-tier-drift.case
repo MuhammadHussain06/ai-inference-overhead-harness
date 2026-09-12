@@ -1,0 +1,7 @@
+# python-service loads three of the four feature tiers. Requests for the missing tier are
+# the only symptom, and a run whose targets exclude it would report nothing at all.
+DESCRIPTION="python-service loads an incomplete set of feature tiers"
+STAGE="stack"
+EXPECT_GUARD="[tier-check]"
+ENV=""
+PATCH_SET_ENV="python-service:FEATURE_TIERS:5,10,20"

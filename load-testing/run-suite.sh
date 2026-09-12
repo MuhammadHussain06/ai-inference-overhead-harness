@@ -17,6 +17,27 @@ for _req_cmd in docker curl shuf python3; do
   fi
 done
 
+for _req_lib in lib/host-provenance.sh lib/jvm-pins.sh lib/topology.sh; do
+  if [ ! -r "$_req_lib" ]; then
+    echo "[!] Required helper not found: ${_req_lib}. Aborting before touching any containers." >&2
+    exit 1
+  fi
+done
+
+# Host-state provenance for run_metadata.json, the JVM collector/thread-pool guards, and
+# the topology checks that decide whether this host's cpusets mean what they say.
+. lib/host-provenance.sh
+. lib/jvm-pins.sh
+. lib/topology.sh
+
+# Reading topology from anywhere but the live tree would verify core placement against a
+# host that is not the one running the containers.
+if [ "${TOPO_SYSFS_ROOT:-/sys}" != "/sys" ]; then
+  echo "[!] TOPO_SYSFS_ROOT is set to '${TOPO_SYSFS_ROOT}'. The suite reads CPU topology from" >&2
+  echo "    the live host only; unset it before running." >&2
+  exit 1
+fi
+
 # Warns on WSL2: cgroup cpuset checks pass, but Hyper-V host core migration is unobservable.
 # Non-blocking; flags warning and records status in run_metadata.json.
 IS_WSL2="false"
@@ -30,8 +51,10 @@ fi
 # Set by verify_smt_isolation() during metadata capture; recorded in run_metadata.json.
 SMT_TOPOLOGY_STATUS="not checked"
 
-COMPOSE_FILE="../docker-compose.yml"
-RESULTS_DIR="../results"
+# Both overridable so the fault-injection suite can run the harness against a patched
+# configuration without writing into a real dataset.
+COMPOSE_FILE="${COMPOSE_FILE_OVERRIDE:-../docker-compose.yml}"
+RESULTS_DIR="${RESULTS_DIR_OVERRIDE:-../results}"
 mkdir -p "$RESULTS_DIR" "$RESULTS_DIR/gc-logs"
 
 # Timestamp-archives prior cell logs, JSON metrics, and GC output outside
@@ -135,6 +158,17 @@ done
 export PYTHON_SERVICE_MAX_CONNECTIONS=$((MAX_VUS * 2))
 
 
+# Reads one scalar field of a service out of the resolved compose configuration, so every
+# check compares against the same source the containers are started from.
+compose_service_value() {
+  docker compose -f "$COMPOSE_FILE" --profile loadgen config 2>/dev/null \
+    | awk -v svc="  ${1}:" -v key="${2}:" '
+        $0 == svc { in_svc = 1; next }
+        in_svc && /^  [a-zA-Z0-9_-]+:$/ { in_svc = 0 }
+        in_svc && $1 == key { sub(/^ +[a-zA-Z0-9_-]+: */, ""); gsub(/"/, ""); print; exit }
+      '
+}
+
 capture_run_metadata() {
   echo "[*] Capturing run metadata to ${METADATA_FILE}..."
 
@@ -206,21 +240,10 @@ capture_run_metadata() {
   # Resolve the cpuset each service is actually configured with (respects
   # PYTHON_CPUSET overrides, though run-suite.sh never sets one) and sum
   # cores pinned across the stack, to verify against cpu_count above.
-  local resolved_config
-  resolved_config=$(docker compose -f "$COMPOSE_FILE" --profile loadgen config 2>/dev/null || echo "")
-
-  extract_cpuset() {
-    printf '%s\n' "$resolved_config" | awk -v svc="  ${1}:" '
-      $0 == svc { in_svc=1; next }
-      in_svc && /^  [a-zA-Z0-9_-]+:$/ { in_svc=0 }
-      in_svc && /^ +cpuset:/ { sub(/^ +cpuset: */, ""); gsub(/"/, ""); print; exit }
-    '
-  }
-
   local py_cpuset java_cpuset k6_cpuset
-  py_cpuset=$(extract_cpuset "python-service")
-  java_cpuset=$(extract_cpuset "transaction-service")
-  k6_cpuset=$(extract_cpuset "k6")
+  py_cpuset=$(compose_service_value "python-service" cpuset)
+  java_cpuset=$(compose_service_value "transaction-service" cpuset)
+  k6_cpuset=$(compose_service_value "k6" cpuset)
 
   local py_cores java_cores k6_cores total_pinned_cores
   py_cores=$(count_cpuset_cores "${py_cpuset:-}")
@@ -228,8 +251,12 @@ capture_run_metadata() {
   k6_cores=$(count_cpuset_cores "${k6_cpuset:-}")
   total_pinned_cores=$((py_cores + java_cores + k6_cores))
 
-  # Aborts before any container starts if the three cpusets share physical cores.
+  # Aborts before any container starts if the three cpusets share physical cores with each
+  # other, or if any of them owns only part of a physical core on this host.
   verify_smt_isolation "${py_cpuset:-}" "${java_cpuset:-}" "${k6_cpuset:-}"
+  verify_service_cpuset "startup" "python-service" "${py_cpuset:-}" "$(compose_service_value "python-service" cpus)"
+  verify_service_cpuset "startup" "transaction-service" "${java_cpuset:-}" "$(compose_service_value "transaction-service" cpus)"
+  verify_service_cpuset "startup" "k6" "${k6_cpuset:-}" "$(compose_service_value "k6" cpus)"
 
   cat > "$METADATA_FILE" <<EOF
 {
@@ -247,6 +274,8 @@ capture_run_metadata() {
   "cpu_governor_at_start": "$(json_escape "$cpu_governor")",
   "cpu_freq_khz_at_start": "$(json_escape "$cpu_freq_khz")",
   "total_mem_kb": "$(json_escape "$total_mem_kb")",
+  "host_provenance": $(host_provenance_json),
+  "jvm_pinned_options": "$(json_escape "$(jvm_pinned_options)")",
   "cores_used_by_suite": {
     "python_service_cpuset": "$(json_escape "${py_cpuset:-unknown}")",
     "python_service_cores": ${py_cores},
@@ -274,6 +303,7 @@ capture_run_metadata() {
 EOF
 
   echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} (pinned: ${total_pinned_cores}) governor=${cpu_governor} freq_khz=${cpu_freq_khz} git=${git_commit:0:12} wsl2=${IS_WSL2}"
+  echo "  [metadata] $(host_provenance_line)"
 }
 
 # Parses a Docker cpuset string (e.g., "3-5" or "0,2,4") to compute the target core
@@ -465,6 +495,11 @@ verify_cpu_pinning() {
 
   # Verify JVM cpuset detection. Reads "Effective CPU Count" from `-XshowSettings:system`
   # (JDK 10+), which populates Runtime.availableProcessors() to size Netty event loops.
+  # This probe JVM inherits JAVA_TOOL_OPTIONS, so it opens -- and therefore truncates --
+  # /gc-logs/gc.log. Running it here, once per rep between readiness and the first cell,
+  # is what scopes each archived GC log to that rep's measured window rather than to the
+  # container's whole lifetime; table_gc_overhead's window_s is read from the log's own
+  # first and last timestamps, so it measures that same window.
   local java_cpus expected_java_cpus
   java_cpus=$(docker exec "$java_container" sh -c \
     'java -XshowSettings:system -version 2>&1 | grep -i "Effective CPU Count" | grep -o "[0-9]*"' \
@@ -486,9 +521,10 @@ verify_cpu_pinning() {
       "and the JIT compiler threads -- all of them would be sized off the wrong core count for this rep."
   fi
 
-  # Verifies the k6 container's own cpuset, matching the compose file's
-  # hardcoded value.
-  local k6_expected="10-11,14-15"
+  # Verifies the k6 container's own cpuset against the compose file, which is also what
+  # verify_smt_isolation() compared, so the two can never disagree about what was asked for.
+  local k6_expected
+  k6_expected=$(compose_service_value "k6" cpuset)
   local k6_live
   k6_live=$(docker compose -f "$COMPOSE_FILE" --profile loadgen run --rm -T --entrypoint sh k6 \
     -c 'cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || cat /sys/fs/cgroup/cpuset/cpuset.cpus 2>/dev/null' \
@@ -747,10 +783,12 @@ for rep in $(seq 1 "$REPS_BASELINE"); do
   restart_stack
   wait_for_ready
   verify_cpu_pinning "baseline rep=${rep}"
+  verify_jvm_flag_pins "baseline rep=${rep}"
   verify_tiers "baseline rep=${rep}"
   echo "[*] Warming up JIT / connection pools..."
   k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" "REP=${rep}" -- --out "json=/results/warmup_baseline_rep${rep}.json"
   verify_tiers_runtime "baseline rep=${rep}"
+  verify_jvm_thread_pins "baseline rep=${rep}"
   sleep "$COOLDOWN_S"
 
   # Independent per-rep shuffle of target order.
@@ -777,10 +815,12 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   restart_stack
   wait_for_ready
   verify_cpu_pinning "scan rep=${rep}"
+  verify_jvm_flag_pins "scan rep=${rep}"
   verify_tiers "scan rep=${rep}"
   echo "[*] Warming up JIT / connection pools (default VUS)..."
   k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" "REP=${rep}" -- --out "json=/results/warmup_scan_rep${rep}.json"
   verify_tiers_runtime "scan rep=${rep}"
+  verify_jvm_thread_pins "scan rep=${rep}"
   sleep "$COOLDOWN_S"
 
   # Matches warm-up concurrency to the scan's peak VUS; separate output

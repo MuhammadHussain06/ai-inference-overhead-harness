@@ -14,14 +14,37 @@ for _req_cmd in docker curl shuf python3; do
   fi
 done
 
+for _req_lib in lib/host-provenance.sh lib/jvm-pins.sh lib/topology.sh; do
+  if [ ! -r "$_req_lib" ]; then
+    echo "[!] Required helper not found: ${_req_lib}. Aborting before touching any containers." >&2
+    exit 1
+  fi
+done
+
+# Host-state provenance for ablation_run_metadata.json, and the JVM collector/thread-pool
+# guards. The Java cpuset is fixed across cells, so its pins hold for every cell.
+. lib/host-provenance.sh
+. lib/jvm-pins.sh
+. lib/topology.sh
+
+# Reading topology from anywhere but the live tree would verify core placement against a
+# host that is not the one running the containers.
+if [ "${TOPO_SYSFS_ROOT:-/sys}" != "/sys" ]; then
+  echo "[!] TOPO_SYSFS_ROOT is set to '${TOPO_SYSFS_ROOT}'. The suite reads CPU topology from" >&2
+  echo "    the live host only; unset it before running." >&2
+  exit 1
+fi
+
 IS_WSL2="false"
 if grep -qi microsoft /proc/version 2>/dev/null; then
   IS_WSL2="true"
   echo "[!] WSL2 detected -- see README Limitations on cpu-pin verification under WSL2." >&2
 fi
 
-COMPOSE_FILE="../docker-compose.yml"
-RESULTS_DIR="../results"
+# Both overridable so the fault-injection suite can run the ablation against a patched
+# configuration without writing into a real dataset.
+COMPOSE_FILE="${COMPOSE_FILE_OVERRIDE:-../docker-compose.yml}"
+RESULTS_DIR="${RESULTS_DIR_OVERRIDE:-../results}"
 mkdir -p "$RESULTS_DIR"
 
 # Separate log files from run-suite.sh's, so an ablation run never trips
@@ -68,8 +91,16 @@ EXPECTED_TIERS="5,10,20,28"
 # configuration E1 and E2 measured. An ablation run at a different worker count would
 # characterise a service the main suite never benchmarked.
 CONTROL_WORKERS=3
-CONTROL_CPUSET="0-1,4-5,8-9"
-CONTROL_CPUS="6.0"
+# Defaults name whole physical cores on the host they were picked for; recommend-cpusets.sh
+# prints values for another host, and verify_service_cpuset() rejects a cell whose cpuset
+# splits a core. Each quota is derived from its own cpuset, since a larger one is clamped
+# by the kernel and would misreport the limit applied.
+CONTROL_CPUSET="${PYTHON_CPUSET:-0-1,4-5,8-9}"
+CONTROL_CPUS="$(topo_count_cpus "$CONTROL_CPUSET").0"
+NARROW_CPUSET="${ABLATION_CPUSET_NARROW:-0-1}"
+NARROW_CPUS="$(topo_count_cpus "$NARROW_CPUSET").0"
+WIDE_CPUSET="${ABLATION_CPUSET_WIDE:-0-1,4-5,8-9,12-13}"
+WIDE_CPUS="$(topo_count_cpus "$WIDE_CPUSET").0"
 
 # Sized off the ablation's own VUS so the Java outbound pool is never the
 # bottleneck under test. Consumed by docker-compose.yml.
@@ -78,10 +109,10 @@ export PYTHON_SERVICE_MAX_CONNECTIONS=$((ABLATION_VUS * 2))
 ENV_TRACE_LOG="${RESULTS_DIR}/ablation_env_trace_log.txt"
 : > "$ENV_TRACE_LOG"
 
-# Sets transaction-service cpuset to odd physical cores (1, 3) to align with docker-compose.yml and SMT validation.
-JAVA_CPUSET="2-3,6-7"
-# Physical cores 5, 7 (CPUs 10-11, 14-15) -- fully disjoint from both services.
-K6_CPUSET="10-11,14-15"
+# Both read the same environment variables docker-compose.yml does, so the cpusets checked
+# here are the ones the containers are started with.
+JAVA_CPUSET="${JAVA_CPUSET:-2-3,6-7}"
+K6_CPUSET="${K6_CPUSET:-10-11,14-15}"
 
 # arm:value:cpuset:cpus:workers:tokens
 # Each arm holds the other mechanisms at the control values above and sweeps one.
@@ -96,9 +127,9 @@ CELLS=(${ABLATION_CELLS_OVERRIDE:-
   "thread_limiter:40:${CONTROL_CPUSET}:${CONTROL_CPUS}:${CONTROL_WORKERS}:40"
   "thread_limiter:64:${CONTROL_CPUSET}:${CONTROL_CPUS}:${CONTROL_WORKERS}:64"
   "thread_limiter:128:${CONTROL_CPUSET}:${CONTROL_CPUS}:${CONTROL_WORKERS}:128"
-  "cpuset:0-1:0-1:2.0:${CONTROL_WORKERS}:${ANYIO_DEFAULT_TOKENS}"
+  "cpuset:${NARROW_CPUSET}:${NARROW_CPUSET}:${NARROW_CPUS}:${CONTROL_WORKERS}:${ANYIO_DEFAULT_TOKENS}"
   "cpuset:${CONTROL_CPUSET}:${CONTROL_CPUSET}:${CONTROL_CPUS}:${CONTROL_WORKERS}:${ANYIO_DEFAULT_TOKENS}"
-  "cpuset:0-1,4-5,8-9,12-13:0-1,4-5,8-9,12-13:8.0:${CONTROL_WORKERS}:${ANYIO_DEFAULT_TOKENS}"
+  "cpuset:${WIDE_CPUSET}:${WIDE_CPUSET}:${WIDE_CPUS}:${CONTROL_WORKERS}:${ANYIO_DEFAULT_TOKENS}"
   "workers:1:${CONTROL_CPUSET}:${CONTROL_CPUS}:1:${ANYIO_DEFAULT_TOKENS}"
   "workers:2:${CONTROL_CPUSET}:${CONTROL_CPUS}:2:${ANYIO_DEFAULT_TOKENS}"
   "workers:3:${CONTROL_CPUSET}:${CONTROL_CPUS}:3:${ANYIO_DEFAULT_TOKENS}"
@@ -160,6 +191,11 @@ capture_run_metadata() {
   k6_cores=$(count_cpuset_cores "${k6_cpuset:-}")
   total_pinned_cores=$((py_cores + java_cores + k6_cores))
 
+  # The Java and k6 cpusets are fixed for the whole ablation, so they are checked once
+  # here; python-service's varies per cell and is checked alongside each cell's restart.
+  verify_service_cpuset "startup" "transaction-service" "$JAVA_CPUSET" "$(topo_count_cpus "$JAVA_CPUSET")"
+  verify_service_cpuset "startup" "k6" "$K6_CPUSET" "$(topo_count_cpus "$K6_CPUSET")"
+
   cat > "$METADATA_FILE" <<EOF
 {
   "timestamp_utc": "${timestamp}",
@@ -169,6 +205,8 @@ capture_run_metadata() {
   "cpu_model": "${cpu_model}",
   "cpu_count": "${cpu_count}",
   "total_mem_kb": "${total_mem_kb}",
+  "host_provenance": $(host_provenance_json),
+  "jvm_pinned_options": "$(jvm_pinned_options)",
   "cores_used_by_suite": {
     "python_service_cpuset": "${py_cpuset:-unknown}",
     "python_service_cores": ${py_cores},
@@ -191,6 +229,7 @@ capture_run_metadata() {
 }
 EOF
   echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} (pinned: ${total_pinned_cores}) git=${git_commit:0:12} wsl2=${IS_WSL2}"
+  echo "  [metadata] $(host_provenance_line)"
 }
 
 abort_suite() {
@@ -526,15 +565,18 @@ for rep in $(seq 1 "$REPS_ABLATION"); do
 
     record_env_sample "${arm}_${value}_rep${rep}_start"
     verify_smt_isolation "$label" "$cpuset"
+    verify_service_cpuset "$label" "python-service" "$cpuset" "$cpus"
     restart_stack "$cpuset" "$cpus" "$workers" "$tokens"
     wait_for_ready
     verify_cpu_pinning "$label"
+    verify_jvm_flag_pins "$label"
     verify_tiers_and_limiter "$label" "$tokens"
 
     echo "  [warm-up] VUS=${ABLATION_VUS}..."
     k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" "REP=${rep}" -- \
       --out "json=/results/ablation_warmup_${arm}_${value}_rep${rep}.json"
     verify_tiers_runtime "$label"
+    verify_jvm_thread_pins "$label"
     sleep "$COOLDOWN_S"
 
     if ! k6_run run-target.js \

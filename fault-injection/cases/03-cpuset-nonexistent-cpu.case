@@ -1,0 +1,6 @@
+# A CPU number no host exposes. Its physical core cannot be resolved, so it would drop out
+# of the overlap comparison and isolation would be reported from the CPUs that remain.
+DESCRIPTION="cpuset names a CPU that does not exist on this host"
+STAGE="pre-container"
+EXPECT_GUARD="[smt]"
+ENV="PYTHON_CPUSET=${PYTHON_BASELINE_CPUSET},9999"

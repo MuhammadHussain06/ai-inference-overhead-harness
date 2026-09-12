@@ -1,0 +1,8 @@
+# The GC worker pin removed from the JVM options. JVM ergonomics then sizes the pool from
+# whatever cores the host exposes, which on the reference machine happens to produce the
+# same number -- so only the absence of the pin itself distinguishes this from a valid run.
+DESCRIPTION="GC worker thread count left to JVM ergonomics"
+STAGE="stack"
+EXPECT_GUARD="[jvm-pin]"
+ENV=""
+PATCH_SET_ENV="transaction-service:JAVA_TOOL_OPTIONS:-Xms1536m -Xmx1536m -XX:+UseG1GC -XX:ConcGCThreads=1 -Dreactor.netty.ioWorkerCount=4 -Xlog:gc*:file=/gc-logs/gc.log:time,uptime,level,tags:filecount=0"
