@@ -33,7 +33,7 @@ jvm_pinned_options() {
 
 # Reads a numeric -XX: or -D option out of an options string.
 jvm_option_value() {
-  printf '%s\n' "$2" | grep -o -- "${1}=[0-9]\+" | head -1 | sed 's/.*=//'
+  printf '%s\n' "$2" | grep -o -- "${1}=[0-9]\+" | head -1 | sed 's/.*=//'  || true
 }
 
 # Reports "<value>|<origin>" for a flag as the JVM itself resolves it. The origin
