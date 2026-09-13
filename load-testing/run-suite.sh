@@ -17,6 +17,27 @@ for _req_cmd in docker curl shuf python3; do
   fi
 done
 
+for _req_lib in lib/host-provenance.sh lib/jvm-pins.sh lib/topology.sh; do
+  if [ ! -r "$_req_lib" ]; then
+    echo "[!] Required helper not found: ${_req_lib}. Aborting before touching any containers." >&2
+    exit 1
+  fi
+done
+
+# Host-state provenance for run_metadata.json, the JVM collector/thread-pool guards, and
+# the topology checks that decide whether this host's cpusets mean what they say.
+. lib/host-provenance.sh
+. lib/jvm-pins.sh
+. lib/topology.sh
+
+# Reading topology from anywhere but the live tree would verify core placement against a
+# host that is not the one running the containers.
+if [ "${TOPO_SYSFS_ROOT:-/sys}" != "/sys" ]; then
+  echo "[!] TOPO_SYSFS_ROOT is set to '${TOPO_SYSFS_ROOT}'. The suite reads CPU topology from" >&2
+  echo "    the live host only; unset it before running." >&2
+  exit 1
+fi
+
 # Warns on WSL2: cgroup cpuset checks pass, but Hyper-V host core migration is unobservable.
 # Non-blocking; flags warning and records status in run_metadata.json.
 IS_WSL2="false"
@@ -30,8 +51,10 @@ fi
 # Set by verify_smt_isolation() during metadata capture; recorded in run_metadata.json.
 SMT_TOPOLOGY_STATUS="not checked"
 
-COMPOSE_FILE="../docker-compose.yml"
-RESULTS_DIR="../results"
+# Both overridable so the fault-injection suite can run the harness against a patched
+# configuration without writing into a real dataset.
+COMPOSE_FILE="${COMPOSE_FILE_OVERRIDE:-../docker-compose.yml}"
+RESULTS_DIR="${RESULTS_DIR_OVERRIDE:-../results}"
 mkdir -p "$RESULTS_DIR" "$RESULTS_DIR/gc-logs"
 
 # Timestamp-archives prior cell logs, JSON metrics, and GC output outside
@@ -52,6 +75,18 @@ ORDER_LOG="${RESULTS_DIR}/run_order_log.txt"
 : > "$ORDER_LOG"   # truncate/create fresh each suite run
 METADATA_FILE="${RESULTS_DIR}/run_metadata.json"
 FAILURES_LOG="${RESULTS_DIR}/run_failures_log.txt"
+# Both analysis scripts refuse to run if this log is non-empty, so any abort must write to
+# it. This catch-all fires last, only when nothing more specific already logged a reason.
+_log_uncaught_exit() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ ! -s "$FAILURES_LOG" ]; then
+    echo "  [FATAL] [uncaught] run aborted with status ${rc} before any cell-level check logged a" \
+         "reason -- treat this dataset as incomplete." >> "$FAILURES_LOG"
+  fi
+  return 0
+}
+trap _log_uncaught_exit EXIT
+
 : > "$FAILURES_LOG"   # truncate/create fresh each suite run
 CPU_PIN_LOG="${RESULTS_DIR}/cpu_pin_check_log.txt"
 : > "$CPU_PIN_LOG"   # truncate/create fresh each suite run
@@ -67,6 +102,8 @@ CONCURRENCY_LEVELS=(${CONCURRENCY_OVERRIDE:-1 2 4 8 16 32 64})
 # regardless of which subset of targets this invocation exercises -- keep in
 # sync with docker-compose.yml's FEATURE_TIERS if that value ever changes.
 EXPECTED_TIERS="5,10,20,28"
+# Keep in sync with docker-compose.yml's THREAD_LIMITER_TOKENS default.
+EXPECTED_THREAD_LIMITER_TOKENS="40"
 # Derived from CONCURRENCY_LEVELS; used by E2's max-VUS warm-up pass below.
 MAX_VUS=0
 for _lvl in "${CONCURRENCY_LEVELS[@]}"; do
@@ -97,10 +134,40 @@ COOLDOWN_S=10
 REPS_BASELINE="${REPS_BASELINE_OVERRIDE:-7}"
 REPS_SCAN="${REPS_SCAN_OVERRIDE:-7}"
 
+# Command substitution in a for-list is not an errexit context, so integer overrides must
+# be validated explicitly before use.
+for _intvar in REPS_BASELINE REPS_SCAN BASELINE_ITERATIONS SCAN_ITERATIONS_PER_VU; do
+  if ! [[ "${!_intvar}" =~ ^[0-9]+$ ]] || [ "${!_intvar}" -lt 1 ]; then
+    echo "[!] ${_intvar} must be a positive integer, got '${!_intvar}'." >&2
+    exit 1
+  fi
+done
+if [ "${#TARGETS[@]}" -eq 0 ] || [ "${#CONCURRENCY_LEVELS[@]}" -eq 0 ]; then
+  echo "[!] TARGETS and CONCURRENCY_LEVELS must each be non-empty (check TARGETS_OVERRIDE / CONCURRENCY_OVERRIDE)." >&2
+  exit 1
+fi
+for _lvl in "${CONCURRENCY_LEVELS[@]}"; do
+  if ! [[ "$_lvl" =~ ^[0-9]+$ ]] || [ "$_lvl" -lt 1 ]; then
+    echo "[!] CONCURRENCY_OVERRIDE must contain only positive integers, got '${_lvl}'." >&2
+    exit 1
+  fi
+done
+
 # Sized off this run's own peak VUS so the Java outbound pool can never become
 # the bottleneck being measured. Consumed by docker-compose.yml.
 export PYTHON_SERVICE_MAX_CONNECTIONS=$((MAX_VUS * 2))
 
+
+# Reads one scalar field of a service out of the resolved compose configuration, so every
+# check compares against the same source the containers are started from.
+compose_service_value() {
+  docker compose -f "$COMPOSE_FILE" --profile loadgen config 2>/dev/null \
+    | awk -v svc="  ${1}:" -v key="${2}:" '
+        $0 == svc { in_svc = 1; next }
+        in_svc && /^  [a-zA-Z0-9_-]+:$/ { in_svc = 0 }
+        in_svc && $1 == key { sub(/^ +[a-zA-Z0-9_-]+: */, ""); gsub(/"/, ""); print; exit }
+      '
+}
 
 capture_run_metadata() {
   echo "[*] Capturing run metadata to ${METADATA_FILE}..."
@@ -173,21 +240,10 @@ capture_run_metadata() {
   # Resolve the cpuset each service is actually configured with (respects
   # PYTHON_CPUSET overrides, though run-suite.sh never sets one) and sum
   # cores pinned across the stack, to verify against cpu_count above.
-  local resolved_config
-  resolved_config=$(docker compose -f "$COMPOSE_FILE" --profile loadgen config 2>/dev/null || echo "")
-
-  extract_cpuset() {
-    printf '%s\n' "$resolved_config" | awk -v svc="  ${1}:" '
-      $0 == svc { in_svc=1; next }
-      in_svc && /^  [a-zA-Z0-9_-]+:$/ { in_svc=0 }
-      in_svc && /^ +cpuset:/ { sub(/^ +cpuset: */, ""); gsub(/"/, ""); print; exit }
-    '
-  }
-
   local py_cpuset java_cpuset k6_cpuset
-  py_cpuset=$(extract_cpuset "python-service")
-  java_cpuset=$(extract_cpuset "transaction-service")
-  k6_cpuset=$(extract_cpuset "k6")
+  py_cpuset=$(compose_service_value "python-service" cpuset)
+  java_cpuset=$(compose_service_value "transaction-service" cpuset)
+  k6_cpuset=$(compose_service_value "k6" cpuset)
 
   local py_cores java_cores k6_cores total_pinned_cores
   py_cores=$(count_cpuset_cores "${py_cpuset:-}")
@@ -195,8 +251,12 @@ capture_run_metadata() {
   k6_cores=$(count_cpuset_cores "${k6_cpuset:-}")
   total_pinned_cores=$((py_cores + java_cores + k6_cores))
 
-  # Aborts before any container starts if the three cpusets share physical cores.
+  # Aborts before any container starts if the three cpusets share physical cores with each
+  # other, or if any of them owns only part of a physical core on this host.
   verify_smt_isolation "${py_cpuset:-}" "${java_cpuset:-}" "${k6_cpuset:-}"
+  verify_service_cpuset "startup" "python-service" "${py_cpuset:-}" "$(compose_service_value "python-service" cpus)"
+  verify_service_cpuset "startup" "transaction-service" "${java_cpuset:-}" "$(compose_service_value "transaction-service" cpus)"
+  verify_service_cpuset "startup" "k6" "${k6_cpuset:-}" "$(compose_service_value "k6" cpus)"
 
   cat > "$METADATA_FILE" <<EOF
 {
@@ -214,6 +274,8 @@ capture_run_metadata() {
   "cpu_governor_at_start": "$(json_escape "$cpu_governor")",
   "cpu_freq_khz_at_start": "$(json_escape "$cpu_freq_khz")",
   "total_mem_kb": "$(json_escape "$total_mem_kb")",
+  "host_provenance": $(host_provenance_json),
+  "jvm_pinned_options": "$(json_escape "$(jvm_pinned_options)")",
   "cores_used_by_suite": {
     "python_service_cpuset": "$(json_escape "${py_cpuset:-unknown}")",
     "python_service_cores": ${py_cores},
@@ -241,6 +303,7 @@ capture_run_metadata() {
 EOF
 
   echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} (pinned: ${total_pinned_cores}) governor=${cpu_governor} freq_khz=${cpu_freq_khz} git=${git_commit:0:12} wsl2=${IS_WSL2}"
+  echo "  [metadata] $(host_provenance_line)"
 }
 
 # Parses a Docker cpuset string (e.g., "3-5" or "0,2,4") to compute the target core
@@ -289,8 +352,21 @@ core_keys_of_cpuset() {
   while read -r cpu; do
     [ -n "$cpu" ] || continue
     key=$(core_key_of_cpu "$cpu")
-    [ -n "$key" ] && echo "$key"
+    # Plain `if`, not `[ -n ... ] && echo`: a false test as the loop's last command would
+    # make the while-loop exit 1, which pipefail turns into a set -e abort.
+    if [ -n "$key" ]; then echo "$key"; fi
   done < <(expand_cpuset "$1") | sort -un | paste -sd, -
+}
+
+# Counts logical CPUs in a cpuset whose physical core cannot be resolved. Dropping one
+# would shrink the set compared for overlap, so an unresolved CPU aborts instead.
+unresolved_cpus_in_cpuset() {
+  local cpu n=0
+  while read -r cpu; do
+    [ -n "$cpu" ] || continue
+    if [ -z "$(core_key_of_cpu "$cpu")" ]; then n=$((n + 1)); fi
+  done < <(expand_cpuset "$1")
+  echo "$n"
 }
 
 # Aborts if cpuset assignments share physical cores via SMT siblings.
@@ -310,6 +386,23 @@ verify_smt_isolation() {
   py_keys=$(core_keys_of_cpuset "$py_cpuset")
   java_keys=$(core_keys_of_cpuset "$java_cpuset")
   k6_keys=$(core_keys_of_cpuset "$k6_cpuset")
+
+  local py_unres java_unres k6_unres
+  py_unres=$(unresolved_cpus_in_cpuset "$py_cpuset")
+  java_unres=$(unresolved_cpus_in_cpuset "$java_cpuset")
+  k6_unres=$(unresolved_cpus_in_cpuset "$k6_cpuset")
+  if [ "$py_unres" -gt 0 ] || [ "$java_unres" -gt 0 ] || [ "$k6_unres" -gt 0 ]; then
+    abort_suite "[smt]" "could not resolve a physical core for every pinned CPU" \
+      "(unresolved: python=${py_unres} java=${java_unres} k6=${k6_unres}). Those CPUs would be" \
+      "dropped from the overlap comparison, which could report isolation that does not hold." \
+      "Check that every CPU in the cpusets exists and is online on this host."
+  fi
+  if [ -z "$py_keys" ] || [ -z "$java_keys" ] || [ -z "$k6_keys" ]; then
+    abort_suite "[smt]" "at least one cpuset resolved to no physical cores at all" \
+      "(python=${py_keys:-EMPTY} java=${java_keys:-EMPTY} k6=${k6_keys:-EMPTY})." \
+      "An empty cpuset means the compose configuration was never read, not that the services" \
+      "are disjoint -- refusing to report physical-core isolation as verified."
+  fi
 
   echo "  [smt] physical cores -- python(${py_keys:-EMPTY}) java(${java_keys:-EMPTY}) k6(${k6_keys:-EMPTY})"
   echo "smt_check python_cores=${py_keys:-EMPTY} java_cores=${java_keys:-EMPTY} k6_cores=${k6_keys:-EMPTY}" >> "$CPU_PIN_LOG"
@@ -402,6 +495,11 @@ verify_cpu_pinning() {
 
   # Verify JVM cpuset detection. Reads "Effective CPU Count" from `-XshowSettings:system`
   # (JDK 10+), which populates Runtime.availableProcessors() to size Netty event loops.
+  # This probe JVM inherits JAVA_TOOL_OPTIONS, so it opens -- and therefore truncates --
+  # /gc-logs/gc.log. Running it here, once per rep between readiness and the first cell,
+  # is what scopes each archived GC log to that rep's measured window rather than to the
+  # container's whole lifetime; table_gc_overhead's window_s is read from the log's own
+  # first and last timestamps, so it measures that same window.
   local java_cpus expected_java_cpus
   java_cpus=$(docker exec "$java_container" sh -c \
     'java -XshowSettings:system -version 2>&1 | grep -i "Effective CPU Count" | grep -o "[0-9]*"' \
@@ -423,9 +521,10 @@ verify_cpu_pinning() {
       "and the JIT compiler threads -- all of them would be sized off the wrong core count for this rep."
   fi
 
-  # Verifies the k6 container's own cpuset, matching the compose file's
-  # hardcoded value.
-  local k6_expected="10-11,14-15"
+  # Verifies the k6 container's own cpuset against the compose file, which is also what
+  # verify_smt_isolation() compared, so the two can never disagree about what was asked for.
+  local k6_expected
+  k6_expected=$(compose_service_value "k6" cpuset)
   local k6_live
   k6_live=$(docker compose -f "$COMPOSE_FILE" --profile loadgen run --rm -T --entrypoint sh k6 \
     -c 'cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || cat /sys/fs/cgroup/cpuset/cpuset.cpus 2>/dev/null' \
@@ -467,7 +566,10 @@ except Exception:
 import json, sys
 try:
     data = json.load(sys.stdin)
-    print("true" if all(data.get("nJobsVerified", {}).values()) else "false")
+    v = data.get("nJobsVerified", {})
+    # Requires real booleans: all({}.values()) is True for an empty mapping, and a
+    # truthy non-bool (e.g. "false") would pass too.
+    print("true" if isinstance(v, dict) and v and all(x is True for x in v.values()) else "false")
 except Exception:
     print("false")
 ')
@@ -487,20 +589,39 @@ except Exception:
   echo "  [tier-check] ${label}: numeric_thread_env(${thread_env:-EMPTY})"
   echo "cpu_pin_check label=${label} numeric_thread_env=${thread_env:-EMPTY}" >> "$CPU_PIN_LOG"
 
+  local live_tokens
+  live_tokens=$(echo "$health_json" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("threadLimiterTokens", ""))
+except Exception:
+    print("")
+')
+  echo "  [tier-check] ${label}: thread_limiter_tokens(${live_tokens:-EMPTY} expected ${EXPECTED_THREAD_LIMITER_TOKENS})"
+  echo "cpu_pin_check label=${label} thread_limiter_tokens=${live_tokens:-EMPTY}" >> "$CPU_PIN_LOG"
+
   if [ "$loaded_tiers" != "$EXPECTED_TIERS" ]; then
     abort_suite "[tier-check] ${label}" "python-service's /health loadedTiers (${loaded_tiers:-EMPTY})" \
       "does not match expected (${EXPECTED_TIERS})."
   elif [ "$all_verified" != "true" ]; then
     abort_suite "[tier-check] ${label}" "python-service's /health nJobsVerified reports at least one" \
       "tier without n_jobs pinned to 1 -- single-threaded inference guarantee not met."
+  elif [ "$live_tokens" != "$EXPECTED_THREAD_LIMITER_TOKENS" ]; then
+    abort_suite "[tier-check] ${label}" "python-service's /health threadLimiterTokens (${live_tokens:-EMPTY})" \
+      "!= expected (${EXPECTED_THREAD_LIMITER_TOKENS}) -- the pinned baseline did not take effect."
   fi
 
-  # Pin BLAS/OpenMP layers to 1 thread alongside n_jobs=1 to guarantee true single-threaded inference for CPU pinning.
-  case "$thread_env" in
-    *OMP_NUM_THREADS=1*) ;;
-    *) abort_suite "[tier-check] ${label}" "python-service reports OMP_NUM_THREADS not pinned to 1" \
-         "(${thread_env:-EMPTY}) -- numeric libraries may spawn threads outside the measured cpuset." ;;
-  esac
+  # Pins BLAS/OpenMP layers to 1 thread alongside n_jobs=1 for true single-threaded inference.
+  # Comma-delimited match: a bare substring match on *OMP_NUM_THREADS=1* also accepts 10, 16,
+  # 100, 1024. All four variables are asserted, per the README.
+  local tvar
+  for tvar in OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS NUMEXPR_NUM_THREADS; do
+    case ",${thread_env}," in
+      *",${tvar}=1,"*) ;;
+      *) abort_suite "[tier-check] ${label}" "python-service reports ${tvar} not pinned to exactly 1" \
+           "(${thread_env:-EMPTY}) -- numeric libraries may spawn threads outside the measured cpuset." ;;
+    esac
+  done
 }
 
 # Re-checks n_jobs after warm-up, when every tier in this run has served inference.
@@ -521,8 +642,12 @@ try:
 except Exception:
     print("unreadable ")
 else:
-    failed = [tier for tier, ok in verified.items() if ok is False]
-    print(("failed:" + ",".join(failed) if failed else "ok"), d.get("workerPid", ""))
+    # Requires an explicit key: an absent key, empty mapping, or null would read as success.
+    if not isinstance(verified, dict) or not verified:
+        print("unreadable", d.get("workerPid", ""))
+    else:
+        failed = [tier for tier, ok in verified.items() if ok is not True and ok is not None]
+        print(("failed:" + ",".join(failed) if failed else "ok"), d.get("workerPid", ""))
 ') || sample="unreadable "
     runtime_state="${sample%% *}"
     pid="${sample##* }"
@@ -611,6 +736,11 @@ check_oom_killed() {
   java_container=$(docker compose -f "$COMPOSE_FILE" ps -q transaction-service 2>/dev/null || echo "")
   py_oom=$(docker inspect --format '{{.State.OOMKilled}}' "$py_container" 2>/dev/null || echo "unknown")
   java_oom=$(docker inspect --format '{{.State.OOMKilled}}' "$java_container" 2>/dev/null || echo "unknown")
+  if [ "$py_oom" = "unknown" ] || [ "$java_oom" = "unknown" ]; then
+    abort_suite "[oom]" "could not determine OOM-kill state (python=${py_oom} java=${java_oom})." \
+      "A container that OOM-died and was removed also reports unknown, which is the case this" \
+      "check exists to catch -- refusing to treat it as clean."
+  fi
   if [ "$py_oom" = "true" ] || [ "$java_oom" = "true" ]; then
     abort_suite "[cell] ${label}" "OOM-killed: python=${py_oom} java=${java_oom}"
   fi
@@ -653,10 +783,12 @@ for rep in $(seq 1 "$REPS_BASELINE"); do
   restart_stack
   wait_for_ready
   verify_cpu_pinning "baseline rep=${rep}"
+  verify_jvm_flag_pins "baseline rep=${rep}"
   verify_tiers "baseline rep=${rep}"
   echo "[*] Warming up JIT / connection pools..."
   k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" "REP=${rep}" -- --out "json=/results/warmup_baseline_rep${rep}.json"
   verify_tiers_runtime "baseline rep=${rep}"
+  verify_jvm_thread_pins "baseline rep=${rep}"
   sleep "$COOLDOWN_S"
 
   # Independent per-rep shuffle of target order.
@@ -683,10 +815,12 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   restart_stack
   wait_for_ready
   verify_cpu_pinning "scan rep=${rep}"
+  verify_jvm_flag_pins "scan rep=${rep}"
   verify_tiers "scan rep=${rep}"
   echo "[*] Warming up JIT / connection pools (default VUS)..."
   k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" "REP=${rep}" -- --out "json=/results/warmup_scan_rep${rep}.json"
   verify_tiers_runtime "scan rep=${rep}"
+  verify_jvm_thread_pins "scan rep=${rep}"
   sleep "$COOLDOWN_S"
 
   # Matches warm-up concurrency to the scan's peak VUS; separate output
@@ -726,5 +860,11 @@ echo "    Per-rep governor/frequency samples logged to ${ENV_TRACE_LOG}"
 echo "    Warm-up JSON output (for post-hoc convergence check) saved as warmup_baseline_rep*.json,"
 echo "    warmup_scan_rep*.json (default VUS), and warmup_scan_maxvus_rep*.json (VUS=${MAX_VUS})"
 echo "    'calibration' target included alongside mock/5/10/20/28 -- isolates instrumentation overhead"
+# Guards against an empty run: "every rep passed" below is vacuously true if no cell ran.
+_n_cells=$(find "$RESULTS_DIR" -maxdepth 1 -name 'baseline_*.json' -o -maxdepth 1 -name 'scan_*.json' 2>/dev/null | wc -l)
+if [ "$_n_cells" -eq 0 ]; then
+  abort_suite "[suite]" "no measurement cells were executed -- check TARGETS_OVERRIDE," \
+    "CONCURRENCY_OVERRIDE and REPS_*_OVERRIDE. Not reporting this run as successful."
+fi
 echo "    No cell failures -- every rep passed cpu-pin and tier verification."
 echo "    Run: ../analysis/venv/bin/python3 ../analysis/analyze-results.py"

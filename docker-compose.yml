@@ -12,10 +12,11 @@ services:
             - FEATURE_TIERS=5,10,20,28
             - MODEL_DIR=models
             - PYTHONUNBUFFERED=1
-            # Both overridable by run-ablation.sh; unset THREAD_LIMITER_TOKENS leaves
-            # anyio's own default (40) in place. Defaults here match the main suite.
+            # Both overridable by run-ablation.sh, which always passes its own explicit value
+            # per cell. THREAD_LIMITER_TOKENS is pinned here as an explicit experimental
+            # parameter rather than left to anyio's internal default.
             - UVICORN_WORKERS=${UVICORN_WORKERS:-3}
-            - THREAD_LIMITER_TOKENS=${THREAD_LIMITER_TOKENS:-}
+            - THREAD_LIMITER_TOKENS=${THREAD_LIMITER_TOKENS:-40}
         healthcheck:
             test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
             interval: 30s
@@ -47,7 +48,11 @@ services:
             - PYTHON_SERVICE_MAX_CONNECTIONS=${PYTHON_SERVICE_MAX_CONNECTIONS:-128}
             # Fixed heap for reproducible sizing across hosts/reps. GC log lets
             # tail-latency spikes be cross-checked against GC pauses.
-            - JAVA_TOOL_OPTIONS=-Xms1536m -Xmx1536m -Xlog:gc*:file=/gc-logs/gc.log:time,uptime,level,tags:filecount=0
+            # Collector, GC worker-thread counts, and Netty's event-loop size are pinned
+            # explicitly rather than left to JVM ergonomics, which derives them from cgroup
+            # CPU/memory detection and is not guaranteed to resolve identically across hosts
+            # or JDK builds. Values match this container's own cpus: 4.0 / 4-core cpuset.
+            - JAVA_TOOL_OPTIONS=-Xms1536m -Xmx1536m -XX:+UseG1GC -XX:ParallelGCThreads=4 -XX:ConcGCThreads=1 -Dreactor.netty.ioWorkerCount=4 -Xlog:gc*:file=/gc-logs/gc.log:time,uptime,level,tags:filecount=0
         volumes:
             - ./results/gc-logs:/gc-logs
         depends_on:
@@ -55,10 +60,13 @@ services:
                 condition: service_healthy
         # Physical cores 1, 3 (CPUs 2-3, 6-7) — interleaved with python-service's
         # even-numbered cores so no physical core is shared between the two services.
-        cpuset: "2-3,6-7"
+        # These numbers name whole physical cores on the host they were picked for and
+        # nowhere else; load-testing/recommend-cpusets.sh prints values for another host,
+        # and verify_service_cpuset() refuses a run whose cpusets split a core.
+        cpuset: "${JAVA_CPUSET:-2-3,6-7}"
         mem_limit: 3g
         mem_reservation: 1g
-        cpus: 4.0
+        cpus: ${JAVA_CPUS:-4.0}
         networks:
             - testbed-net
 
@@ -81,9 +89,9 @@ services:
         environment:
             - BASE_URL=http://java:8080/api/v1/transactions
         # Physical cores 5, 7 (CPUs 10-11, 14-15) — disjoint from both services.
-        cpuset: "10-11,14-15"
+        cpuset: "${K6_CPUSET:-10-11,14-15}"
         mem_limit: 1g
-        cpus: 4.0
+        cpus: ${K6_CPUS:-4.0}
         networks:
             - testbed-net
 

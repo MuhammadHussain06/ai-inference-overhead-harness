@@ -1,0 +1,40 @@
+[*] Baseline cpusets from docker-compose.yml defaults:
+    python=0-1,4-5,8-9 java=2-3,6-7 k6=10-11,14-15
+
+=== 00-unmodified: unmodified configuration
+    expects a clean run (stack)
+    PASS: ran clean
+
+=== 01-smt-overlap: python-service pinned onto the Java service's physical cores
+    expects [smt] (pre-container)
+    PASS: rejected by [smt]
+
+=== 02-cpuset-splits-core: python-service takes one hyperthread of each core, not both
+    expects [cpuset] (pre-container)
+    PASS: rejected by [cpuset]
+
+=== 03-cpuset-nonexistent-cpu: cpuset names a CPU that does not exist on this host
+    expects [smt] (pre-container)
+    PASS: rejected by [smt]
+
+=== 04-cpu-quota-exceeds-cpuset: CPU quota larger than the cpuset can supply
+    expects [cpuset] (pre-container)
+    PASS: rejected by [cpuset]
+
+=== 05-thread-limiter-drift: thread limiter tokens away from the pinned baseline
+    expects [tier-check] (stack)
+    PASS: rejected by [tier-check]
+
+=== 06-feature-tier-drift: python-service loads an incomplete set of feature tiers
+    expects [tier-check] (stack)
+    PASS: rejected by [tier-check]
+
+=== 07-gc-threads-unpinned: GC worker thread count left to JVM ergonomics
+    expects [jvm-pin] (stack)
+    PASS: rejected by [jvm-pin]
+
+=== 08-collector-swapped: collector swapped from G1 to Parallel
+    expects [jvm-pin] (stack)
+    PASS: rejected by [jvm-pin]
+
+[+] 9 passed, 0 failed, 0 skipped. Report: /home/hussain/Desktop/ai-inference-overhead-harness-latest/fault-injection/results/guard_verification_report.md

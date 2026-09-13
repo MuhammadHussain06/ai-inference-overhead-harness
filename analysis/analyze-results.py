@@ -136,6 +136,14 @@ def check_cpu_pin_log(results_dir):
         print(f"[cpu-pin] {n_checks} checks verified, all matched.")
 
 
+# Emitted by k6's engine outside any HTTP request context, so they never carry the
+# per-request tags the load scripts attach.
+K6_ENGINE_METRICS = frozenset({
+    "data_sent", "data_received", "iterations", "iteration_duration",
+    "vus", "vus_max", "dropped_iterations",
+})
+
+
 def load_results(results_dir, prefixes=None):
     """
     prefixes: optional tuple of filename prefixes to restrict loading to (e.g.
@@ -211,7 +219,7 @@ def load_results(results_dir, prefixes=None):
 
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df["vus"] = pd.to_numeric(df["vus"], errors="coerce")
-    df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
+    df["time"] = pd.to_datetime(df["time"], format="ISO8601", errors="coerce", utc=True)
 
     # to_datetime infers one format from the first row and coerces the rest to NaT.
     # Unparsed timestamps silently blank the throughput column, so surface them here.
@@ -222,11 +230,27 @@ def load_results(results_dir, prefixes=None):
 
     # A missing rep tag would merge every repetition into one cluster and silently
     # revert the whole analysis to pseudoreplication.
-    n_untagged_reps = int(df["rep"].isna().sum())
+    # k6 emits these outside any HTTP request context, so they carry no per-request tags
+    # and are excluded here to keep this warning meaningful.
+    n_untagged_reps = int(df.loc[~df["metric"].isin(K6_ENGINE_METRICS), "rep"].isna().sum())
     if n_untagged_reps:
-        print(f"[!] {n_untagged_reps} metric point(s) carry no 'rep' tag and are being treated as "
-              f"rep=1. Rep-level statistics assume one repetition per clean-slate restart.")
+        print(f"[!] {n_untagged_reps} per-request metric point(s) carry no 'rep' tag and are being "
+              f"treated as rep=1. Rep-level statistics assume one repetition per clean-slate "
+              f"restart. (k6 engine metrics, which carry no request tags by design and enter no "
+              f"reported statistic, are excluded from this count.)")
     df["rep"] = df["rep"].fillna("1")
+
+    # k6 exits 0 when a per-vu-iterations scenario hits maxDuration; unrun iterations are
+    # booked as dropped_iterations, which a truncated cell would otherwise report silently.
+    drops = df[df["metric"] == "dropped_iterations"]
+    if not drops.empty:
+        per_file = drops.groupby("source_file", observed=True)["value"].sum()
+        stray = {f: int(v) for f, v in per_file.items()
+                 if v > 0 and not str(f).startswith("openloop")}
+        if stray:
+            print(f"[!] {sum(stray.values())} iteration(s) were dropped in non-open-loop cell(s): "
+                  f"{stray}. Those cells hit maxDuration and ran fewer requests than configured, "
+                  f"so their iteration budget was not met -- treat their results as truncated.")
 
     # Low-cardinality columns (a handful of distinct tiers/phases/metrics/etc.,
     # repeated across every one of the millions of rows) cost far less as
@@ -326,7 +350,23 @@ def crosscheck_error_counters(df, phase, group_cols, label_fn, table_from_durati
         "request_timeout_error": "Timeouts / Network Errors (no response)",
     }
     sub = df[(df["phase"] == phase) & df["metric"].isin(counter_metrics.keys()) & df["value"].notna()].copy()
-    if sub.empty or table_from_duration is None or table_from_duration.empty:
+    if table_from_duration is None or table_from_duration.empty:
+        return
+    if sub.empty:
+        # k6 emits a Counter's points only when .add() is called, so absent counters are
+        # normal on a clean run -- but indistinguishable from a renamed or never-emitted one.
+        # Report which case this is rather than staying silent.
+        derived = 0
+        for col in counter_metrics.values():
+            if col in table_from_duration.columns:
+                derived += int(pd.to_numeric(table_from_duration[col], errors="coerce").fillna(0).sum())
+        if derived:
+            print(f"[!] phase='{phase}': the http_req_duration-derived table reports {derived} "
+                  f"error(s), but no request_http_error/request_timeout_error counter points "
+                  f"exist -- the independent cross-check could not run for this phase.")
+        else:
+            print(f"[+] phase='{phase}': no errors in either source; error-count cross-check "
+                  f"vacuous (no counter points emitted, none expected).")
         return
 
     mismatches = []
@@ -369,7 +409,10 @@ def _throughput_reqs_per_s(subset_df, rep_col="rep"):
             continue
         span_s = (times.max() - times.min()).total_seconds()
         if span_s > 0:
-            per_rep.append(len(times) / span_s)
+            # N completion timestamps bound N-1 inter-completion intervals, so the rate over
+            # that span is (N-1)/span. N/span overestimates by a factor of N/(N-1), a bias
+            # correlated with concurrency -- the axis Table 4 and Figure 4 display.
+            per_rep.append((len(times) - 1) / span_s)
     return float(np.mean(per_rep)) if per_rep else np.nan
 
 
@@ -397,10 +440,16 @@ def client_diagnostics_summary(df, phase, group_cols, label_fn, blocked_warn_ms=
 
 def rank_biserial_effect_size(U, n1, n2):
     """
-    Rank-biserial correlation from a Mann-Whitney U statistic (equivalent to
-    Cliff's delta). Ranges [-1, 1]; 0 = no separation between groups.
+    Rank-biserial correlation from a Mann-Whitney U statistic, on the same sign
+    convention as Cliff's delta: delta = P(A > B) - P(A < B), computed from the U
+    that scipy.stats.mannwhitneyu returns for the FIRST sample.
+
+    Ranges [-1, 1]; 0 = no separation. NEGATIVE means group A's values are smaller
+    than group B's, so along an increasing-latency axis (tier 5 -> 28) the expected
+    sign is negative. The previous form, 1 - 2U/(n1*n2), was the negative of this
+    and therefore reported +1 where Cliff's delta is -1.
     """
-    return 1 - (2 * U) / (n1 * n2)
+    return (2 * U) / (n1 * n2) - 1
 
 
 def _effect_magnitude(delta):
@@ -465,6 +514,13 @@ def pairwise_mannwhitney(df, metric, phase, group_col, order, label_fn, fixed_fi
     if not raw_rows:
         return pd.DataFrame()
 
+    n_possible = len(order) - 1
+    if len(raw_rows) < n_possible:
+        print(f"[!] Holm correction for metric='{metric}' phase='{phase}' is over "
+              f"{len(raw_rows)} comparison(s), not the {n_possible} the design specifies: "
+              f"{n_possible - len(raw_rows)} adjacent pair(s) had fewer than 2 repetitions on "
+              f"one side and were skipped. A smaller family means a weaker correction.")
+
     pvals = [r["_p_rep_raw"] for r in raw_rows]
     reject, pvals_holm, _, _ = multipletests(pvals, alpha=0.05, method="holm")
 
@@ -504,7 +560,9 @@ def between_run_consistency(df, metric, phase, group_cols, label_fn):
 
     pivot = pivot.rename(columns=lambda r: f"Rep {r} Mean (ms)").round(3)
     pivot["Mean of Reps (ms)"] = row_mean.round(3)
-    pivot["StdDev Across Reps (ms)"] = row_std.fillna(0.0).round(3)
+    # Not fillna(0.0): a single repetition has no between-run SD, and 0.0 would misread as
+    # perfect consistency rather than "not estimable".
+    pivot["StdDev Across Reps (ms)"] = row_std.round(3)
     pivot["Independent Runs"] = row_count.astype(int)
     pivot["CoV Across Reps (%)"] = row_cov.round(2)
 
@@ -570,11 +628,17 @@ def analyze_warmup(df, output_dir, window_size=100, tail_tolerance_pct=5.0):
     much work warm-up did, which is large by design and says nothing about whether
     the stack had settled by the end.
     """
-    warm = df[(df["phase"] == "warmup") & (df["metric"] == "http_req_duration") &
-              df["value"].notna() & (df["status"] == "200")].copy()
+    warm_any = df[(df["phase"] == "warmup") & (df["metric"] == "http_req_duration") &
+                  df["value"].notna()]
+    warm = warm_any[warm_any["status"] == "200"].copy()
     if warm.empty:
-        print("[!] No phase='warmup' data found (older results, or warm-up.js run without "
-              "--out json=...); skipping warm-up convergence check.")
+        if warm_any.empty:
+            print("[!] No phase='warmup' data found (older results, or warm-up.js run without "
+                  "--out json=...); skipping warm-up convergence check.")
+        else:
+            print(f"[!] {len(warm_any)} warm-up request(s) found but none returned HTTP 200 -- the "
+                  f"warm-up phase failed rather than being absent. Skipping convergence check; "
+                  f"the measured phase that follows it should not be trusted.")
         return
 
     rows = []
@@ -1084,7 +1148,11 @@ GC_COLLECTOR_RE = re.compile(r"^Using (?P<collector>\S.*)$")
 
 
 def parse_gc_log(path):
-    """Extracts (uptime_s, pause_ms) for each G1 pause event."""
+    """Extracts (uptime_s, pause_ms) for each pause event, plus the collector that produced them.
+
+    Returns (pauses, window_s, collector). `collector` is the name from the JVM's own one-line
+    "Using <Collector>" startup record, or None if that record was not present.
+    """
     pauses = []
     first_uptime = last_uptime = None
     n_lines = 0
@@ -1111,24 +1179,28 @@ def parse_gc_log(path):
             if dm:
                 pauses.append((uptime, float(dm.group("dur_ms"))))
 
-    # No pause matches doesn't by itself mean a non-G1 collector -- could just be
-    # a quiet rep. The startup "Using <Collector>" line settles which it is.
-    if n_lines and not pauses:
+    # The collector is checked unconditionally, not only when no pauses were found.
+    # GC_PAUSE_RE matches Unified Logging's generic "GC(N) Pause ..." record, which is not
+    # G1-specific -- Serial, Parallel and Shenandoah all parse through it too, differing from
+    # G1 only in the parenthetical cause. Only ZGC's format does not match.
+    if collector is not None and collector != "G1":
+        print(f"[gc] WARNING: {os.path.basename(path)} selected '{collector}', not G1. "
+              f"{len(pauses)} pause event(s) parsed from this log are that collector's, and are "
+              f"not comparable to G1 pause data -- treat this rep's GC overhead as unmeasured "
+              f"rather than as G1's. Check mem_limit/cpus have not dropped below HotSpot's "
+              f"server-class threshold, which silently changes the collector.")
+    elif n_lines and not pauses:
         if collector == "G1":
             print(f"[gc] {os.path.basename(path)}: G1 confirmed selected (startup log), "
                   f"but 0 pause events in this rep's {n_lines}-line window -- read as "
                   f"'no GC cycle ran' (e.g. light load), not as unmeasured overhead.")
-        elif collector:
-            print(f"[gc] WARNING: {os.path.basename(path)} selected '{collector}', not G1. "
-                  f"This parser only recognizes G1's pause-log format, so GC overhead is "
-                  f"unmeasured for this rep under a different collector, not zero.")
         else:
-            print(f"[gc] WARNING: {os.path.basename(path)} has {n_lines} parsable lines but no G1 "
+            print(f"[gc] WARNING: {os.path.basename(path)} has {n_lines} parsable lines but no "
                   f"pause events, and no 'Using <Collector>' startup line was found either. "
                   f"Collector identity unknown; GC overhead is unmeasured for this rep, not zero.")
 
     window_s = (last_uptime - first_uptime) if first_uptime is not None else None
-    return pauses, window_s
+    return pauses, window_s, collector
 
 
 def analyze_gc_logs(results_dir, output_dir):
@@ -1145,12 +1217,13 @@ def analyze_gc_logs(results_dir, output_dir):
         if not m:
             continue
         phase, rep = m.group("phase"), int(m.group("rep"))
-        pauses, window_s = parse_gc_log(log_path)
+        pauses, window_s, collector = parse_gc_log(log_path)
         total_ms = sum(d for _, d in pauses)
         max_ms = max((d for _, d in pauses), default=0.0)
         overhead_pct = (total_ms / 1000.0 / window_s * 100.0) if window_s else None
         rows.append({
-            "phase": phase, "rep": rep, "n_pauses": len(pauses),
+            "phase": phase, "rep": rep, "collector": collector or "unknown",
+            "n_pauses": len(pauses),
             "total_pause_ms": round(total_ms, 2), "max_pause_ms": round(max_ms, 2),
             "window_s": round(window_s, 1) if window_s else None,
             "gc_overhead_pct": round(overhead_pct, 3) if overhead_pct is not None else None,
@@ -1162,7 +1235,11 @@ def analyze_gc_logs(results_dir, output_dir):
 
     gc_df = pd.DataFrame(rows).sort_values(["phase", "rep"])
     save_table(gc_df, "table_gc_overhead", output_dir,
-               caption="Per-repetition JVM GC pause overhead (Unified JVM Logging, -Xlog:gc*).",
+               caption="Per-repetition JVM GC pause overhead (Unified JVM Logging, -Xlog:gc*). "
+                       "The 'collector' column is read from each log's own \"Using <Collector>\" "
+                       "startup record: pause records are only comparable across rows reporting the "
+                       "same collector, and a non-G1 row means that rep's GC overhead is unmeasured "
+                       "rather than measured-as-zero.",
                label="tab:gc-overhead")
 
     high = gc_df[gc_df["gc_overhead_pct"] > 1.0]

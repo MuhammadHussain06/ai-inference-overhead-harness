@@ -136,9 +136,11 @@ def cluster_bootstrap_ci(sub_df, n_boot=2000, ci=0.95, seed=42):
 
 
 def rank_biserial_effect_size(U, n1, n2):
-    """Rank-biserial correlation from a Mann-Whitney U statistic (equivalent to
-    Cliff's delta). Ranges [-1, 1]; 0 = no separation between groups."""
-    return 1 - (2 * U) / (n1 * n2)
+    """Rank-biserial correlation from a Mann-Whitney U statistic, on Cliff's delta's own
+    sign convention: delta = P(A > B) - P(A < B), from the U scipy returns for the FIRST
+    sample. Ranges [-1, 1]; 0 = no separation. NEGATIVE means A's values are smaller than
+    B's. Must stay identical to analyze-results.py's copy (asserted by the test suite)."""
+    return (2 * U) / (n1 * n2) - 1
 
 
 def _effect_magnitude(delta):

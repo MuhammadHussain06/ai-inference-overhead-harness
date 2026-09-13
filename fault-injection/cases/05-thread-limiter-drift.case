@@ -1,0 +1,6 @@
+# The thread limiter at a value the suite does not expect. This is the ablation's own
+# independent variable, so a stray value silently turns the baseline into an ablation cell.
+DESCRIPTION="thread limiter tokens away from the pinned baseline"
+STAGE="stack"
+EXPECT_GUARD="[tier-check]"
+ENV="THREAD_LIMITER_TOKENS=64"

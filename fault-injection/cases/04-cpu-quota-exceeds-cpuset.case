@@ -1,0 +1,6 @@
+# A CPU quota larger than the cpuset it applies to. The kernel enforces the smaller of the
+# two, so the run would record a six-CPU limit while applying a two-CPU one.
+DESCRIPTION="CPU quota larger than the cpuset can supply"
+STAGE="pre-container"
+EXPECT_GUARD="[cpuset]"
+ENV="PYTHON_CPUS=64.0"

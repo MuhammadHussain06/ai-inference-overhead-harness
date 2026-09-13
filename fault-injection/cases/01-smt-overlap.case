@@ -1,0 +1,6 @@
+# python-service is pinned onto transaction-service's physical cores. The two cpusets are
+# different strings, so only the SMT sibling comparison can tell they are the same hardware.
+DESCRIPTION="python-service pinned onto the Java service's physical cores"
+STAGE="pre-container"
+EXPECT_GUARD="[smt]"
+ENV="PYTHON_CPUSET=${JAVA_CPUSET:-$(compose_default transaction-service cpuset)}"

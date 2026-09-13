@@ -1,0 +1,6 @@
+# Control. Nothing is misconfigured, so every guard must stay silent and the slice must
+# complete. Without this case, a suite in which all guards fire would look like success.
+DESCRIPTION="unmodified configuration"
+STAGE="stack"
+EXPECT_GUARD=""
+ENV=""
