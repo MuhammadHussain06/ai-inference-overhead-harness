@@ -29,4 +29,6 @@ fault-injection/scratch/
 # OS/editor noise
 .DS_Store
 .idea/
-.vscode/
+.vscode/fault-injection/verify-guards-console.log
+fault-injection/verify-guards-rerun.log
+services/fraud-ml-service/.venv/
