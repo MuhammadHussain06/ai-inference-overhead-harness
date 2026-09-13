@@ -23,6 +23,7 @@ analysis/venv/bin/python3 analysis/analyze-results.py   # generate tables + figu
 - [Containerization & Hardware](#containerization--hardware)
 - [Running](#running)
 - [Tests](#tests)
+- [Fault-injection guard verification](#fault-injection-guard-verification)
 - [Troubleshooting](#troubleshooting)
 - [Experimental design rationale](#experimental-design-rationale)
 - [Threats to validity](#threats-to-validity)
@@ -121,6 +122,8 @@ Each service runs in its own container, pinned to a disjoint CPU range, so they 
 - Model inference pinned to `n_jobs=1`, read back at load *and* re-read after real inference (`nJobsVerified` / `nJobsRuntimeVerified` on `/health`). `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS` are pinned to 1 and asserted from `/health` each rep — `n_jobs` alone does not constrain the BLAS layer beneath it.
 - CPU governor and per-core frequency sampled at both ends of every repetition to `env_trace_log.txt`, so mid-suite thermal throttling is attributable to a specific rep.
 - Valid feature-tier set is fetched from `fraud-ml-service`'s `/health` at startup — never hardcoded in Java. `run-suite.sh` re-verifies this per rep (`loadedTiers` matches expected, `nJobsVerified` all true) and aborts the suite if it doesn't.
+- JVM thread pins are verified against how the JVM itself resolved them, not just what was requested: G1 as the collector, its worker-thread ceilings, and the Reactor Netty event-loop count are read back via `-XX:+PrintFlagsFinal` (`load-testing/lib/jvm-pins.sh`), including each flag's *origin* — a value that merely coincides with the pinned one because of JVM ergonomics is distinguished from a value the compose file actually set. Runs after warm-up, once every event loop has served traffic; aborts the suite on a mismatch, same as a cpu-pin failure.
+- Host-level state that can shift measured latency without appearing in this project's own configuration — kernel `isolcpus`, AC vs. battery power, whether `irqbalance` is migrating interrupts across pinned cores — is sampled every rep (`load-testing/lib/host-provenance.sh`) and recorded in `run_metadata.json`. Warn-only by design: none of the three has one correct value for every host, so the harness records what it found rather than dictating a setting, and only conditions that invalidate a measurement outright (cpu-pin, tier, JVM-pin mismatches) abort the run.
 - Outbound Java→Python connection pool is sized by the harness at 2× the run's peak VUS (`PYTHON_SERVICE_MAX_CONNECTIONS`), so it can never become the bottleneck being measured, and is logged at startup. A hand-started stack falls back to `128`.
 - In-memory H2 — clean slate every run.
 - Per-request logging is off on both services (Java: `TransactionService` at `WARN`; Python: `uvicorn --no-access-log`) — a synchronous stdout write on the WebFlux event loop or the request coroutine would otherwise stall it, adding latency/throughput noise unrelated to inference.
@@ -255,7 +258,7 @@ Resource limits (`mem_limit`/`mem_reservation`/`cpus`) use Compose's plain (non-
 **Requirements**
 
 - Docker + Docker Compose v2 (`docker compose`)
-- 16 logical cores. The `cpuset` values span CPUs 0–15 and are chosen for a host whose SMT siblings are *adjacent* logical CPUs, so that each service owns whole physical cores. On a host that enumerates siblings differently (Intel's classic `N` / `N+8` layout, for instance), `verify_smt_isolation()` resolves each cpuset through `thread_siblings_list` and aborts before any container starts rather than producing incomparable data — re-pick the values for your topology with `cat /sys/devices/system/cpu/cpu*/topology/thread_siblings_list`
+- 16 logical cores. The `cpuset` values span CPUs 0–15 and are chosen for a host whose SMT siblings are *adjacent* logical CPUs, so that each service owns whole physical cores. On a host that enumerates siblings differently (Intel's classic `N` / `N+8` layout, for instance), `verify_smt_isolation()` resolves each cpuset through `thread_siblings_list` and aborts before any container starts rather than producing incomparable data — re-pick the values for your topology with `cat /sys/devices/system/cpu/cpu*/topology/thread_siblings_list`, or let `load-testing/recommend-cpusets.sh` do it: it reads this host's topology, restricts itself to performance cores on a hybrid CPU, and prints `export` lines for `PYTHON_CPUSET`/`JAVA_CPUSET`/`K6_CPUSET` (plus the ablation's narrow/wide cpuset values) that are pre-checked against the same guard the suite runs, so a value it prints can never be one the suite then refuses. It only recommends — review the output, `export` it, then run the suite.
 - ~7GB free RAM
 - k6 runs containerized (`grafana/k6`, pulled automatically on first `run-suite.sh` invocation) — no host install needed
 - Python 3 on the host — required by `run-suite.sh` itself (tier verification) in addition to `pip install -r analysis/requirements.txt` (pandas, numpy, matplotlib, scipy, statsmodels, tabulate) for the analysis phase. `requirements.txt` pins floors, not ceilings — recent CPython (3.13+) needs recent-enough wheels of these anyway, and older exact pins can fail a from-source build on a newer compiler toolchain
@@ -307,7 +310,7 @@ Requires `APP_DB_SAVE_ENABLED=false` in `docker-compose.yml`.
 |---|---|
 | `results/*.json` | One file per (target, concurrency, rep) cell |
 | `run_order_log.txt` | Shuffle order per repetition |
-| `run_metadata.json` | Timestamp, Docker/Compose versions, git commit + dirty flag, CPU/RAM, CPU governor/frequency snapshot |
+| `run_metadata.json` | Timestamp, Docker/Compose versions, git commit + dirty flag, CPU/RAM, CPU governor/frequency snapshot, host provenance (`isolcpus` live state + boot cmdline, AC/battery power source, `irqbalance` status) |
 | `cpu_pin_check_log.txt` | Per-repetition requested-vs-live cpuset |
 | `warmup_*_rep{N}.json` | Warm-up latency, tagged `phase=warmup`, for convergence checks |
 | `gc-logs/gc_<phase>_rep{N}.log` | JVM GC events for that rep's transaction-service lifetime |
@@ -356,17 +359,25 @@ Output filenames must start with `openloop` (e.g. `openloop_28_rate32.json`) —
 ## Tests
 
 The measurement instruments are unit-tested, since every reported figure depends on them
-being correct. Neither suite runs during the Docker build — the images stay free of test
-tooling and the measured containers stay identical to what is shipped.
+being correct. None of these suites run during the Docker build — the images stay free of
+test tooling and the measured containers stay identical to what is shipped.
+
+`./install-test-deps.sh` (run once from the repo root) sets up everything below in one pass —
+`analysis/venv` plus its `requirements-dev.txt`, `services/fraud-ml-service/.venv` plus its
+own `requirements-dev.txt`, and `bats-core` for the shell test suite — and is distinct from
+`setup.sh`, which only prepares what's needed to run the measurement stack for real numbers.
+Maven fetches its own test dependencies (JUnit, `spring-boot-starter-test`, `reactor-test`)
+automatically on first `./mvnw test`, so there's nothing to pre-install there.
 
 ```bash
-# Python service (49 tests): timing invariants, EWMA convergence,
+./install-test-deps.sh   # once — sets up every test toolchain below
+
+# Python service (42 tests): timing invariants, EWMA convergence,
 # n_jobs pinning, telemetry symmetry across the three strategies
 cd services/fraud-ml-service
-pip install -r requirements-dev.txt
-python3 -m pytest tests/ -q
+.venv/bin/python3 -m pytest tests/ -q
 
-# Analysis pipeline (24 tests): cell-value parsing, throughput measurement,
+# Analysis pipeline (29 tests): cell-value parsing, throughput measurement,
 # cluster bootstrap, effect size, GC log parsing, k6 JSON loading
 cd analysis
 venv/bin/python3 -m pytest tests/ -q
@@ -375,6 +386,12 @@ venv/bin/python3 -m pytest tests/ -q
 # strategy routing, request-timing filter ordering
 cd services/transaction-service
 ./mvnw test
+
+# Load-testing harness helpers (39 tests, bats-core): CPU-topology expansion/
+# formatting, SMT-sibling and cpuset-quota guards, JVM flag-origin parsing,
+# and the shared k6 helpers in lib/common.js
+cd load-testing
+bats tests/
 ```
 
 What they guard, and why it matters for the results:
@@ -387,6 +404,52 @@ What they guard, and why it matters for the results:
 | `test_api.py` baseline-floor tests | `mock` and `calibration` genuinely report zero compute, so they bound inference cost |
 | `TransactionServiceTest` overhead tests | `estimatedNetworkOverheadMs` is exactly round-trip minus Python total, and negative values are preserved rather than hidden |
 | `RequestTimingWebFilterTest` | The request-start stamp anchoring every Java-side figure is taken at highest filter precedence |
+| `test_topology.bats` | Cpuset expansion/formatting and the SMT-sibling/cpuset-quota guards behave correctly on synthetic topologies the running host may not have (via `TOPO_SYSFS_ROOT`) — the same mechanism the fault-injection suite reuses below |
+| `test_jvm_pins.bats` | Flag-origin parsing tells a pinned JVM value from one that merely coincides with it by ergonomics |
+
+---
+
+## Fault-injection guard verification
+
+The unit tests above check each guard's logic in isolation; this checks that the guards
+actually fire against the harness's real abort path. A guard that never fires reports a
+clean run identically to a guard that cannot fail, and this is what tells the two apart —
+each of nine cases misconfigures one pinned setting the suite claims to enforce, runs a
+minimal slice of `run-suite.sh` against it, and records whether the expected guard rejected
+it. Case `00-unmodified` runs with nothing changed and must instead pass clean, so a version
+of the suite where every case aborts is itself reported as a failure, not a pass.
+
+```bash
+cd fault-injection
+./verify-guards.sh
+```
+
+Runs entirely against a generated copy of the compose configuration under
+`fault-injection/scratch/`, whose bind mounts and results directory point inside
+`fault-injection/` — nothing under the top-level `results/` is touched. Output goes to
+`fault-injection/results/guard_verification_report.{md,csv}`.
+
+| Case | Fault | Guard |
+|---|---|---|
+| `00-unmodified` | Nothing changed | none — must run clean |
+| `01-smt-overlap` | python-service pinned onto the Java service's physical cores under a different cpuset string | `[smt]` |
+| `02-cpuset-splits-core` | python-service takes one hyperthread of each core rather than both | `[cpuset]` |
+| `03-cpuset-nonexistent-cpu` | cpuset names a CPU absent on this host | `[smt]` |
+| `04-cpu-quota-exceeds-cpuset` | CPU quota larger than the cpuset can supply | `[cpuset]` |
+| `05-thread-limiter-drift` | Thread-limiter tokens moved off the pinned baseline | `[tier-check]` |
+| `06-feature-tier-drift` | python-service loads an incomplete feature-tier set | `[tier-check]` |
+| `07-gc-threads-unpinned` | GC worker-thread count left to JVM ergonomics | `[jvm-pin]` |
+| `08-collector-swapped` | Collector swapped from G1 to Parallel | `[jvm-pin]` |
+
+The current committed report (`fault-injection/results/guard_verification_report.md`) shows
+9 passed, 0 failed, 0 skipped on the reference host. One gap is disclosed rather than
+covered: a configuration whose pinned options are present in the compose file but never
+reach the JVM — no compose-level fault reproduces that, so the `[jvm-pin]` guard is only
+checked through the flag origin the JVM itself reports, not against that specific failure
+mode. Baseline cpusets for cases 01–04 are read from `docker-compose.yml`'s defaults if they
+still hold on the host running the script, and from `recommend-cpusets.sh` otherwise — like
+the suite itself, a fault-injection case failing because the *baseline* doesn't fit this
+host is distinguished from one failing because its guard didn't fire.
 
 ---
 
@@ -431,6 +494,7 @@ What they guard, and why it matters for the results:
 - **Pinning assumes a native Linux Docker host.** On Docker Desktop (macOS/Windows), `cpuset` inside the VM has no fixed relationship to physical cores.
 - **WSL2 specifically: `verify_cpu_pinning()` can pass while pinning is not real.** cgroup `cpuset` is honored inside the WSL2 VM so the requested-vs-live check reports OK, but the Hyper-V host scheduler can still migrate the underlying virtual CPUs across physical cores, and no in-VM check can observe that. `thread_siblings_list` is often not exposed there either, in which case the SMT check reports `unverifiable` rather than passing. `wsl2_detected` and `physical_core_isolation` are recorded in `run_metadata.json` so any affected snapshot is traceable. **This is disclosure, not mitigation — a native-Linux run is the stronger dataset.** Treat concurrency-scan tail claims (E2) as more exposed than the baseline decomposition (E1), since migration risk scales with scheduling pressure.
 - **CPU governor and per-core frequency are sampled at both ends of every rep** to `env_trace_log.txt`, so mid-suite thermal throttling is attributable to a specific rep rather than inferred from one opening snapshot.
+- **`isolcpus`, AC/battery power, and `irqbalance` are recorded but not enforced.** All three can shift measured latency without appearing anywhere in this project's own configuration, so `host-provenance.sh` samples them into `run_metadata.json` every rep. This is disclosure, not a guarantee — a run on battery power or with `irqbalance` active is not blocked, so check `run_metadata.json` before treating two runs as comparable.
 - **GC pause overhead is measured, not eliminated.** `table_gc_overhead` reports per-rep GC pause time as a % of wall-clock; a rep above ~1%, or with a single pause near the P99, is a candidate confound for that rep's tail rather than inference cost.
 - **k6 is pinned to its own cpuset and capped at 2 CPUs.** That stops direct cgroup-level contention with the services under test, but does not isolate any of the three from the Docker daemon or the rest of the host OS, which remain unpinned. `http_req_blocked` (tables 1d/4d) is a partial diagnostic only — it cannot independently prove k6 never became the bottleneck at high concurrency.
 - **The Java outbound connection pool is sized at 2× the run's peak VUS** by both harness scripts, so pool queueing cannot masquerade as network or Python cost. A hand-started stack falls back to the 128 default.
@@ -454,19 +518,34 @@ What they guard, and why it matters for the results:
 ```
 .
 ├── docker-compose.yml
+├── setup.sh                       # once per machine: .env (HOST_UID/GID), results/gc-logs/, analysis/venv
+├── install-test-deps.sh           # once per machine: every *test* toolchain below, in one pass
 ├── analysis/
 │   ├── analyze-results.py        # tables, figures, significance tests
 │   ├── analyze-ablation.py       # thread-dispatch mechanism sweep
-│   ├── tests/                    # pytest: cell-value parsing, throughput, bootstrap, GC parsing
-│   └── requirements.txt
+│   ├── tests/                    # pytest (29): cell-value parsing, throughput, bootstrap, GC parsing
+│   ├── requirements.txt
+│   └── requirements-dev.txt      # test-only: pytest, kept off analyze-*.py's real runtime deps
 ├── load-testing/
 │   ├── run-suite.sh              # full baseline + concurrency-scan orchestrator
 │   ├── run-ablation.sh           # four-arm thread-dispatch mechanism sweep
 │   ├── run-smoke-test.sh         # small pipeline-check pass before the full suite
+│   ├── recommend-cpusets.sh      # prints cpuset values fitting this host's topology
 │   ├── warm-up.js                # per-target sequential JIT/pool warm-up
 │   ├── run-target.js             # single (target, concurrency, rep) cell runner (closed-loop)
 │   ├── run-target-openloop.js    # manual constant-arrival-rate check, top concurrency cells only
-│   └── lib/common.js             # shared sendTransaction()/TARGETS + telemetry Trends
+│   ├── lib/
+│   │   ├── common.js             # shared sendTransaction()/TARGETS + telemetry Trends
+│   │   ├── topology.sh           # cpuset↔physical-core resolution; SMT-overlap/cpuset-quota guards
+│   │   ├── jvm-pins.sh           # verifies G1/thread-pool ceilings against the JVM's own flag origin
+│   │   └── host-provenance.sh    # isolcpus/power-source/irqbalance sampling for run_metadata.json
+│   └── tests/                    # bats-core (39): topology, JVM-pin, and lib/common.js helpers
+├── fault-injection/
+│   ├── verify-guards.sh          # runs each case, records whether the expected guard fired
+│   ├── cases/*.case              # 9 cases, one misconfigured pinned setting each
+│   └── results/guard_verification_report.{md,csv}
+├── results/                       # generated: *.json, run_metadata.json, logs (gitignored except .gitkeep)
+│   └── gc-logs/                   # generated: gc_<phase>_rep{N}.log per repetition
 └── services/
     ├── fraud-ml-service/            # Python FastAPI inference service
     │   ├── app/
@@ -476,7 +555,7 @@ What they guard, and why it matters for the results:
     │   │   ├── schemas.py
     │   │   ├── responses.py         # shared response/telemetry builder
     │   │   └── routers/predict.py (POST /predict/v{n}), mock.py, calibration.py
-    │   ├── tests/                   # pytest: timing invariants, EWMA, telemetry symmetry
+    │   ├── tests/                   # pytest (42): timing invariants, EWMA, telemetry symmetry
     │   ├── requirements-dev.txt     # test-only deps, kept out of the service image
     │   ├── models/fraud_model_v{5,10,20,28}.joblib   # pretrained, committed
     │   └── training/train_model.py  # --n-features {5,10,20,28}, omit for all four
