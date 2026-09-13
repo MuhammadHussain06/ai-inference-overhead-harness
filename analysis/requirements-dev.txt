@@ -1,0 +1,6 @@
+# Test-only dependencies for analysis/tests/. Mirrors
+# services/fraud-ml-service/requirements-dev.txt's split: analysis/requirements.txt
+# stays exactly what analyze-results.py/analyze-ablation.py need to run for real;
+# this is only what running the test suite adds on top.
+-r requirements.txt
+pytest==8.3.3
