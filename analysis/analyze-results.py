@@ -14,8 +14,10 @@ Usage:
 import argparse
 import gc
 import glob
+import gzip
 import json
 import os
+import random
 import re
 import sys
 
@@ -143,6 +145,14 @@ K6_ENGINE_METRICS = frozenset({
     "vus", "vus_max", "dropped_iterations",
 })
 
+# Counters whose exact sum a check depends on (truncated-cell detection, the
+# error-count cross-check) and which are inherently rare next to a per-request
+# metric like http_req_duration. Reservoir sampling below is uniform per file, so
+# without this exemption a handful of dropped_iterations points in a multi-million-
+# point file would almost certainly all get sampled out, making a truncated cell
+# silently look clean instead of tripping the check that exists to catch it.
+ALWAYS_KEEP_METRICS = frozenset({"dropped_iterations", "request_http_error", "request_timeout_error"})
+
 
 def load_results(results_dir, prefixes=None):
     """
@@ -155,7 +165,12 @@ def load_results(results_dir, prefixes=None):
     (distinct from the results_dir being empty/missing entirely, which is
     still a hard error either way).
     """
-    files = sorted(glob.glob(os.path.join(results_dir, "*.json")))
+    # run-suite.sh writes cells gzipped (*.json.gz); *.json still matches
+    # anything from before that change, or a manually-added raw file.
+    files = sorted(
+        glob.glob(os.path.join(results_dir, "*.json"))
+        + glob.glob(os.path.join(results_dir, "*.json.gz"))
+    )
     if not files:
         raise FileNotFoundError(
             f"No result files found in {results_dir}. Run load-testing/run-suite.sh first."
@@ -173,9 +188,38 @@ def load_results(results_dir, prefixes=None):
     col_metric, col_value, col_strategy, col_tier, col_vus = [], [], [], [], []
     col_phase, col_rep, col_rate, col_status, col_time, col_source = [], [], [], [], [], []
 
+    # json.loads() doesn't intern strings, so each tag column (a few dozen
+    # distinct values) pays for a new ~50-70 byte object per point instead of
+    # one shared object per distinct value -- the actual cost behind the OOM
+    # on an inflated warm-up file. Interning fixes that.
+    def _intern_tag(v):
+        return sys.intern(v) if type(v) is str else v
+
+    # calibrate_target() recalibrates ITERATIONS_PER_VU to hit a fixed wall-clock
+    # duration regardless of throughput, so a trivial/reference target (mock,
+    # calibration) can log millions of points in the same window a model-inference
+    # tier logs a few hundred thousand in -- observed up to 4.8M points in one cell,
+    # which is what drove analyze-results.py past available memory. Reservoir-sampling
+    # each file down to a uniform random subset this size bounds memory regardless of
+    # a target's throughput; at this sample size, mean/percentile/bootstrap-CI
+    # estimates are statistically indistinguishable from the full population, so
+    # nothing downstream loses accuracy that matters. Every real tier's cell is
+    # currently well under this and passes through untouched.
+    MAX_POINTS_PER_FILE = 250_000
+    rng = random.Random(42)
+
     for fp in files:
         source_file = os.path.basename(fp)
-        with open(fp) as f:
+        # Reservoir: the bounded, sampled population (high-volume per-request metrics).
+        res_metric, res_value, res_strategy, res_tier, res_vus = [], [], [], [], []
+        res_phase, res_rep, res_rate, res_status, res_time = [], [], [], [], []
+        # Always-keep: ALWAYS_KEEP_METRICS points, unbounded but inherently rare --
+        # kept in a separate list so appending to it never touches reservoir slots.
+        keep_metric, keep_value, keep_strategy, keep_tier, keep_vus = [], [], [], [], []
+        keep_phase, keep_rep, keep_rate, keep_status, keep_time = [], [], [], [], []
+        n_seen = 0
+        opener = gzip.open if fp.endswith(".gz") else open
+        with opener(fp, "rt") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -188,18 +232,57 @@ def load_results(results_dir, prefixes=None):
                     continue
                 data = obj.get("data", {}) or {}
                 tags = data.get("tags", {}) or {}
-                col_metric.append(obj.get("metric"))
-                col_value.append(data.get("value"))
-                col_strategy.append(tags.get("strategy"))
-                col_tier.append(tags.get("tier"))
-                col_vus.append(tags.get("vus"))
-                col_phase.append(tags.get("phase"))
-                col_rep.append(tags.get("rep"))
-                col_rate.append(tags.get("rate"))
+                metric = _intern_tag(obj.get("metric"))
+                value = data.get("value")
+                strategy = _intern_tag(tags.get("strategy"))
+                tier = _intern_tag(tags.get("tier"))
+                vus = _intern_tag(tags.get("vus"))
+                phase = _intern_tag(tags.get("phase"))
+                rep = _intern_tag(tags.get("rep"))
+                rate = _intern_tag(tags.get("rate"))
                 # HTTP status code; "0" means no response was received
-                col_status.append(tags.get("status"))
-                col_time.append(data.get("time"))
-                col_source.append(source_file)
+                status = _intern_tag(tags.get("status"))
+                time_val = data.get("time")
+
+                if metric in ALWAYS_KEEP_METRICS:
+                    keep_metric.append(metric); keep_value.append(value); keep_strategy.append(strategy)
+                    keep_tier.append(tier); keep_vus.append(vus); keep_phase.append(phase)
+                    keep_rep.append(rep); keep_rate.append(rate); keep_status.append(status)
+                    keep_time.append(time_val)
+                    continue
+
+                n_seen += 1
+                # Algorithm R: the first MAX_POINTS_PER_FILE points are always kept;
+                # each point after that replaces a uniformly random existing slot with
+                # probability MAX_POINTS_PER_FILE/n_seen, which keeps every point seen
+                # so far equally likely to end up in the final sample.
+                if n_seen <= MAX_POINTS_PER_FILE:
+                    res_metric.append(metric); res_value.append(value); res_strategy.append(strategy)
+                    res_tier.append(tier); res_vus.append(vus); res_phase.append(phase)
+                    res_rep.append(rep); res_rate.append(rate); res_status.append(status)
+                    res_time.append(time_val)
+                else:
+                    idx = rng.randint(0, n_seen - 1)
+                    if idx < MAX_POINTS_PER_FILE:
+                        res_metric[idx] = metric; res_value[idx] = value; res_strategy[idx] = strategy
+                        res_tier[idx] = tier; res_vus[idx] = vus; res_phase[idx] = phase
+                        res_rep[idx] = rep; res_rate[idx] = rate; res_status[idx] = status
+                        res_time[idx] = time_val
+
+        if n_seen > MAX_POINTS_PER_FILE:
+            print(f"[!] {source_file}: {n_seen} points subsampled to {MAX_POINTS_PER_FILE} "
+                  f"(uniform random sample) to bound memory.")
+        col_metric.extend(res_metric); col_metric.extend(keep_metric)
+        col_value.extend(res_value); col_value.extend(keep_value)
+        col_strategy.extend(res_strategy); col_strategy.extend(keep_strategy)
+        col_tier.extend(res_tier); col_tier.extend(keep_tier)
+        col_vus.extend(res_vus); col_vus.extend(keep_vus)
+        col_phase.extend(res_phase); col_phase.extend(keep_phase)
+        col_rep.extend(res_rep); col_rep.extend(keep_rep)
+        col_rate.extend(res_rate); col_rate.extend(keep_rate)
+        col_status.extend(res_status); col_status.extend(keep_status)
+        col_time.extend(res_time); col_time.extend(keep_time)
+        col_source.extend([source_file] * (len(res_metric) + len(keep_metric)))
 
     if not col_metric:
         raise ValueError(f"No 'Point' metric records found across {len(files)} file(s) in {results_dir}.")
@@ -217,8 +300,11 @@ def load_results(results_dir, prefixes=None):
     del col_phase, col_rep, col_rate, col_status, col_time, col_source
     gc.collect()
 
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df["vus"] = pd.to_numeric(df["vus"], errors="coerce")
+    # float32 halves this column's memory versus float64. k6 reports latencies
+    # to tenth-millisecond precision; float32 keeps ~7 significant digits, so
+    # nothing downstream (percentiles, bootstrap CIs, Mann-Whitney) is affected.
+    df["value"] = pd.to_numeric(df["value"], errors="coerce").astype(np.float32)
+    df["vus"] = pd.to_numeric(df["vus"], errors="coerce").astype(np.float32)
     df["time"] = pd.to_datetime(df["time"], format="ISO8601", errors="coerce", utc=True)
 
     # to_datetime infers one format from the first row and coerces the rest to NaT.
