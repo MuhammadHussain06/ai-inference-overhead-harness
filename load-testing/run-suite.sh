@@ -55,14 +55,21 @@ SMT_TOPOLOGY_STATUS="not checked"
 # configuration without writing into a real dataset.
 COMPOSE_FILE="${COMPOSE_FILE_OVERRIDE:-../docker-compose.yml}"
 RESULTS_DIR="${RESULTS_DIR_OVERRIDE:-../results}"
-mkdir -p "$RESULTS_DIR" "$RESULTS_DIR/gc-logs"
+# k6 writes its full, unfiltered trail here (container-visible as /results/raw);
+# finalize_result() filters + gzips each file into RESULTS_DIR and deletes the
+# raw copy right after, so this stays near-empty except mid-cell.
+RAW_RESULTS_DIR="${RESULTS_DIR}/raw"
+rm -rf "$RAW_RESULTS_DIR"
+mkdir -p "$RESULTS_DIR" "$RESULTS_DIR/gc-logs" "$RAW_RESULTS_DIR"
 
 # Timestamp-archives prior cell logs, JSON metrics, and GC output outside
 # of RESULTS_DIR to prevent non-recursive analysis glob collisions.
-if compgen -G "${RESULTS_DIR}/*.json" > /dev/null 2>&1 || [ -f "${RESULTS_DIR}/run_order_log.txt" ]; then
+if compgen -G "${RESULTS_DIR}/*.json" > /dev/null 2>&1 || compgen -G "${RESULTS_DIR}/*.json.gz" > /dev/null 2>&1 \
+    || [ -f "${RESULTS_DIR}/run_order_log.txt" ]; then
   ARCHIVE_DIR="${RESULTS_DIR}/archive/$(date +%Y%m%d_%H%M%S)"
   mkdir -p "$ARCHIVE_DIR"
   find "$RESULTS_DIR" -maxdepth 1 -name '*.json' -exec mv {} "$ARCHIVE_DIR/" \;
+  find "$RESULTS_DIR" -maxdepth 1 -name '*.json.gz' -exec mv {} "$ARCHIVE_DIR/" \;
   find "$RESULTS_DIR" -maxdepth 1 -name '*_log.txt' -exec mv {} "$ARCHIVE_DIR/" \;
   if [ -d "${RESULTS_DIR}/gc-logs" ] && [ -n "$(ls -A "${RESULTS_DIR}/gc-logs" 2>/dev/null)" ]; then
     mv "${RESULTS_DIR}/gc-logs" "${ARCHIVE_DIR}/gc-logs"
@@ -110,21 +117,82 @@ for _lvl in "${CONCURRENCY_LEVELS[@]}"; do
   if [ "$_lvl" -gt "$MAX_VUS" ]; then MAX_VUS="$_lvl"; fi
 done
 BASELINE_ITERATIONS="${BASELINE_ITERATIONS_OVERRIDE:-500}"
+# Flat fallback for VUS 1/2/4 -- drift stays within noise at this default.
+# VUS 8/16/32/64 get a per-tier, per-rep calibrated value instead -- see
+# calibrate_target() below.
 SCAN_ITERATIONS_PER_VU="${SCAN_ITERATIONS_PER_VU_OVERRIDE:-100}"
-# Unset by default -- warm-up.js's own 3000 default applies for the full suite.
-# Set for a reduced-scale run (e.g. the smoke test) so warm-up doesn't dwarf it.
-WARMUP_ITERATIONS_PER_TARGET_OVERRIDE="${WARMUP_ITERATIONS_PER_TARGET_OVERRIDE:-}"
 
-# Shared warm-up env args: WARMUP_TARGETS keeps warm-up scoped to this run's
-# actual TARGETS (matters when TARGETS_OVERRIDE reduces it, e.g. the smoke
-# test) instead of always warming all 6 targets regardless of what's being
-# tested. WARMUP_ITERATIONS_PER_TARGET only passed if explicitly overridden,
-# so the full suite keeps warm-up.js's own 3000 default untouched.
+# per-vu-iterations runs each VU to a fixed iteration count independent of the
+# others, so VUs finish at slightly different wall-clock times and effective
+# concurrency tapers off near the end. That taper's absolute duration is
+# roughly fixed regardless of cell length, so a short cell spends a larger
+# fraction of its length in the taper than a long one. Retargeting VUS
+# 8/16/32/64's iteration counts to hit a fixed wall-clock duration keeps the
+# taper a small, fixed-size tail instead of most of the cell. Recalibrated
+# every rep since per-rep throughput varies enough to matter.
+CALIB_VUS=16
+CALIB_ITER_PER_VU=2000
+CALIB_TARGET_DURATION_S=60
+CALIB_AFFECTED_LEVELS="8 16 32 64"
+declare -A CALIB_ITERATIONS_PER_VU
+
+# Metrics analyze-results.py actually reads (verified by grepping every metric
+# name comparison in it). k6's raw trail carries roughly twice this many --
+# the http_req_* sub-metrics, http_reqs, iteration_duration, iterations,
+# checks, request_success, java_execution_time_ms -- none of which any table
+# or figure uses. Dropping them at write time roughly halves both on-disk
+# size and analyze-results.py's peak memory, since it currently loads every
+# Point it sees regardless of whether anything downstream reads it.
+KEEP_METRICS="http_req_duration,http_req_blocked,dropped_iterations,python_parsing_time_ms,python_thread_dispatch_time_ms,python_computation_time_ms,python_dataframe_construction_time_ms,python_model_inference_time_ms,python_compute_stall_time_ms,python_serialization_time_ms,python_total_time_ms,java_estimated_network_overhead_ms"
+# Unset by default -- warm-up.js's own 3000/60s defaults apply for the full
+# suite. Set for a reduced-scale run (e.g. the smoke test) so warm-up doesn't
+# dwarf it. Applies to the baseline and default-VUS scan warm-up passes only
+# -- the maxvus pass has its own override below, since it runs at a much
+# higher VUS and needs a different iteration/duration budget to converge.
+WARMUP_ITERATIONS_PER_TARGET_OVERRIDE="${WARMUP_ITERATIONS_PER_TARGET_OVERRIDE:-}"
+WARMUP_MAX_DURATION_S_OVERRIDE="${WARMUP_MAX_DURATION_S_OVERRIDE:-}"
+
+# ITERATIONS_PER_TARGET is a total budget divided by VUS, so at the maxvus
+# pass's high VUS, the same target used for the VUS=5 passes yields far
+# fewer iterations per VU. Reusing one override for both means raising it
+# enough for maxvus to converge inflates the VUS=5 passes' output by the
+# same factor for no benefit -- each warm-up pass writes one raw k6 JSON
+# line per metric per request, so a large uniform target multiplies output
+# size and analyze-results.py's memory use across all three passes instead
+# of just the one that needs it. Separate variables avoid that. Falls back
+# to the shared override above when unset, so existing invocations still work.
+WARMUP_MAXVUS_ITERATIONS_PER_TARGET_OVERRIDE="${WARMUP_MAXVUS_ITERATIONS_PER_TARGET_OVERRIDE:-$WARMUP_ITERATIONS_PER_TARGET_OVERRIDE}"
+WARMUP_MAXVUS_MAX_DURATION_S_OVERRIDE="${WARMUP_MAXVUS_MAX_DURATION_S_OVERRIDE:-$WARMUP_MAX_DURATION_S_OVERRIDE}"
+
+# Warm-up env args for the baseline and default-VUS scan passes.
+# WARMUP_TARGETS scopes warm-up to this run's actual TARGETS.
 WARMUP_ENV_ARGS=("WARMUP_TARGETS=${TARGETS[*]}")
 if [ -n "$WARMUP_ITERATIONS_PER_TARGET_OVERRIDE" ]; then
   WARMUP_ENV_ARGS+=("WARMUP_ITERATIONS_PER_TARGET=${WARMUP_ITERATIONS_PER_TARGET_OVERRIDE}")
 fi
+if [ -n "$WARMUP_MAX_DURATION_S_OVERRIDE" ]; then
+  WARMUP_ENV_ARGS+=("WARMUP_MAX_DURATION_S=${WARMUP_MAX_DURATION_S_OVERRIDE}")
+fi
+
+# Separate env args for the maxvus pass -- own iteration/duration budget,
+# same WARMUP_TARGETS scoping.
+WARMUP_MAXVUS_ENV_ARGS=("WARMUP_TARGETS=${TARGETS[*]}")
+if [ -n "$WARMUP_MAXVUS_ITERATIONS_PER_TARGET_OVERRIDE" ]; then
+  WARMUP_MAXVUS_ENV_ARGS+=("WARMUP_ITERATIONS_PER_TARGET=${WARMUP_MAXVUS_ITERATIONS_PER_TARGET_OVERRIDE}")
+fi
+if [ -n "$WARMUP_MAXVUS_MAX_DURATION_S_OVERRIDE" ]; then
+  WARMUP_MAXVUS_ENV_ARGS+=("WARMUP_MAX_DURATION_S=${WARMUP_MAXVUS_MAX_DURATION_S_OVERRIDE}")
+fi
 COOLDOWN_S=10
+# ACPI/DPTF thermal negotiation isn't guaranteed to work (some hardware never
+# completes it -- e.g. _SB.IETM._OSC aborting at boot), leaving the OS blind
+# to platform thermal policy. check_thermal_safety() below reads
+# /sys/class/thermal directly instead of trusting a userspace daemon, so a
+# long pinned-core run pauses or aborts instead of hard-hanging.
+THERMAL_WARN_C="${THERMAL_WARN_C_OVERRIDE:-90}"
+THERMAL_CRIT_C="${THERMAL_CRIT_C_OVERRIDE:-95}"
+THERMAL_COOLDOWN_S="${THERMAL_COOLDOWN_S_OVERRIDE:-60}"
+MAX_THERMAL_COOLDOWNS="${MAX_THERMAL_COOLDOWNS_OVERRIDE:-2}"
 # n=7 vs 7 puts the minimum achievable two-sided Mann-Whitney p-value at
 # 2/C(14,7) = 0.00058, which still clears alpha=0.05 after Holm correction
 # across the five adjacent-tier comparisons (0.00058 x 5 = 0.0029). n=5 vs 5
@@ -136,7 +204,8 @@ REPS_SCAN="${REPS_SCAN_OVERRIDE:-7}"
 
 # Command substitution in a for-list is not an errexit context, so integer overrides must
 # be validated explicitly before use.
-for _intvar in REPS_BASELINE REPS_SCAN BASELINE_ITERATIONS SCAN_ITERATIONS_PER_VU; do
+for _intvar in REPS_BASELINE REPS_SCAN BASELINE_ITERATIONS SCAN_ITERATIONS_PER_VU \
+  THERMAL_WARN_C THERMAL_CRIT_C THERMAL_COOLDOWN_S MAX_THERMAL_COOLDOWNS; do
   if ! [[ "${!_intvar}" =~ ^[0-9]+$ ]] || [ "${!_intvar}" -lt 1 ]; then
     echo "[!] ${_intvar} must be a positive integer, got '${!_intvar}'." >&2
     exit 1
@@ -728,6 +797,208 @@ k6_run() {
     "${env_flags[@]}" k6 run "/scripts/${script}" "$@"
 }
 
+# Filters a raw k6 JSON trail down to KEEP_METRICS and gzips it into
+# RESULTS_DIR, then deletes the raw copy. Runs on the host, after the
+# container that wrote the raw file has already exited.
+# Usage: finalize_result <name.json>  -- name matches what --out json=
+# pointed at under /results/raw/ (container path) / RAW_RESULTS_DIR (host path).
+finalize_result() {
+  local name="$1"
+  local raw="${RAW_RESULTS_DIR}/${name}"
+  local final="${RESULTS_DIR}/${name}.gz"
+  python3 -c "
+import gzip, json, sys
+
+keep = set('${KEEP_METRICS}'.split(','))
+raw_path, final_path = sys.argv[1], sys.argv[2]
+with open(raw_path) as fin, gzip.open(final_path, 'wt') as fout:
+    for line in fin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get('type') != 'Point' or obj.get('metric') not in keep:
+            continue
+        fout.write(line + '\n')
+" "$raw" "$final"
+  rm -f "$raw"
+}
+
+# Different targets/tiers converge at different rates, so a fixed warm-up
+# budget is either wasteful for fast targets or insufficient for slow ones.
+# Runs warm-up.js in duration-bounded chunks (WARMUP_CHUNK_DURATION_S)
+# instead, checking convergence after each chunk with table0's own criterion
+# (last WARMUP_WINDOW requests vs. the WARMUP_WINDOW before them, converged
+# if drift < WARMUP_TAIL_TOLERANCE_PCT or the absolute gap is under
+# WARMUP_TAIL_ABS_FLOOR_MS), grouped per target so one slow target can't be
+# masked by faster ones finishing early. Stops once every target present has
+# converged, or after MAX_WARMUP_CHUNKS chunks -- table0 shows the real
+# outcome either way, so a capped-out warm-up is visible, not silently
+# accepted. An explicit WARMUP_ITERATIONS_PER_TARGET (smoke-test overrides)
+# skips this entirely and runs a single fixed-iteration pass instead, so
+# smoke tests stay fast.
+#
+# A percentage-only tolerance is unreasonably tight for the fastest targets:
+# 5% of a sub-millisecond round trip is a few dozen microseconds, well
+# inside ordinary request-to-request timer and scheduler jitter at a genuine
+# steady state, so a purely relative check flags those targets as still
+# moving most of the time regardless of how settled they are.
+# WARMUP_TAIL_ABS_FLOOR_MS gives convergence an absolute floor alongside the
+# percentage one -- a target passes on whichever bound is looser for its own
+# latency scale, so this stops penalizing fast targets for jitter without
+# loosening the check for slower ones, where the percentage tolerance is
+# already a meaningful bound on its own.
+WARMUP_CHUNK_DURATION_S=15
+MAX_WARMUP_CHUNKS=4
+WARMUP_WINDOW=100
+WARMUP_TAIL_TOLERANCE_PCT=5.0
+WARMUP_TAIL_ABS_FLOOR_MS=0.25
+
+converge_warmup() {
+  local out_prefix="$1"; shift
+  local -a base_args=("$@")
+
+  local arg
+  for arg in "${base_args[@]}"; do
+    if [[ "$arg" == WARMUP_ITERATIONS_PER_TARGET=* ]]; then
+      k6_run warm-up.js "${base_args[@]}" -- --out "json=/results/raw/${out_prefix}.json"
+      finalize_result "${out_prefix}.json"
+      return
+    fi
+  done
+
+  local combined="${RAW_RESULTS_DIR}/${out_prefix}_combined.json"
+  : > "$combined"
+  local chunk=0 converged="false"
+  while [ "$chunk" -lt "$MAX_WARMUP_CHUNKS" ]; do
+    chunk=$((chunk + 1))
+    local chunk_name="${out_prefix}_chunk${chunk}.json"
+    k6_run warm-up.js "${base_args[@]}" "WARMUP_DURATION_S=${WARMUP_CHUNK_DURATION_S}" -- \
+      --out "json=/results/raw/${chunk_name}"
+    cat "${RAW_RESULTS_DIR}/${chunk_name}" >> "$combined"
+    rm -f "${RAW_RESULTS_DIR}/${chunk_name}"
+    check_thermal_safety "${out_prefix} chunk${chunk}"
+
+    converged=$(python3 - "$combined" "$WARMUP_WINDOW" "$WARMUP_TAIL_TOLERANCE_PCT" "$WARMUP_TAIL_ABS_FLOOR_MS" <<'PYEOF'
+import json, sys
+from collections import defaultdict
+
+fp, window, tol, abs_floor = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+by_tier = defaultdict(list)
+with open(fp) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "Point" or obj.get("metric") != "http_req_duration":
+            continue
+        data = obj.get("data", {}) or {}
+        tags = data.get("tags", {}) or {}
+        if tags.get("status") != "200":
+            continue
+        tier, t, v = tags.get("tier"), data.get("time"), data.get("value")
+        if tier is not None and t is not None and v is not None:
+            by_tier[tier].append((t, v))
+
+if not by_tier:
+    print("false")
+    sys.exit()
+
+all_converged = True
+for pts in by_tier.values():
+    if len(pts) < 3 * window:
+        all_converged = False
+        continue
+    pts.sort(key=lambda p: p[0])
+    prev = sorted(v for _, v in pts[-2 * window:-window])[window // 2]
+    last = sorted(v for _, v in pts[-window:])[window // 2]
+    drift = 100 * (last - prev) / prev if prev else float("inf")
+    if abs(last - prev) >= abs_floor and abs(drift) >= tol:
+        all_converged = False
+
+print("true" if all_converged else "false")
+PYEOF
+    )
+    [ "$converged" = "true" ] && break
+  done
+
+  if [ "$converged" = "true" ]; then
+    echo "  [warmup] ${out_prefix}: converged after ${chunk} chunk(s)."
+  else
+    echo "  [warmup] ${out_prefix}: did not converge within ${MAX_WARMUP_CHUNKS} chunk(s) " \
+         "(~$((MAX_WARMUP_CHUNKS * WARMUP_CHUNK_DURATION_S))s/target) -- proceeding with " \
+         "what was collected. Check table0 for this file's actual tail drift."
+  fi
+  mv "$combined" "${RAW_RESULTS_DIR}/${out_prefix}.json"
+  finalize_result "${out_prefix}.json"
+}
+
+# Measures this target's real throughput at CALIB_VUS, then derives the
+# ITERATIONS_PER_VU each of CALIB_AFFECTED_LEVELS needs to hit
+# CALIB_TARGET_DURATION_S, into CALIB_ITERATIONS_PER_VU. Call once per
+# target per rep, before that target's VUS loop. Throughput is roughly
+# constant across VUS within a tier (validated at v28/mock/tier5/tier20)
+# but varies ~2.4x across tiers, so this can't be a flat constant.
+calibrate_target() {
+  local target="$1" rep="$2"
+  local raw_name="calib_${target}_vus${CALIB_VUS}_rep${rep}.json"
+  echo "  [calibrate] target=${target} rep=${rep}: measuring throughput at VUS=${CALIB_VUS}..."
+  k6_run run-target.js \
+    TARGET="$target" VUS="$CALIB_VUS" ITERATIONS_PER_VU="$CALIB_ITER_PER_VU" PHASE=scan REP="calib_${rep}" -- \
+    --out "json=/results/raw/${raw_name}"
+  finalize_result "$raw_name"
+
+  local host_path="${RESULTS_DIR}/${raw_name}.gz"
+  local vus iters
+  while read -r vus iters; do
+    CALIB_ITERATIONS_PER_VU[$vus]="$iters"
+  done < <(python3 - "$host_path" "$CALIB_TARGET_DURATION_S" $CALIB_AFFECTED_LEVELS <<'PYEOF'
+import gzip, json, re, sys
+from datetime import datetime
+
+def parse_iso(ts):
+    ts = ts.strip()
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    ts = re.sub(r"(\.\d{6})\d+", r"\1", ts)
+    return datetime.fromisoformat(ts)
+
+fp, target_s = sys.argv[1], float(sys.argv[2])
+levels = [int(v) for v in sys.argv[3:]]
+times = []
+with gzip.open(fp, "rt") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        if obj.get("type") != "Point" or obj.get("metric") != "http_req_duration":
+            continue
+        if (obj["data"].get("tags") or {}).get("phase") != "scan":
+            continue
+        times.append(parse_iso(obj["data"]["time"]))
+times.sort()
+duration = (times[-1] - times[0]).total_seconds()
+throughput = len(times) / duration
+target_total_requests = throughput * target_s
+for vus in levels:
+    print(vus, max(1, round(target_total_requests / vus)))
+PYEOF
+  )
+  local summary=""
+  for vus in $CALIB_AFFECTED_LEVELS; do
+    summary="${summary}VUS${vus}=${CALIB_ITERATIONS_PER_VU[$vus]} "
+  done
+  echo "  [calibrate] target=${target} rep=${rep}: ${summary}"
+}
+
 # Aborts the suite if either container was OOM-killed during the cell.
 check_oom_killed() {
   local label="$1"
@@ -743,6 +1014,49 @@ check_oom_killed() {
   fi
   if [ "$py_oom" = "true" ] || [ "$java_oom" = "true" ]; then
     abort_suite "[cell] ${label}" "OOM-killed: python=${py_oom} java=${java_oom}"
+  fi
+}
+
+# THERMAL_* constants live earlier, next to COOLDOWN_S -- already validated
+# before either function below runs.
+
+# Highest reading across all thermal zones, whole degrees C. Empty output
+# means no zone was readable -- callers treat that as "skip the check", not
+# as an abort, since this is a safety net on top of the real run, not a
+# requirement for it.
+read_max_cpu_temp_c() {
+  local max="" raw t zone
+  for zone in /sys/class/thermal/thermal_zone*/temp; do
+    [ -r "$zone" ] || continue
+    raw=$(cat "$zone" 2>/dev/null) || continue
+    [[ "$raw" =~ ^[0-9]+$ ]] || continue
+    t=$((raw / 1000))
+    if [ -z "$max" ] || [ "$t" -gt "$max" ]; then
+      max="$t"
+    fi
+  done
+  echo "$max"
+  return 0
+}
+
+# Pauses if temps are at/above THERMAL_WARN_C, giving the system a chance to
+# cool; aborts if still at/above THERMAL_CRIT_C after MAX_THERMAL_COOLDOWNS
+# pauses. Errs toward pausing over aborting on the first warning -- a hard
+# hang loses the whole run, a paused one only costs wall-clock time.
+check_thermal_safety() {
+  local label="$1"
+  local temp cooldowns=0
+  temp=$(read_max_cpu_temp_c)
+  [ -z "$temp" ] && return 0
+  while [ "$temp" -ge "$THERMAL_WARN_C" ] && [ "$cooldowns" -lt "$MAX_THERMAL_COOLDOWNS" ]; do
+    echo "  [thermal] ${label}: ${temp}C >= warn ${THERMAL_WARN_C}C -- cooling ${THERMAL_COOLDOWN_S}s ($((cooldowns + 1))/${MAX_THERMAL_COOLDOWNS})"
+    sleep "$THERMAL_COOLDOWN_S"
+    cooldowns=$((cooldowns + 1))
+    temp=$(read_max_cpu_temp_c)
+    [ -z "$temp" ] && return 0
+  done
+  if [ "$temp" -ge "$THERMAL_CRIT_C" ]; then
+    abort_suite "[thermal] ${label}" "${temp}C still >= critical ${THERMAL_CRIT_C}C after ${cooldowns} cooldown(s)."
   fi
 }
 
@@ -772,6 +1086,7 @@ run_cell() {
     abort_suite "[cell] ${label}" "k6 exited non-zero."
   fi
   check_oom_killed "$label"
+  check_thermal_safety "$label"
 }
 
 capture_run_metadata
@@ -786,7 +1101,7 @@ for rep in $(seq 1 "$REPS_BASELINE"); do
   verify_jvm_flag_pins "baseline rep=${rep}"
   verify_tiers "baseline rep=${rep}"
   echo "[*] Warming up JIT / connection pools..."
-  k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" "REP=${rep}" -- --out "json=/results/warmup_baseline_rep${rep}.json"
+  converge_warmup "warmup_baseline_rep${rep}" "${WARMUP_ENV_ARGS[@]}" "REP=${rep}"
   verify_tiers_runtime "baseline rep=${rep}"
   verify_jvm_thread_pins "baseline rep=${rep}"
   sleep "$COOLDOWN_S"
@@ -801,7 +1116,8 @@ for rep in $(seq 1 "$REPS_BASELINE"); do
     run_cell "baseline target=${target} rep=${rep}" \
       k6_run run-target.js \
       TARGET="$target" VUS=1 ITERATIONS="$BASELINE_ITERATIONS" PHASE=baseline REP="$rep" -- \
-      --out "json=/results/baseline_${target}_rep${rep}.json"
+      --out "json=/results/raw/baseline_${target}_rep${rep}.json"
+    finalize_result "baseline_${target}_rep${rep}.json"
     sleep "$COOLDOWN_S"
   done
   record_env_sample "baseline_rep${rep}_end"
@@ -818,7 +1134,7 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   verify_jvm_flag_pins "scan rep=${rep}"
   verify_tiers "scan rep=${rep}"
   echo "[*] Warming up JIT / connection pools (default VUS)..."
-  k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" "REP=${rep}" -- --out "json=/results/warmup_scan_rep${rep}.json"
+  converge_warmup "warmup_scan_rep${rep}" "${WARMUP_ENV_ARGS[@]}" "REP=${rep}"
   verify_tiers_runtime "scan rep=${rep}"
   verify_jvm_thread_pins "scan rep=${rep}"
   sleep "$COOLDOWN_S"
@@ -826,8 +1142,7 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   # Matches warm-up concurrency to the scan's peak VUS; separate output
   # file so table0's convergence check can report on it distinctly.
   echo "[*] Warming up JIT / connection pools (MAX_VUS=${MAX_VUS})..."
-  k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" WARMUP_VUS="$MAX_VUS" "REP=${rep}" -- \
-    --out "json=/results/warmup_scan_maxvus_rep${rep}.json"
+  converge_warmup "warmup_scan_maxvus_rep${rep}" "${WARMUP_MAXVUS_ENV_ARGS[@]}" WARMUP_VUS="$MAX_VUS" "REP=${rep}"
   sleep "$COOLDOWN_S"
 
   # Randomizes target and concurrency order per rep (shuffled independently)
@@ -839,12 +1154,19 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   echo "  [order] concurrency levels this rep: ${CONCURRENCY_THIS_REP[*]}"
 
   for target in "${TARGETS_THIS_REP[@]}"; do
+    calibrate_target "$target" "$rep"
+    sleep "$COOLDOWN_S"
     for vus in "${CONCURRENCY_THIS_REP[@]}"; do
-      echo "  -> target=${target} vus=${vus} rep=${rep}"
+      iter_per_vu="$SCAN_ITERATIONS_PER_VU"
+      if [ -n "${CALIB_ITERATIONS_PER_VU[$vus]:-}" ]; then
+        iter_per_vu="${CALIB_ITERATIONS_PER_VU[$vus]}"
+      fi
+      echo "  -> target=${target} vus=${vus} rep=${rep} iterations_per_vu=${iter_per_vu}"
       run_cell "scan target=${target} vus=${vus} rep=${rep}" \
         k6_run run-target.js \
-        TARGET="$target" VUS="$vus" ITERATIONS_PER_VU="$SCAN_ITERATIONS_PER_VU" PHASE=scan REP="$rep" -- \
-        --out "json=/results/scan_${target}_vus${vus}_rep${rep}.json"
+        TARGET="$target" VUS="$vus" ITERATIONS_PER_VU="$iter_per_vu" PHASE=scan REP="$rep" -- \
+        --out "json=/results/raw/scan_${target}_vus${vus}_rep${rep}.json"
+      finalize_result "scan_${target}_vus${vus}_rep${rep}.json"
       sleep "$COOLDOWN_S"
     done
   done
@@ -857,11 +1179,12 @@ echo "    Per-rep cell order logged to ${ORDER_LOG}"
 echo "    Host/toolchain fingerprint (incl. physical-core isolation) logged to ${METADATA_FILE}"
 echo "    CPU pinning, SMT topology and thread-env checks logged to ${CPU_PIN_LOG}"
 echo "    Per-rep governor/frequency samples logged to ${ENV_TRACE_LOG}"
-echo "    Warm-up JSON output (for post-hoc convergence check) saved as warmup_baseline_rep*.json,"
-echo "    warmup_scan_rep*.json (default VUS), and warmup_scan_maxvus_rep*.json (VUS=${MAX_VUS})"
+echo "    Warm-up JSON output (for post-hoc convergence check) saved as warmup_baseline_rep*.json.gz,"
+echo "    warmup_scan_rep*.json.gz (default VUS), and warmup_scan_maxvus_rep*.json.gz (VUS=${MAX_VUS})"
 echo "    'calibration' target included alongside mock/5/10/20/28 -- isolates instrumentation overhead"
+echo "    Per-tier per-rep calibration measurements saved as calib_*.json.gz (not read by analyze-results.py)"
 # Guards against an empty run: "every rep passed" below is vacuously true if no cell ran.
-_n_cells=$(find "$RESULTS_DIR" -maxdepth 1 -name 'baseline_*.json' -o -maxdepth 1 -name 'scan_*.json' 2>/dev/null | wc -l)
+_n_cells=$(find "$RESULTS_DIR" -maxdepth 1 -name 'baseline_*.json.gz' -o -maxdepth 1 -name 'scan_*.json.gz' 2>/dev/null | wc -l)
 if [ "$_n_cells" -eq 0 ]; then
   abort_suite "[suite]" "no measurement cells were executed -- check TARGETS_OVERRIDE," \
     "CONCURRENCY_OVERRIDE and REPS_*_OVERRIDE. Not reporting this run as successful."

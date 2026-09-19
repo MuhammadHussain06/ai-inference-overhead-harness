@@ -45,7 +45,19 @@ fi
 # configuration without writing into a real dataset.
 COMPOSE_FILE="${COMPOSE_FILE_OVERRIDE:-../docker-compose.yml}"
 RESULTS_DIR="${RESULTS_DIR_OVERRIDE:-../results}"
-mkdir -p "$RESULTS_DIR"
+# k6 writes its full, unfiltered trail here (container-visible as /results/raw);
+# finalize_result() filters + gzips each file into RESULTS_DIR and deletes the
+# raw copy right after, so this stays near-empty except mid-cell. Shared
+# scratch with run-suite.sh's own raw dir -- cleared at whichever starts first.
+RAW_RESULTS_DIR="${RESULTS_DIR}/raw"
+rm -rf "$RAW_RESULTS_DIR"
+mkdir -p "$RESULTS_DIR" "$RAW_RESULTS_DIR"
+
+# analyze-ablation.py only reads these three metrics (checked directly in its
+# METRICS dict). http_req_duration is also kept, unused today, so a
+# taper-contamination check on these cells has what it needs without costing
+# anything extra to collect.
+ABLATION_KEEP_METRICS="python_thread_dispatch_time_ms,python_model_inference_time_ms,python_total_time_ms,http_req_duration"
 
 # Separate log files from run-suite.sh's, so an ablation run never trips
 # analyze-results.py's hard-fail-on-any-failures-log-entry check for the main
@@ -72,13 +84,33 @@ CPU_PIN_LOG="${RESULTS_DIR}/ablation_cpu_pin_check_log.txt"
 
 ABLATION_TARGET="${ABLATION_TARGET_OVERRIDE:-28}"
 ABLATION_VUS="${ABLATION_VUS_OVERRIDE:-64}"
+# Fallback only -- calibrate_ablation_cell() sets the real per-cell value.
+# Kept here as the metadata-recorded reference value.
 ITERATIONS_PER_VU="${ABLATION_ITERATIONS_PER_VU_OVERRIDE:-100}"
+
+# Every ablation cell runs this same TARGET/VUS, so per-vu-iterations' tail
+# taper (see run-suite.sh's calibration comment) applies here too. Throughput
+# is the arm's own manipulated variable, unlike the main scan, so calibration
+# reruns per (arm, value, rep) cell, not once per rep.
+ABLATION_CALIB_ITER_PER_VU="${ABLATION_CALIB_ITER_PER_VU_OVERRIDE:-500}"
+ABLATION_CALIB_TARGET_DURATION_S="${ABLATION_CALIB_TARGET_DURATION_S_OVERRIDE:-60}"
 # Sets default replicate count to n=7 per arm to ensure statistical power for Mann-Whitney tests and bootstrap CIs.
 REPS_ABLATION="${REPS_ABLATION_OVERRIDE:-7}"
 
+# ACPI/DPTF thermal negotiation isn't guaranteed to work (some hardware never
+# completes it -- e.g. _SB.IETM._OSC aborting at boot), leaving the OS blind
+# to platform thermal policy. check_thermal_safety() below reads
+# /sys/class/thermal directly instead of trusting a userspace daemon, so a
+# long pinned-core run pauses or aborts instead of hard-hanging.
+THERMAL_WARN_C="${THERMAL_WARN_C_OVERRIDE:-90}"
+THERMAL_CRIT_C="${THERMAL_CRIT_C_OVERRIDE:-95}"
+THERMAL_COOLDOWN_S="${THERMAL_COOLDOWN_S_OVERRIDE:-60}"
+MAX_THERMAL_COOLDOWNS="${MAX_THERMAL_COOLDOWNS_OVERRIDE:-2}"
+
 # Command substitution in a for word-list is not an errexit context, so integer overrides
 # must be validated explicitly before use.
-for _intvar in REPS_ABLATION ABLATION_VUS ITERATIONS_PER_VU; do
+for _intvar in REPS_ABLATION ABLATION_VUS ITERATIONS_PER_VU ABLATION_CALIB_ITER_PER_VU ABLATION_CALIB_TARGET_DURATION_S \
+  THERMAL_WARN_C THERMAL_CRIT_C THERMAL_COOLDOWN_S MAX_THERMAL_COOLDOWNS; do
   if [ -n "${!_intvar+x}" ] && { ! [[ "${!_intvar}" =~ ^[0-9]+$ ]] || [ "${!_intvar}" -lt 1 ]; }; then
     echo "[!] ${_intvar} must be a positive integer, got '${!_intvar}'." >&2
     exit 1
@@ -222,6 +254,9 @@ capture_run_metadata() {
     "target": "${ABLATION_TARGET}",
     "vus": ${ABLATION_VUS},
     "iterations_per_vu": ${ITERATIONS_PER_VU},
+    "iterations_per_vu_note": "fallback only -- actual value is calibrated per cell against calib_target_duration_s, see ablation_calib_* files",
+    "calib_iter_per_vu": ${ABLATION_CALIB_ITER_PER_VU},
+    "calib_target_duration_s": ${ABLATION_CALIB_TARGET_DURATION_S},
     "reps": ${REPS_ABLATION},
     "anyio_default_tokens": ${ANYIO_DEFAULT_TOKENS},
     "cells": [$(printf '"%s",' "${CELLS[@]}" | sed 's/,$//')]
@@ -539,6 +574,46 @@ check_oom_killed() {
   fi
 }
 
+# Highest reading across all thermal zones, whole degrees C. Empty output
+# means no zone was readable -- callers treat that as "skip the check", not
+# as an abort, since this is a safety net on top of the real run, not a
+# requirement for it.
+read_max_cpu_temp_c() {
+  local max="" raw t zone
+  for zone in /sys/class/thermal/thermal_zone*/temp; do
+    [ -r "$zone" ] || continue
+    raw=$(cat "$zone" 2>/dev/null) || continue
+    [[ "$raw" =~ ^[0-9]+$ ]] || continue
+    t=$((raw / 1000))
+    if [ -z "$max" ] || [ "$t" -gt "$max" ]; then
+      max="$t"
+    fi
+  done
+  echo "$max"
+  return 0
+}
+
+# Pauses if temps are at/above THERMAL_WARN_C, giving the system a chance to
+# cool; aborts if still at/above THERMAL_CRIT_C after MAX_THERMAL_COOLDOWNS
+# pauses. Errs toward pausing over aborting on the first warning -- a hard
+# hang loses the whole run, a paused one only costs wall-clock time.
+check_thermal_safety() {
+  local label="$1"
+  local temp cooldowns=0
+  temp=$(read_max_cpu_temp_c)
+  [ -z "$temp" ] && return 0
+  while [ "$temp" -ge "$THERMAL_WARN_C" ] && [ "$cooldowns" -lt "$MAX_THERMAL_COOLDOWNS" ]; do
+    echo "  [thermal] ${label}: ${temp}C >= warn ${THERMAL_WARN_C}C -- cooling ${THERMAL_COOLDOWN_S}s ($((cooldowns + 1))/${MAX_THERMAL_COOLDOWNS})"
+    sleep "$THERMAL_COOLDOWN_S"
+    cooldowns=$((cooldowns + 1))
+    temp=$(read_max_cpu_temp_c)
+    [ -z "$temp" ] && return 0
+  done
+  if [ "$temp" -ge "$THERMAL_CRIT_C" ]; then
+    abort_suite "[thermal] ${label}" "${temp}C still >= critical ${THERMAL_CRIT_C}C after ${cooldowns} cooldown(s)."
+  fi
+}
+
 k6_run() {
   local script="$1"; shift
   local env_flags=()
@@ -546,6 +621,184 @@ k6_run() {
   shift
   docker compose -f "$COMPOSE_FILE" --profile loadgen run --rm -T \
     "${env_flags[@]}" k6 run "/scripts/${script}" "$@"
+}
+
+# Filters a raw k6 JSON trail down to ABLATION_KEEP_METRICS and gzips it into
+# RESULTS_DIR, then deletes the raw copy. Runs on the host, after the
+# container that wrote the raw file has already exited.
+# Usage: finalize_result <name.json>  -- name matches what --out json=
+# pointed at under /results/raw/ (container path) / RAW_RESULTS_DIR (host path).
+finalize_result() {
+  local name="$1"
+  local raw="${RAW_RESULTS_DIR}/${name}"
+  local final="${RESULTS_DIR}/${name}.gz"
+  python3 -c "
+import gzip, json, sys
+
+keep = set('${ABLATION_KEEP_METRICS}'.split(','))
+raw_path, final_path = sys.argv[1], sys.argv[2]
+with open(raw_path) as fin, gzip.open(final_path, 'wt') as fout:
+    for line in fin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get('type') != 'Point' or obj.get('metric') not in keep:
+            continue
+        fout.write(line + '\n')
+" "$raw" "$final"
+  rm -f "$raw"
+}
+
+# Same convergence gate as run-suite.sh's converge_warmup(), reused verbatim
+# -- see that function's comment for the full rationale, including why
+# WARMUP_TAIL_ABS_FLOOR_MS gives the tail-drift criterion an absolute floor
+# alongside its percentage one. Runs warm-up.js in duration-bounded chunks
+# (WARMUP_CHUNK_DURATION_S), checks table0's own tail-drift criterion after
+# each chunk, stops once ABLATION_TARGET has converged or after
+# MAX_WARMUP_CHUNKS chunks. An explicit WARMUP_ITERATIONS_PER_TARGET
+# override skips gating and runs a single fixed-iteration pass instead.
+WARMUP_CHUNK_DURATION_S=15
+MAX_WARMUP_CHUNKS=4
+WARMUP_WINDOW=100
+WARMUP_TAIL_TOLERANCE_PCT=5.0
+WARMUP_TAIL_ABS_FLOOR_MS=0.25
+
+converge_warmup() {
+  local out_prefix="$1"; shift
+  local -a base_args=("$@")
+
+  local arg
+  for arg in "${base_args[@]}"; do
+    if [[ "$arg" == WARMUP_ITERATIONS_PER_TARGET=* ]]; then
+      k6_run warm-up.js "${base_args[@]}" -- --out "json=/results/raw/${out_prefix}.json"
+      finalize_result "${out_prefix}.json"
+      return
+    fi
+  done
+
+  local combined="${RAW_RESULTS_DIR}/${out_prefix}_combined.json"
+  : > "$combined"
+  local chunk=0 converged="false"
+  while [ "$chunk" -lt "$MAX_WARMUP_CHUNKS" ]; do
+    chunk=$((chunk + 1))
+    local chunk_name="${out_prefix}_chunk${chunk}.json"
+    k6_run warm-up.js "${base_args[@]}" "WARMUP_DURATION_S=${WARMUP_CHUNK_DURATION_S}" -- \
+      --out "json=/results/raw/${chunk_name}"
+    cat "${RAW_RESULTS_DIR}/${chunk_name}" >> "$combined"
+    rm -f "${RAW_RESULTS_DIR}/${chunk_name}"
+    check_thermal_safety "${out_prefix} chunk${chunk}"
+
+    converged=$(python3 - "$combined" "$WARMUP_WINDOW" "$WARMUP_TAIL_TOLERANCE_PCT" "$WARMUP_TAIL_ABS_FLOOR_MS" <<'PYEOF'
+import json, sys
+from collections import defaultdict
+
+fp, window, tol, abs_floor = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+by_tier = defaultdict(list)
+with open(fp) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "Point" or obj.get("metric") != "http_req_duration":
+            continue
+        data = obj.get("data", {}) or {}
+        tags = data.get("tags", {}) or {}
+        if tags.get("status") != "200":
+            continue
+        tier, t, v = tags.get("tier"), data.get("time"), data.get("value")
+        if tier is not None and t is not None and v is not None:
+            by_tier[tier].append((t, v))
+
+if not by_tier:
+    print("false")
+    sys.exit()
+
+all_converged = True
+for pts in by_tier.values():
+    if len(pts) < 3 * window:
+        all_converged = False
+        continue
+    pts.sort(key=lambda p: p[0])
+    prev = sorted(v for _, v in pts[-2 * window:-window])[window // 2]
+    last = sorted(v for _, v in pts[-window:])[window // 2]
+    drift = 100 * (last - prev) / prev if prev else float("inf")
+    if abs(last - prev) >= abs_floor and abs(drift) >= tol:
+        all_converged = False
+
+print("true" if all_converged else "false")
+PYEOF
+    )
+    [ "$converged" = "true" ] && break
+  done
+
+  if [ "$converged" = "true" ]; then
+    echo "  [warmup] ${out_prefix}: converged after ${chunk} chunk(s)."
+  else
+    echo "  [warmup] ${out_prefix}: did not converge within ${MAX_WARMUP_CHUNKS} chunk(s) " \
+         "(~$((MAX_WARMUP_CHUNKS * WARMUP_CHUNK_DURATION_S))s/target) -- proceeding with " \
+         "what was collected. Check table0_ablation_warmup_convergence_check for this cell's actual tail drift."
+  fi
+  mv "$combined" "${RAW_RESULTS_DIR}/${out_prefix}.json"
+  finalize_result "${out_prefix}.json"
+}
+
+# Measures this cell's real throughput at ABLATION_CALIB_ITER_PER_VU, then sets
+# the global ABLATION_ITER_PER_VU to whatever hits ABLATION_CALIB_TARGET_DURATION_S
+# at ABLATION_VUS. Call once per cell, after warm-up so the measurement isn't
+# contaminated by cold start. phase=ablation-calib keeps this run out of
+# analyze-ablation.py's phase=ablation filter, and the ablation_calib_ filename
+# prefix keeps it out of CELL_FILE_RE's known-arm match.
+calibrate_ablation_cell() {
+  local arm="$1" value="$2" rep="$3"
+  local raw_name="ablation_calib_${arm}_${value}_rep${rep}.json"
+  echo "  [calibrate] arm=${arm} value=${value} rep=${rep}: measuring throughput at VUS=${ABLATION_VUS}..."
+  k6_run run-target.js \
+    TARGET="$ABLATION_TARGET" VUS="$ABLATION_VUS" ITERATIONS_PER_VU="$ABLATION_CALIB_ITER_PER_VU" \
+    PHASE=ablation-calib REP="$rep" -- \
+    --out "json=/results/raw/${raw_name}"
+  finalize_result "$raw_name"
+
+  local host_path="${RESULTS_DIR}/${raw_name}.gz"
+  ABLATION_ITER_PER_VU=$(python3 - "$host_path" "$ABLATION_CALIB_TARGET_DURATION_S" "$ABLATION_VUS" <<'PYEOF'
+import gzip, json, re, sys
+from datetime import datetime
+
+def parse_iso(ts):
+    ts = ts.strip()
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    ts = re.sub(r"(\.\d{6})\d+", r"\1", ts)
+    return datetime.fromisoformat(ts)
+
+fp, target_s, vus = sys.argv[1], float(sys.argv[2]), int(sys.argv[3])
+times = []
+with gzip.open(fp, "rt") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        if obj.get("type") != "Point" or obj.get("metric") != "http_req_duration":
+            continue
+        if (obj["data"].get("tags") or {}).get("phase") != "ablation-calib":
+            continue
+        times.append(parse_iso(obj["data"]["time"]))
+times.sort()
+duration = (times[-1] - times[0]).total_seconds()
+throughput = len(times) / duration
+target_total_requests = throughput * target_s
+print(max(1, round(target_total_requests / vus)))
+PYEOF
+  )
+  echo "  [calibrate] arm=${arm} value=${value} rep=${rep}: ITERATIONS_PER_VU=${ABLATION_ITER_PER_VU}"
 }
 
 shuffled() { printf '%s\n' "$@" | shuf | tr '\n' ' '; }
@@ -573,20 +826,26 @@ for rep in $(seq 1 "$REPS_ABLATION"); do
     verify_tiers_and_limiter "$label" "$tokens"
 
     echo "  [warm-up] VUS=${ABLATION_VUS}..."
-    k6_run warm-up.js "${WARMUP_ENV_ARGS[@]}" "REP=${rep}" -- \
-      --out "json=/results/ablation_warmup_${arm}_${value}_rep${rep}.json"
+    warmup_name="ablation_warmup_${arm}_${value}_rep${rep}"
+    converge_warmup "$warmup_name" "${WARMUP_ENV_ARGS[@]}" "REP=${rep}"
     verify_tiers_runtime "$label"
     verify_jvm_thread_pins "$label"
     sleep "$COOLDOWN_S"
 
+    calibrate_ablation_cell "$arm" "$value" "$rep"
+    sleep "$COOLDOWN_S"
+
+    cell_name="ablation_${arm}_${value}_rep${rep}.json"
     if ! k6_run run-target.js \
-      TARGET="$ABLATION_TARGET" VUS="$ABLATION_VUS" ITERATIONS_PER_VU="$ITERATIONS_PER_VU" \
+      TARGET="$ABLATION_TARGET" VUS="$ABLATION_VUS" ITERATIONS_PER_VU="$ABLATION_ITER_PER_VU" \
       PHASE=ablation REP="$rep" ARM="$arm" ARM_VALUE="$value" -- \
-      --out "json=/results/ablation_${arm}_${value}_rep${rep}.json"
+      --out "json=/results/raw/${cell_name}"
     then
       abort_suite "[cell] ${label}" "k6 exited non-zero."
     fi
+    finalize_result "$cell_name"
     check_oom_killed "$label"
+    check_thermal_safety "$label"
     record_env_sample "${arm}_${value}_rep${rep}_end"
     sleep "$COOLDOWN_S"
   done
@@ -595,13 +854,13 @@ done
 docker compose -f "$COMPOSE_FILE" down
 # Guards against an empty run: the completion banner would otherwise report success after
 # executing no cells at all.
-_n_cells=$(find "$RESULTS_DIR" -maxdepth 1 -name 'ablation_*_rep*.json' 2>/dev/null | wc -l)
+_n_cells=$(find "$RESULTS_DIR" -maxdepth 1 -name 'ablation_*_rep*.json.gz' 2>/dev/null | wc -l)
 if [ "$_n_cells" -eq 0 ]; then
   abort_suite "[ablation]" "no ablation cells were executed -- check ABLATION_CELLS_OVERRIDE and" \
     "REPS_ABLATION_OVERRIDE. Not reporting this run as successful."
 fi
 
-echo "[+] Ablation complete. Raw results in ${RESULTS_DIR}/ablation_*.json"
+echo "[+] Ablation complete. Raw results in ${RESULTS_DIR}/ablation_*.json.gz"
 echo "    SMT topology and pinning checks logged to ${CPU_PIN_LOG}"
 echo "    Per-cell governor/frequency samples logged to ${ENV_TRACE_LOG}"
 echo "    Run: ../analysis/venv/bin/python3 ../analysis/analyze-ablation.py"
