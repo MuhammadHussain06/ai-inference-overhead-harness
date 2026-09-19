@@ -15,9 +15,12 @@ Usage:
 
 import argparse
 import glob
+import gzip
 import json
 import os
+import random
 import re
+import sys
 
 import numpy as np
 import pandas as pd
@@ -39,13 +42,25 @@ METRICS = {
     "python_total_time_ms": "Total",
 }
 
-# ablation_<arm>_<value>_rep<N>.json. Gating on a known arm also rejects
+# ablation_<arm>_<value>_rep<N>.json[.gz]. Gating on a known arm also rejects
 # ablation_warmup_* and ablation_run_metadata.json, which share the prefix.
-CELL_FILE_RE = re.compile(r"^ablation_(?P<arm>[a-z_]+)_(?P<value>[^_]+)_rep(?P<rep>\d+)\.json$")
+CELL_FILE_RE = re.compile(r"^ablation_(?P<arm>[a-z_]+)_(?P<value>[^_]+)_rep(?P<rep>\d+)\.json(\.gz)?$")
+
+# ablation_warmup_<arm>_<value>_rep<N>.json[.gz]. The warm-up call itself carries no
+# arm/arm_value tag (only the real cell that follows sets ARM/ARM_VALUE), so which
+# cell a warm-up file belongs to comes from its filename, same as CELL_FILE_RE.
+WARMUP_FILE_RE = re.compile(r"^ablation_warmup_(?P<arm>[a-z_]+)_(?P<value>[^_]+)_rep(?P<rep>\d+)\.json(\.gz)?$")
 
 # The one configuration every arm holds as its control, so the cells that
 # realize it can be cross-checked against each other.
 CONTROL_CELL = {"thread_limiter": "40", "cpuset": "0-1,4-5,8-9", "workers": "3"}
+
+# Same safety net as analyze-results.py's load_results(), sized identically for
+# consistency. Ablation cells are fixed at a real model-inference tier and keep
+# only 3 metrics, so they haven't approached this in practice, but nothing rules
+# out an arm/value combination someday raising throughput enough to matter --
+# cheap to guard against and a no-op for every file already under the cap.
+MAX_POINTS_PER_FILE = 250_000
 
 
 def _cpu_count_of(cpuset):
@@ -83,15 +98,26 @@ def _is_cell_file(path):
 
 
 def load_ablation_cells(results_dir):
-    """Loads ablation_<arm>_<value>_rep<N>.json cell files."""
-    files = [f for f in sorted(glob.glob(os.path.join(results_dir, "ablation_*.json")))
-             if _is_cell_file(f)]
+    """Loads ablation_<arm>_<value>_rep<N>.json[.gz] cell files."""
+    files = [f for f in sorted(
+                glob.glob(os.path.join(results_dir, "ablation_*.json"))
+                + glob.glob(os.path.join(results_dir, "ablation_*.json.gz"))
+             ) if _is_cell_file(f)]
     if not files:
         return None
 
+    # json.loads() doesn't intern strings, so each tag repeats as a new object
+    # per row instead of one shared object per distinct value.
+    def _intern_tag(v):
+        return sys.intern(v) if type(v) is str else v
+
+    rng = random.Random(42)
     rows = []
     for fp in files:
-        with open(fp) as f:
+        file_rows = []
+        n_seen = 0
+        opener = gzip.open if fp.endswith(".gz") else open
+        with opener(fp, "rt") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -105,17 +131,36 @@ def load_ablation_cells(results_dir):
                 tags = (obj.get("data", {}) or {}).get("tags", {}) or {}
                 if tags.get("phase") != "ablation":
                     continue
-                rows.append({
-                    "metric": obj["metric"],
+                row = {
+                    "metric": _intern_tag(obj["metric"]),
                     "value": pd.to_numeric(obj["data"].get("value"), errors="coerce"),
-                    "arm": tags.get("arm"),
-                    "arm_value": tags.get("arm_value"),
-                    "rep": tags.get("rep", "1"),
-                })
+                    "arm": _intern_tag(tags.get("arm")),
+                    "arm_value": _intern_tag(tags.get("arm_value")),
+                    "rep": _intern_tag(tags.get("rep", "1")),
+                }
+                # Algorithm R: first MAX_POINTS_PER_FILE rows always kept; each row
+                # after that replaces a uniformly random existing slot with probability
+                # MAX_POINTS_PER_FILE/n_seen, keeping every row seen so far equally
+                # likely to end up in the final sample. No counter metric lives in
+                # METRICS, so nothing here needs an always-keep exemption.
+                n_seen += 1
+                if n_seen <= MAX_POINTS_PER_FILE:
+                    file_rows.append(row)
+                else:
+                    idx = rng.randint(0, n_seen - 1)
+                    if idx < MAX_POINTS_PER_FILE:
+                        file_rows[idx] = row
+        if n_seen > MAX_POINTS_PER_FILE:
+            print(f"[!] {os.path.basename(fp)}: {n_seen} points subsampled to "
+                  f"{MAX_POINTS_PER_FILE} (uniform random sample) to bound memory.")
+        rows.extend(file_rows)
     if not rows:
         return None
     df = pd.DataFrame(rows)
     df = df.dropna(subset=["value", "arm", "arm_value"])
+    # float32 halves this column's memory versus float64; ablation latencies
+    # don't need more precision than that.
+    df["value"] = df["value"].astype(np.float32)
     return df
 
 
@@ -315,6 +360,74 @@ def plot_ablation(df, output_dir):
     print(f"[+] Figure -> {figures_dir}/figure_ablation_mechanisms.png / .pdf")
 
 
+def build_ablation_warmup_table(results_dir, window_size=100, tail_tolerance_pct=5.0):
+    """Per-cell warm-up convergence check -- same criterion as analyze-results.py's
+    table0 (last window vs. the one before it, converged if drift < tail_tolerance_pct).
+    Runs against ablation_warmup_* files, which load_ablation_cells() never touches.
+    """
+    files = sorted(
+        glob.glob(os.path.join(results_dir, "ablation_warmup_*.json"))
+        + glob.glob(os.path.join(results_dir, "ablation_warmup_*.json.gz"))
+    )
+    rows = []
+    for fp in files:
+        m = WARMUP_FILE_RE.match(os.path.basename(fp))
+        if not m:
+            continue
+        arm, value, rep = m.group("arm"), m.group("value"), m.group("rep")
+        opener = gzip.open if fp.endswith(".gz") else open
+        points = []
+        with opener(fp, "rt") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "Point" or obj.get("metric") != "http_req_duration":
+                    continue
+                data = obj.get("data", {}) or {}
+                tags = data.get("tags", {}) or {}
+                if tags.get("status") != "200":
+                    continue
+                t, v = data.get("time"), data.get("value")
+                if t is not None and v is not None:
+                    points.append((t, v))
+        if len(points) < 3 * window_size:
+            continue
+        points.sort(key=lambda p: p[0])
+        values = [v for _, v in points]
+        p50_first = float(np.percentile(values[:window_size], 50))
+        p50_prev = float(np.percentile(values[-2 * window_size:-window_size], 50))
+        p50_last = float(np.percentile(values[-window_size:], 50))
+        total_drift = 100 * (p50_last - p50_first) / p50_first if p50_first else np.nan
+        tail_drift = 100 * (p50_last - p50_prev) / p50_prev if p50_prev else np.nan
+        converged = not np.isnan(tail_drift) and abs(tail_drift) < tail_tolerance_pct
+        rows.append({
+            "Arm": ARM_LABELS.get(arm, arm), "Value": value, "Rep": rep,
+            "N Requests": len(points),
+            f"First {window_size} P50 (ms)": round(p50_first, 3),
+            f"Prev {window_size} P50 (ms)": round(p50_prev, 3),
+            f"Last {window_size} P50 (ms)": round(p50_last, 3),
+            "Total drift (%)": round(total_drift, 1) if not np.isnan(total_drift) else np.nan,
+            "Tail drift (%)": round(tail_drift, 1) if not np.isnan(tail_drift) else np.nan,
+            f"Converged (tail <{tail_tolerance_pct:g}%)": "YES" if converged else "no",
+        })
+    table = pd.DataFrame(rows)
+    if not table.empty:
+        converged_col = f"Converged (tail <{tail_tolerance_pct:g}%)"
+        n_failed = int((table[converged_col] == "no").sum())
+        if n_failed:
+            print(f"[!] {n_failed}/{len(table)} ablation warm-up windows had not converged at "
+                  f"the tail. The cell measurement that follows it may not reflect steady state.")
+    elif files:
+        print(f"[!] {len(files)} ablation_warmup_* file(s) found but none had >= {3 * window_size} "
+              f"HTTP 200 requests -- skipping convergence check.")
+    return table
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze run-ablation.sh's thread-dispatch mechanism sweep.")
     parser.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
@@ -325,6 +438,14 @@ def main():
     if os.path.isfile(failures_log) and os.path.getsize(failures_log) > 0:
         print(f"[!] {failures_log} has entries -- fix the cause and re-run run-ablation.sh.")
         return
+
+    save_table(build_ablation_warmup_table(args.results_dir), "table0_ablation_warmup_convergence_check",
+               args.output_dir,
+               caption="Per-cell warm-up convergence check, same criterion as the main suite's "
+                       "table0. 'Tail drift' compares the last window to the one before it; only "
+                       "this indicates whether the stack reached steady state before the measured "
+                       "cell began.",
+               label="tab:ablation-warmup-convergence")
 
     df = load_ablation_cells(args.results_dir)
     if df is None:
