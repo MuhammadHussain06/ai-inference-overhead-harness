@@ -2,9 +2,11 @@ import { sendTransaction, TARGETS } from './lib/common.js';
 
 // Warms JIT tiers, connection pools, and OS/network buffers past compilation
 // thresholds. Defaults to constant-vus: every VU runs for a fixed wall-clock
-// duration and all stop together, so no VU finishes early and tapers
-// concurrency down near the end of a chunk -- which would otherwise read as
-// still-cooling latency to a tail-window convergence check. Passing
+// duration at flat concurrency, with gracefulStop disabled so no VU lingers
+// past that duration finishing one last iteration while others have already
+// stopped -- that kind of staggered drain would thin concurrency during the
+// grace window and read as fast, "converged" latency to a tail-window
+// convergence check when it is really just fewer VUs contending. Passing
 // WARMUP_ITERATIONS_PER_TARGET selects a fixed-count per-vu-iterations pass
 // instead, for callers (smoke tests) that want a fast, deterministic run and
 // don't check the tail.
@@ -37,15 +39,15 @@ if (USE_ITERATIONS) {
     });
 } else {
     const DURATION_S = parseInt(__ENV.WARMUP_DURATION_S || '15', 10);
-    // gracefulStop lets in-flight requests finish instead of cutting them off at
-    // DURATION_S; SLOT_S budgets for that on top of the run itself so the next
-    // target's scenario never overlaps this one's tail.
+    // gracefulStop: '0s' interrupts whatever's still in flight at DURATION_S
+    // instead of letting each VU wind down on its own; SLOT_S keeps its buffer
+    // regardless so the next target's scenario still can't overlap this one's.
     SLOT_S = DURATION_S + 10;
     scenarioFor = (key, i) => ({
         executor: 'constant-vus',
         vus: VUS,
         duration: `${DURATION_S}s`,
-        gracefulStop: '5s',
+        gracefulStop: '0s',
         startTime: `${i * SLOT_S}s`,
         exec: `warm_${key}`,
     });
