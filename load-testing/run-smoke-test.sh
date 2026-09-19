@@ -25,6 +25,34 @@ docker compose -f ../docker-compose.yml --profile loadgen run --rm -T \
   -e PRE_ALLOCATED_VUS=32 -e MAX_VUS=64 -e PHASE=smoke-openloop -e REP=1 \
   k6 run /scripts/run-target-openloop.js --out json=/results/openloop_28_smoke.json
 
+# table7 excludes phase=smoke-openloop on purpose (see analyze_openloop_check()), so
+# it will never report this cell -- checked directly against the raw file instead.
+SMOKE_DROPPED=$(python3 -c "
+import json
+n = 0
+with open('../results/openloop_28_smoke.json') as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get('type') == 'Point' and obj.get('metric') == 'dropped_iterations':
+            n += obj.get('data', {}).get('value', 0)
+print(int(n))
+")
+if [ "$SMOKE_DROPPED" -gt 0 ]; then
+  echo "  [+] smoke-openloop: ${SMOKE_DROPPED} dropped_iterations recorded (RATE=5000 was, as intended, unsustainable)."
+else
+  echo "  [!] smoke-openloop: 0 dropped_iterations at RATE=5000 -- the open-loop executor did not detect the overload. Investigate before trusting the real suite's own open-loop checks." >&2
+fi
+
+# No reason for this to survive past this script -- table7's phase-based exclusion
+# is defense in depth, not a reason to leave a stale artifact in ../results/.
+rm -f ../results/openloop_28_smoke.json
+
 echo "[*] Smoke test 3/4: ablation slice -- exercises the cpuset arm's multi-range values"
 # The cpuset arm is the one whose cell values are cpuset strings rather than integers,
 # so it is the arm that catches a parsing regression in analyze-ablation.py.
@@ -44,7 +72,8 @@ echo "[+] Smoke test complete. Before trusting this run, check:"
 echo "    ../results/run_failures_log.txt and ../results/ablation_run_failures_log.txt (both empty)"
 echo "    ../results/cpu_pin_check_log.txt, incl. the smt_check line"
 echo "    ../results/env_trace_log.txt"
-echo "    table7_openloop_validity_check shows Dropped iterations > 0 for the smoke-openloop cell"
+echo "    the [+]/[!] smoke-openloop line printed above (dropped_iterations at RATE=5000);"
+echo "    table7 itself will not show this cell -- it excludes phase=smoke-openloop on purpose"
 echo "    table_ablation_decomposition lists both cpuset values, ordered by core count"
 echo ""
 echo "    Expected here: table0 is skipped as empty. Its convergence check needs 300+"

@@ -298,6 +298,57 @@ def test_dropped_iterations_outside_openloop_are_reported(tmp_path, capsys):
     assert "dropped in non-open-loop cell" in out and "warmup_baseline_rep1" in out
 
 
+def _openloop_rows(source_file, phase, rate, tier, n_ok, n_dropped, rep="1"):
+    """N http_req_duration=200 points (tagged, as sendTransaction() sets them) plus
+    N untagged dropped_iterations points (as k6 actually emits them -- no phase/rate/tier,
+    since an unexecuted iteration never reaches http.post())."""
+    rows = []
+    for _ in range(n_ok):
+        rows.append({"metric": "http_req_duration", "value": 10.0, "status": "200",
+                     "phase": phase, "tier": tier, "rate": rate, "rep": rep,
+                     "vus": np.nan, "source_file": source_file,
+                     "time": pd.Timestamp("2026-01-01T00:00:00Z")})
+    for _ in range(n_dropped):
+        rows.append({"metric": "dropped_iterations", "value": 1.0, "status": np.nan,
+                     "phase": np.nan, "tier": np.nan, "rate": np.nan, "rep": np.nan,
+                     "vus": np.nan, "source_file": source_file,
+                     "time": pd.Timestamp("2026-01-01T00:00:00Z")})
+    return rows
+
+
+def test_openloop_check_excludes_smoke_test_artifact(tmp_path, capsys):
+    """run-smoke-test.sh's deliberately-unsustainable RATE=5000 cell (phase=smoke-openloop)
+    must never be reported as a real table7 validity check."""
+    rows = _openloop_rows("openloop_28_smoke.json", "smoke-openloop", "5000", "28",
+                           n_ok=10, n_dropped=80)
+    df = pd.DataFrame(rows)
+    results.analyze_openloop_check(df, str(tmp_path))
+    out = capsys.readouterr().out
+    assert "excluded 10 smoke-test open-loop point" in out
+    assert not (tmp_path / "tables" / "table7_openloop_validity_check.csv").exists()
+
+
+def test_openloop_check_reports_real_check_without_smoke_contamination(tmp_path, capsys):
+    """A real check (phase=openloop-check) alongside a leftover smoke file for the same
+    tier must be reported on its own -- not pooled with, and not replaced by, the smoke
+    cell's drop count."""
+    rows = (_openloop_rows("openloop_28_smoke.json", "smoke-openloop", "5000", "28",
+                            n_ok=10, n_dropped=80)
+            + _openloop_rows("openloop_28_rate32.json", "openloop-check", "32", "28",
+                              n_ok=20, n_dropped=1))
+    df = pd.DataFrame(rows)
+    results.analyze_openloop_check(df, str(tmp_path))
+    out = capsys.readouterr().out
+    assert "excluded 10 smoke-test open-loop point" in out
+
+    table = pd.read_csv(tmp_path / "tables" / "table7_openloop_validity_check.csv")
+    ol_rows = table[table["Model"].str.startswith("Open-loop")]
+    assert len(ol_rows) == 1
+    assert ol_rows.iloc[0]["Model"] == "Open-loop (rate=32/s)"
+    assert ol_rows.iloc[0]["Dropped iterations"] == 1
+    assert ol_rows.iloc[0]["N"] == 20
+
+
 def test_between_run_sd_is_not_estimable_from_one_rep():
     """0.0 would read as perfect consistency rather than "not estimable"."""
     one = pd.DataFrame([{"metric": "m", "phase": "baseline", "tier": "v5",

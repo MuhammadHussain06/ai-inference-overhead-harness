@@ -1347,33 +1347,60 @@ def analyze_gc_logs(results_dir, output_dir):
 
 def analyze_openloop_check(df, output_dir):
     # Compares manual open-loop checks against closed-loop scans per tier, skipping silently if no open-loop files are present.
-    ol = df[df["source_file"].str.startswith("openloop") & (df["metric"] == "http_req_duration") &
-            (df["status"] == "200")]
+    #
+    # run-smoke-test.sh's own open-loop cell (openloop_28_smoke.json) lands in this same
+    # results dir at a deliberately unsustainable RATE=5000, to prove dropped_iterations
+    # fires before trusting a real run. Excluded by phase=="smoke-openloop" (the tag
+    # run-target-openloop.js sets from PHASE; a real manual check defaults to
+    # "openloop-check") rather than by filename, so a leftover smoke artifact is never
+    # reported as a real validity check.
+    ol_all = df[df["source_file"].str.startswith("openloop", na=False) & (df["metric"] == "http_req_duration") &
+                (df["status"] == "200")]
+    ol = ol_all[ol_all["phase"] != "smoke-openloop"]
+
+    n_smoke_pts = int((ol_all["phase"] == "smoke-openloop").sum())
+    if n_smoke_pts:
+        print(f"[!] table7: excluded {n_smoke_pts} smoke-test open-loop point(s) "
+              f"(phase=smoke-openloop) -- that cell is a deliberate RATE overload to "
+              f"prove dropped_iterations fires, not a real validity check.")
+
     if ol.empty:
         return
 
-    dropped = df[df["source_file"].str.startswith("openloop") & (df["metric"] == "dropped_iterations")]
+    dropped_all = df[df["source_file"].str.startswith("openloop", na=False) & (df["metric"] == "dropped_iterations")]
 
-    # dropped_iterations lacks per-request tier tags as unexecuted iterations miss http.post().
-    # Attributes drops via source_file (openloop_<tier>_*.json) using http_req_duration tags.
-    file_tier = ol.groupby("source_file", observed=True)["tier"].first()
-    dropped_by_file = dropped.groupby("source_file", observed=True)["value"].sum()
+    # dropped_iterations lacks per-request tags (phase/rate/tier) as unexecuted
+    # iterations miss http.post() entirely -- k6 only ever tags it with scenario="run".
+    # Attributes drops via source_file (openloop_<tier>_*.json) using the tier/rate/phase
+    # every http_req_duration point in that same file actually carries.
+    file_meta = ol_all.groupby("source_file", observed=True)[["tier", "rate", "phase"]].first()
+    dropped_by_file = dropped_all.groupby("source_file", observed=True)["value"].sum()
 
     # Converts categorical indices to strings before reindexing to prevent Cython crashes caused by differing internal code widths.
-    file_tier.index = file_tier.index.astype(str)
+    file_meta.index = file_meta.index.astype(str)
     dropped_by_file.index = dropped_by_file.index.astype(str)
+    # A smoke file's dropped_iterations points carry no phase of their own (see above),
+    # so they're excluded the same way file_meta's own phase says they should be.
+    smoke_files = set(file_meta.index[file_meta["phase"] == "smoke-openloop"])
 
     rows = []
     for tier in sorted(ol["tier"].dropna().unique(), key=lambda t: TIER_ORDER.index(t) if t in TIER_ORDER else 99):
-        ol_stats = summarize(ol[ol["tier"] == tier], f"{_tier_label(tier)} open-loop")
-        if not ol_stats:
-            continue
-        tier_files = file_tier[file_tier == tier].index
-        dropped_count = int(dropped_by_file.reindex(tier_files, fill_value=0).sum())
-        rows.append({"Tier": _tier_label(tier), "Model": "Open-loop (constant-arrival-rate)",
-                     "P95 (ms)": ol_stats["P95 (ms)"], "P99 (ms)": ol_stats["P99 (ms)"],
-                     "N": ol_stats["N (pooled, all reps)"],
-                     "Dropped iterations": str(dropped_count)})
+        # Grouping by rate too, not just tier: two open-loop files for the same tier at
+        # different RATEs are two different checks, not one pooled sample -- pooling
+        # them would silently average a sustainable rate together with an unsustainable
+        # one instead of showing both.
+        for rate in sorted(ol.loc[ol["tier"] == tier, "rate"].dropna().unique(), key=lambda r: float(r)):
+            ol_cell = ol[(ol["tier"] == tier) & (ol["rate"] == rate)]
+            ol_stats = summarize(ol_cell, f"{_tier_label(tier)} open-loop rate={rate}")
+            if not ol_stats:
+                continue
+            cell_files = file_meta[(file_meta["tier"] == tier) & (file_meta["rate"] == rate)].index
+            cell_files = [f for f in cell_files if f not in smoke_files]
+            dropped_count = int(dropped_by_file.reindex(cell_files, fill_value=0).sum())
+            rows.append({"Tier": _tier_label(tier), "Model": f"Open-loop (rate={rate}/s)",
+                         "P95 (ms)": ol_stats["P95 (ms)"], "P99 (ms)": ol_stats["P99 (ms)"],
+                         "N": ol_stats["N (pooled, all reps)"],
+                         "Dropped iterations": str(dropped_count)})
 
         # Compare against the top of whatever concurrency sweep this run actually used.
         scan_levels = sorted(int(v) for v in df.loc[df["phase"] == "scan", "vus"].dropna().unique())
@@ -1395,7 +1422,8 @@ def analyze_openloop_check(df, output_dir):
     save_table(table, "table7_openloop_validity_check", output_dir,
                caption="Open-loop (constant-arrival-rate) tail latency vs. the closed-loop scan at "
                        "VUS 32/64, for manually-checked tiers. Validates the concurrency scan against "
-                       "coordinated omission; not part of the automated suite.",
+                       "coordinated omission; not part of the automated suite. Smoke-test artifacts "
+                       "(phase=smoke-openloop) are excluded regardless of how many are present.",
                label="tab:openloop-validity")
 
     fig, ax = plt.subplots(figsize=(6, 4), dpi=300)
