@@ -16,7 +16,7 @@ set -euo pipefail
 # (the main-suite condition); pass all four to reproduce an ablation arm.
 # WARMUP_WINDOW_OVERRIDE / WARMUP_TOL_OVERRIDE / WARMUP_ABS_FLOOR_OVERRIDE
 # widen the checkpoint window, tolerance, or absolute floor beyond table0's
-# WARMUP_WINDOW=100 / WARMUP_TAIL_TOLERANCE_PCT=5.0 /
+# WARMUP_WINDOW=500 / WARMUP_TAIL_TOLERANCE_PCT=5.0 /
 # WARMUP_TAIL_ABS_FLOOR_MS=0.25, to check whether the production window is
 # noise-dominated at a target's steady-state per-request variance.
 #
@@ -46,12 +46,12 @@ TOKENS="${7:-40}"
 MAX_CHUNKS="${8:-20}"
 CHUNK_DURATION_S="${9:-15}"
 
-WINDOW="${WARMUP_WINDOW_OVERRIDE:-100}"
+WINDOW="${WARMUP_WINDOW_OVERRIDE:-500}"
 TOL="${WARMUP_TOL_OVERRIDE:-5.0}"
 ABS_FLOOR_MS="${WARMUP_ABS_FLOOR_OVERRIDE:-0.25}"
 
-COMPOSE_FILE="../docker-compose.yml"
-RESULTS_DIR="../results/probes"
+COMPOSE_FILE="../../docker-compose.yml"
+RESULTS_DIR="../../results/probes"
 RAW_RESULTS_DIR="${RESULTS_DIR}/raw"
 mkdir -p "$RESULTS_DIR" "$RAW_RESULTS_DIR"
 

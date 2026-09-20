@@ -1,29 +1,25 @@
 """
-Diagnostic tool from the thermal-throttling investigation: overlays rolling
-P50 latency against active VUs, package temp, and core frequency, so a
-suspected throttle signature (temp pegged near the ceiling, frequency
-dropping, latency climbing) is actually visible against the load, not just
-inferred from temp alone.
+Thermal-throttling diagnostic: overlays rolling P50 latency against active
+VUs, package temp, and core frequency, so a throttle signature (temp at the
+ceiling, frequency dropping, latency climbing) can be read against the load
+rather than inferred from temp alone.
 
-Works on warmup_*.json (the multi-tier diagnostic probe) and
-baseline_*/scan_*.json (single-tier real cells) the same way, since the
-real question was whether throttling shows up at real cell durations or
-only in the artificially long probe.
+Handles warmup_*.json (the multi-tier diagnostic probe) and baseline_*.json /
+scan_*.json (single-tier real cells) identically, so throttling at real cell
+durations is comparable with throttling in the longer probe.
 
 --thermal-log takes a `sensors`-polling log (package temp only).
---turbostat-log takes a `turbostat` log (temp + Bzy_MHz frequency, the
-actual evidence for throttling rather than a temp proxy). If both are
-given, turbostat's temp reading wins.
+--turbostat-log takes a `turbostat` log (temp + Bzy_MHz frequency, direct
+evidence of throttling rather than a temp proxy). If both are given,
+turbostat's temp reading wins.
 
 Log format for both: timestamped blocks from a polling loop --
 
     === 2026-09-15T12:34:56.789Z ===
     <sensors or turbostat output for that tick>
 
-One log gets reused across every plotted file (collected continuously for
-the whole suite run), so each file's temp/freq points are clipped to its
-own time window first -- otherwise a short real cell's few seconds of data
-disappear against the log's full multi-hour span.
+One log covers a whole suite run, so each file's temp/freq points are clipped
+to that file's own time window before plotting (see _clip_to_window).
 
 Usage:
     python3 plot_warmup_curve.py [--results-dir ../results] [--output-dir .] \
@@ -55,8 +51,8 @@ def _intern_tag(v):
 
 def load_file(fp):
     """tier -> {time, value} for http_req_duration, plus the vus series.
-    No phase filter -- each results file is already one phase by
-    construction, which is what lets warmup/baseline/scan share a loader."""
+    No phase filter -- each results file holds a single phase by
+    construction, so warmup/baseline/scan share one loader."""
     by_tier = {}
     vus_time, vus_value = [], []
     with open(fp) as f:
@@ -160,9 +156,9 @@ def _drop_none(times, values):
 
 def _clip_to_window(times, values, window_start, window_end):
     """Restricts a continuously-collected thermal/turbostat log to one
-    file's own time span. Without this a short real cell's few seconds of
-    data get lost against the log's full multi-hour range -- the x-axis
-    stretches to fit the log and the P50 line collapses to a sliver."""
+    file's own time span. The temp/freq axes twin the latency axis, so an
+    unclipped multi-hour log stretches the shared x-axis and collapses a
+    short cell's P50 line to a sliver."""
     if not times:
         return [], []
     t = pd.to_datetime(times, format="ISO8601", utc=True)
@@ -215,8 +211,8 @@ def plot_file(fp, output_dir, window, thermal_log=None, turbostat_log=None):
         ax2.set_ylabel("active VUs")
         ax2.legend(loc="upper right", fontsize=8)
 
-    # turbostat's temp wins over sensors' when both are given, so there's
-    # never two competing temp lines on the same plot.
+    # turbostat's temp supersedes sensors' when both logs are given, so the
+    # plot never carries two competing temp lines.
     temp_times = temp_values = None
     freq_times = freq_values = None
     if turbostat_log:
@@ -225,7 +221,7 @@ def plot_file(fp, output_dir, window, thermal_log=None, turbostat_log=None):
         freq_times, freq_values = _drop_none(t_times, t_freqs)
         temp_times, temp_values = _clip_to_window(temp_times, temp_values, window_start, window_end)
         freq_times, freq_values = _clip_to_window(freq_times, freq_values, window_start, window_end)
-        if not temp_times and not freq_values:
+        if not temp_times and not freq_times:
             print(f"[!] Turbostat log {turbostat_log} had no readings inside {name}'s own "
                   f"time window (+/-{buffer_s:.0f}s) -- log likely doesn't cover when this file ran.")
     elif thermal_log:

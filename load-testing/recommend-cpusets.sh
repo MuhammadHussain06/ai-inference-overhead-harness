@@ -90,4 +90,4 @@ for svc in "python-service:${PY_WIDE}" "transaction-service:${JAVA}" "k6:${K6}";
   verify_service_cpuset "self-check" "${svc%%:*}" "${svc#*:}" "$(topo_count_cpus "${svc#*:}")" > /dev/null
 done
 echo ""
-echo "# Self-check: every cpuset above owns whole physical cores and none overlap."
+echo "# Self-check: every cpuset above owns whole physical cores; the blocks are disjoint by construction."

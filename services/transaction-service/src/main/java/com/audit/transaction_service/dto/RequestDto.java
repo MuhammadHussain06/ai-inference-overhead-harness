@@ -35,8 +35,9 @@ public class RequestDto {
     @NotNull(message = "strategy is required")
     private String strategy;
 
-    // Feature-count tier for the AI strategy: one of 5, 10, 20, 28.
-    // Ignored for DISTRIBUTED_MOCK_GATEWAY.
+    // Required by DISTRIBUTED_AI_SYNCHRONOUS and checked against the tiers
+    // FeatureTierRegistry reads from fraud-ml-service, so no tier list is pinned
+    // here. Ignored by the two baseline strategies.
     private Integer featureTier;
 
     public RequestDto() {}

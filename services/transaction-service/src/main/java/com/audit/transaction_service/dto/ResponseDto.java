@@ -24,8 +24,8 @@ public class ResponseDto {
 
     private String strategy;
 
-    // Number of features (V1..Vn) the scoring model actually used. Null for
-    // DISTRIBUTED_MOCK_GATEWAY
+    // Number of features (V1..Vn) the scoring model actually used. Null for the
+    // mock-gateway and calibration-only strategies, which score nothing.
     private Integer featureTier;
 
     public ResponseDto() {}
@@ -83,8 +83,8 @@ public class ResponseDto {
     public Integer getFeatureTier() { return featureTier; }
     public void setFeatureTier(Integer featureTier) { this.featureTier = featureTier; }
 
-    // Also deserialized from fraud-ml-service's response; unknown fields are
-    // ignored so new Python-side telemetry cannot break the upstream call.
+    // Also deserialized from fraud-ml-service's response, so unknown fields are
+    // ignored: a new Python-side telemetry field must not break the upstream call.
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class PythonTelemetryDto {
         private double parsingRequestTimeMs = 0.0;

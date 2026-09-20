@@ -15,10 +15,9 @@ import java.util.Map;
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
-    // Handles three 400 Bad Request envelope formats:
-    // - WebExchangeBindException ("Validation Failed"): Field-level bean validation errors with a field->message map.
-    // - IllegalArgumentException ("Bad Request"): Cross-field business rule failures with a single message string.
-    // - ServerWebInputException ("Malformed Request"): Unparseable/mistyped JSON body, caught here to prevent fall-through to generic 500 error handling.
+    // Unparseable or mistyped JSON body. Handled explicitly because
+    // ServerWebInputException is a RuntimeException: without this it would fall
+    // through to the handler below and be reported as a 500.
     @ExceptionHandler(ServerWebInputException.class)
     public ResponseEntity<ErrorResponseDto> handleServerWebInputException(ServerWebInputException ex) {
         ErrorResponseDto response = new ErrorResponseDto(

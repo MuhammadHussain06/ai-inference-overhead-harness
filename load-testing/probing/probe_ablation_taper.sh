@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Standalone probe -- NOT wired into run-ablation.sh. Checks whether ablation
-# cells, fixed at TARGET=28 VUS=64 ITERATIONS_PER_VU=100 (the exact
-# combination independently measured at -75% raw / -47% trimmed drift in the
-# main scan), show the same per-vu-iterations wind-down contamination here,
-# and whether extending cell duration fixes it under this arm's real
-# processing capacity. Each ablation arm genuinely changes python-service's
-# throughput by design, so this has to be checked per config, not assumed
-# from the main scan's tier=28 numbers alone.
+# cells, fixed at TARGET=28 VUS=64 ITERATIONS_PER_VU=100, suffer the same
+# per-vu-iterations wind-down contamination the main scan shows at that
+# combination, and whether a longer cell fixes it under this arm's real
+# processing capacity. Each ablation arm changes python-service's throughput by
+# design, so this has to be measured per config, not carried over from the main
+# scan's tier=28 numbers.
 #
 # Usage: ./probe_ablation_taper.sh LABEL CPUSET CPUS WORKERS TOKENS [TARGET_DURATION_S]
 set -euo pipefail
@@ -18,8 +17,10 @@ WORKERS="${4:?workers required}"
 TOKENS="${5:?tokens required}"
 TARGET_DURATION_S="${6:-60}"
 
-COMPOSE_FILE="../docker-compose.yml"
-RESULTS_DIR="../results"
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+COMPOSE_FILE="../../docker-compose.yml"
+RESULTS_DIR="../../results"
 TARGET=28
 VUS=64
 SHORT_ITER_PER_VU=100   # matches the real ablation cell exactly

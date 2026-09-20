@@ -5,9 +5,9 @@ contention via process count) drives Thread Dispatch time at VUS=64.
 
 Each arm holds the other mechanisms at their control value and sweeps one.
 Rep-level stats use the same cluster-bootstrap and Mann-Whitney approach
-as analyze-results.py, applied to one pairwise comparison per arm
-(control vs. its most extreme value) rather than a full pairwise grid,
-since each arm has an a priori ordered sweep.
+as analyze-results.py, applied to one pairwise comparison per arm (the
+sweep's two endpoints) rather than a full pairwise grid, since each arm
+has an a priori ordered sweep.
 
 Usage:
     python3 analyze-ablation.py [--results-dir ../results] [--output-dir ./output]
@@ -42,8 +42,9 @@ METRICS = {
     "python_total_time_ms": "Total",
 }
 
-# ablation_<arm>_<value>_rep<N>.json[.gz]. Gating on a known arm also rejects
-# ablation_warmup_* and ablation_run_metadata.json, which share the prefix.
+# ablation_<arm>_<value>_rep<N>.json[.gz]. The _rep<N> suffix already rejects
+# ablation_run_metadata.json; gating on a known arm additionally rejects
+# ablation_warmup_*, which otherwise parses with arm='warmup_<arm>'.
 CELL_FILE_RE = re.compile(r"^ablation_(?P<arm>[a-z_]+)_(?P<value>[^_]+)_rep(?P<rep>\d+)\.json(\.gz)?$")
 
 # ablation_warmup_<arm>_<value>_rep<N>.json[.gz]. The warm-up call itself carries no
@@ -51,15 +52,16 @@ CELL_FILE_RE = re.compile(r"^ablation_(?P<arm>[a-z_]+)_(?P<value>[^_]+)_rep(?P<r
 # cell a warm-up file belongs to comes from its filename, same as CELL_FILE_RE.
 WARMUP_FILE_RE = re.compile(r"^ablation_warmup_(?P<arm>[a-z_]+)_(?P<value>[^_]+)_rep(?P<rep>\d+)\.json(\.gz)?$")
 
-# The one configuration every arm holds as its control, so the cells that
-# realize it can be cross-checked against each other.
+# The shared control configuration, keyed by the arm_value whose cell realizes
+# it, so those cells can be cross-checked against each other. workers_token_matched
+# has no entry: its 3-worker cell rescales tokens to 13, so it is a different
+# configuration.
 CONTROL_CELL = {"thread_limiter": "40", "cpuset": "0-1,4-5,8-9", "workers": "3"}
 
-# Same safety net as analyze-results.py's load_results(), sized identically for
-# consistency. Ablation cells are fixed at a real model-inference tier and keep
-# only 3 metrics, so they haven't approached this in practice, but nothing rules
-# out an arm/value combination someday raising throughput enough to matter --
-# cheap to guard against and a no-op for every file already under the cap.
+# Same per-file cap as analyze-results.py's load_results(), sized identically so
+# both loaders behave alike. Ablation cells sit at one model-inference tier and
+# keep 3 metrics, so the cap is normally slack; it bounds memory if an arm/value
+# combination ever raises throughput enough to reach it.
 MAX_POINTS_PER_FILE = 250_000
 
 
@@ -138,11 +140,11 @@ def load_ablation_cells(results_dir):
                     "arm_value": _intern_tag(tags.get("arm_value")),
                     "rep": _intern_tag(tags.get("rep", "1")),
                 }
-                # Algorithm R: first MAX_POINTS_PER_FILE rows always kept; each row
-                # after that replaces a uniformly random existing slot with probability
-                # MAX_POINTS_PER_FILE/n_seen, keeping every row seen so far equally
-                # likely to end up in the final sample. No counter metric lives in
-                # METRICS, so nothing here needs an always-keep exemption.
+                # Algorithm R: the first MAX_POINTS_PER_FILE rows are always kept; each
+                # later row replaces a uniformly random slot with probability
+                # MAX_POINTS_PER_FILE/n_seen, leaving every row seen equally likely to
+                # survive. No counter metric is in METRICS, so no row needs an
+                # always-keep exemption.
                 n_seen += 1
                 if n_seen <= MAX_POINTS_PER_FILE:
                     file_rows.append(row)
@@ -234,9 +236,10 @@ def build_decomposition_table(df):
 def build_control_agreement_table(df, metric="python_thread_dispatch_time_ms"):
     """Compares the cells that realize the shared control configuration.
 
-    Every arm holds the other mechanisms at CONTROL_CELL, so those cells are
-    repeated measurements of one configuration. Disagreement between them is
-    drift or an order effect rather than the manipulated factor.
+    The arms named in CONTROL_CELL each hold the other mechanisms at that
+    configuration, so those cells are repeated measurements of one setup.
+    Disagreement between them is drift or an order effect rather than the
+    manipulated factor.
     """
     rows = []
     for arm, value in CONTROL_CELL.items():
@@ -260,7 +263,9 @@ def build_control_agreement_table(df, metric="python_thread_dispatch_time_ms"):
 
 
 def control_vs_extreme_test(df, metric="python_thread_dispatch_time_ms"):
-    """Rep-level Mann-Whitney, control value vs. the arm's most extreme value.
+    """Rep-level Mann-Whitney between the endpoints of each arm's ordered sweep:
+    lowest- against highest-sorting arm_value. For cpuset, workers and
+    workers_token_matched the low endpoint is not the CONTROL_CELL value.
     One planned comparison per arm, so no multiple-comparison correction applies."""
     rows = []
     for arm in sorted(df["arm"].unique()):
@@ -360,10 +365,15 @@ def plot_ablation(df, output_dir):
     print(f"[+] Figure -> {figures_dir}/figure_ablation_mechanisms.png / .pdf")
 
 
-def build_ablation_warmup_table(results_dir, window_size=100, tail_tolerance_pct=5.0):
+def build_ablation_warmup_table(results_dir, window_size=500, tail_tolerance_pct=5.0,
+                                tail_abs_floor_ms=0.25):
     """Per-cell warm-up convergence check -- same criterion as analyze-results.py's
-    table0 (last window vs. the one before it, converged if drift < tail_tolerance_pct).
-    Runs against ablation_warmup_* files, which load_ablation_cells() never touches.
+    table0 (last window vs. the one before it, converged if the absolute gap is under
+    tail_abs_floor_ms or the drift is under tail_tolerance_pct).
+    Reads ablation_warmup_* files, which load_ablation_cells() never touches.
+    The three parameters mirror run-ablation.sh's WARMUP_WINDOW /
+    WARMUP_TAIL_TOLERANCE_PCT / WARMUP_TAIL_ABS_FLOOR_MS so this table reports the
+    same verdict the live gate acted on.
     """
     files = sorted(
         glob.glob(os.path.join(results_dir, "ablation_warmup_*.json"))
@@ -404,7 +414,9 @@ def build_ablation_warmup_table(results_dir, window_size=100, tail_tolerance_pct
         p50_last = float(np.percentile(values[-window_size:], 50))
         total_drift = 100 * (p50_last - p50_first) / p50_first if p50_first else np.nan
         tail_drift = 100 * (p50_last - p50_prev) / p50_prev if p50_prev else np.nan
-        converged = not np.isnan(tail_drift) and abs(tail_drift) < tail_tolerance_pct
+        converged = not np.isnan(tail_drift) and (
+            abs(p50_last - p50_prev) < tail_abs_floor_ms or abs(tail_drift) < tail_tolerance_pct
+        )
         rows.append({
             "Arm": ARM_LABELS.get(arm, arm), "Value": value, "Rep": rep,
             "N Requests": len(points),
@@ -413,11 +425,12 @@ def build_ablation_warmup_table(results_dir, window_size=100, tail_tolerance_pct
             f"Last {window_size} P50 (ms)": round(p50_last, 3),
             "Total drift (%)": round(total_drift, 1) if not np.isnan(total_drift) else np.nan,
             "Tail drift (%)": round(tail_drift, 1) if not np.isnan(tail_drift) else np.nan,
-            f"Converged (tail <{tail_tolerance_pct:g}%)": "YES" if converged else "no",
+            f"Converged (tail <{tail_tolerance_pct:g}% or <{tail_abs_floor_ms:g}ms)":
+                "YES" if converged else "no",
         })
     table = pd.DataFrame(rows)
     if not table.empty:
-        converged_col = f"Converged (tail <{tail_tolerance_pct:g}%)"
+        converged_col = f"Converged (tail <{tail_tolerance_pct:g}% or <{tail_abs_floor_ms:g}ms)"
         n_failed = int((table[converged_col] == "no").sum())
         if n_failed:
             print(f"[!] {n_failed}/{len(table)} ablation warm-up windows had not converged at "
@@ -448,16 +461,19 @@ def main():
                label="tab:ablation-warmup-convergence")
 
     df = load_ablation_cells(args.results_dir)
-    if df is None:
-        print(f"[!] No ablation_*.json cell files found in {args.results_dir}. Run run-ablation.sh first.")
+    # An all-dropped frame reaches plot_ablation() as zero arms, which plt.subplots()
+    # rejects; bail here so a file set with no usable points reports rather than raises.
+    if df is None or df.empty:
+        print(f"[!] No usable ablation_*.json cell points found in {args.results_dir}. "
+              f"Run run-ablation.sh first.")
         return
 
     n_reps = df["rep"].nunique()
     print(f"[*] Loaded {len(df)} metric points across {df['arm'].nunique()} arm(s), {n_reps} rep(s).")
 
     # Both headline outputs are rep-level: the CIs resample whole reps and the
-    # significance test ranks per-rep means. Saying so up front beats emitting a
-    # table of NaN CIs and an empty test table with no explanation.
+    # significance test ranks per-rep means, so too few reps yields NaN CIs and an
+    # empty test table rather than an error.
     if n_reps < 2:
         print(f"[!] Only {n_reps} rep detected. Bootstrap CIs cannot be computed and no "
               f"significance test can run. This output is a pipeline check, not a result.")

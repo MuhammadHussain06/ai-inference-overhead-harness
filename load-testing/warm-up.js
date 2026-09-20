@@ -1,13 +1,13 @@
 import { sendTransaction, TARGETS } from './lib/common.js';
 
 // Warms JIT tiers, connection pools, and OS/network buffers past compilation
-// thresholds. Defaults to constant-vus: every VU runs for a fixed wall-clock
-// duration and all stop together, so no VU finishes early and tapers
-// concurrency down near the end of a chunk -- which would otherwise read as
-// still-cooling latency to a tail-window convergence check. Passing
+// thresholds. Defaults to constant-vus with gracefulStop: '0s' -- every VU is cut
+// at DURATION_S rather than draining individually, since a staggered drain thins
+// concurrency during the grace window and reads as fast, "converged" latency to a
+// tail-window convergence check when it is really just fewer VUs contending.
 // WARMUP_ITERATIONS_PER_TARGET selects a fixed-count per-vu-iterations pass
-// instead, for callers (smoke tests) that want a fast, deterministic run and
-// don't check the tail.
+// instead, for smoke tests that want a fast, deterministic run and don't check
+// the tail.
 
 const VUS = parseInt(__ENV.WARMUP_VUS || '5', 10);
 const MAX_DURATION_S = parseInt(__ENV.WARMUP_MAX_DURATION_S || '60', 10);
@@ -25,7 +25,10 @@ let scenarioFor;
 if (USE_ITERATIONS) {
     const ITERATIONS_PER_TARGET = parseInt(ITERATIONS_PER_TARGET_RAW, 10);
     const ITERATIONS_PER_VU = Math.max(1, Math.ceil(ITERATIONS_PER_TARGET / VUS));
-    // Adds buffer beyond MAX_DURATION_S to prevent target VU execution overlap between warmup windows.
+    // Buffer past MAX_DURATION_S so the next target's scenario doesn't overlap this
+    // one's. Holds while iterations finish inside MAX_DURATION_S; a run actually
+    // capped by maxDuration would drain into k6's default 30s gracefulStop, which is
+    // longer than this buffer.
     SLOT_S = MAX_DURATION_S + 5;
     scenarioFor = (key, i) => ({
         executor: 'per-vu-iterations',
@@ -37,15 +40,13 @@ if (USE_ITERATIONS) {
     });
 } else {
     const DURATION_S = parseInt(__ENV.WARMUP_DURATION_S || '15', 10);
-    // gracefulStop lets in-flight requests finish instead of cutting them off at
-    // DURATION_S; SLOT_S budgets for that on top of the run itself so the next
-    // target's scenario never overlaps this one's tail.
+    // Buffer past DURATION_S so the next target's scenario can't overlap this one's.
     SLOT_S = DURATION_S + 10;
     scenarioFor = (key, i) => ({
         executor: 'constant-vus',
         vus: VUS,
         duration: `${DURATION_S}s`,
-        gracefulStop: '5s',
+        gracefulStop: '0s',
         startTime: `${i * SLOT_S}s`,
         exec: `warm_${key}`,
     });

@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Host-state provenance for run_metadata.json: kernel CPU isolation, power source,
-# and IRQ balancing. All three change measured latency without appearing anywhere in
-# the harness's own configuration, so a run that cannot be compared against another
-# is otherwise indistinguishable from one that can.
+# Host-state provenance for run_metadata.json: kernel CPU isolation, power source, and
+# IRQ balancing. All three shift measured latency without appearing anywhere in the
+# harness's own configuration, so without them two runs look comparable when they are not.
 #
-# Warn-only by design. Each setting has a defensible reason to be either way on a
-# given host, so the harness records what it found and leaves the choice to the
-# operator; only conditions that invalidate a measurement outright abort a run.
+# Recorded, never enforced: each setting has a defensible value either way on a given
+# host, so the operator decides. Only conditions that invalidate a measurement outright
+# abort a run.
 
 # Reports the kernel's live view of isolated CPUs alongside the boot parameter that
 # requested them. The two disagree when isolcpus names CPUs that do not exist, so
@@ -24,9 +23,9 @@ isolcpus_state() {
   printf '%s|%s' "${live:-none}" "${cmdline:-none}"
 }
 
-# Distinguishes mains power from battery. Laptops throttle sustained clocks on
-# battery regardless of the governor, which shows up as a mid-suite latency drift
-# that the env trace alone attributes to the wrong cause.
+# Distinguishes mains power from battery. Laptops throttle sustained clocks on battery
+# regardless of the governor, and the env trace's governor/frequency samples alone
+# attribute the resulting mid-suite drift to the wrong cause.
 power_source_state() {
   local type_file supply online
   for type_file in /sys/class/power_supply/*/type; do

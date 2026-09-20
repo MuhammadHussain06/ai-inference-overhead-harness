@@ -38,8 +38,9 @@ if [ "${TOPO_SYSFS_ROOT:-/sys}" != "/sys" ]; then
   exit 1
 fi
 
-# Warns on WSL2: cgroup cpuset checks pass, but Hyper-V host core migration is unobservable.
-# Non-blocking; flags warning and records status in run_metadata.json.
+# On WSL2 the cgroup cpuset checks pass but Hyper-V host core migration is
+# unobservable, so pinning cannot actually be confirmed. Non-blocking; recorded
+# in run_metadata.json.
 IS_WSL2="false"
 if grep -qi microsoft /proc/version 2>/dev/null; then
   IS_WSL2="true"
@@ -62,8 +63,9 @@ RAW_RESULTS_DIR="${RESULTS_DIR}/raw"
 rm -rf "$RAW_RESULTS_DIR"
 mkdir -p "$RESULTS_DIR" "$RESULTS_DIR/gc-logs" "$RAW_RESULTS_DIR"
 
-# Timestamp-archives prior cell logs, JSON metrics, and GC output outside
-# of RESULTS_DIR to prevent non-recursive analysis glob collisions.
+# Moves a prior run's cell logs, JSON metrics and GC output into a timestamped
+# subdirectory. The analysis scripts glob RESULTS_DIR non-recursively, so anything
+# left at its top level would be read as part of this run.
 if compgen -G "${RESULTS_DIR}/*.json" > /dev/null 2>&1 || compgen -G "${RESULTS_DIR}/*.json.gz" > /dev/null 2>&1 \
     || [ -f "${RESULTS_DIR}/run_order_log.txt" ]; then
   ARCHIVE_DIR="${RESULTS_DIR}/archive/$(date +%Y%m%d_%H%M%S)"
@@ -117,50 +119,46 @@ for _lvl in "${CONCURRENCY_LEVELS[@]}"; do
   if [ "$_lvl" -gt "$MAX_VUS" ]; then MAX_VUS="$_lvl"; fi
 done
 BASELINE_ITERATIONS="${BASELINE_ITERATIONS_OVERRIDE:-500}"
-# Flat fallback for VUS 1/2/4 -- drift stays within noise at this default.
-# VUS 8/16/32/64 get a per-tier, per-rep calibrated value instead -- see
-# calibrate_target() below.
+# Flat fallback for the concurrency levels outside CALIB_AFFECTED_LEVELS (1/2/4
+# by default), where too few VUs are in flight for the end-of-cell taper to
+# matter. The rest get a per-target, per-rep calibrated value -- see
+# calibrate_target().
 SCAN_ITERATIONS_PER_VU="${SCAN_ITERATIONS_PER_VU_OVERRIDE:-100}"
 
 # per-vu-iterations runs each VU to a fixed iteration count independent of the
 # others, so VUs finish at slightly different wall-clock times and effective
-# concurrency tapers off near the end. That taper's absolute duration is
-# roughly fixed regardless of cell length, so a short cell spends a larger
-# fraction of its length in the taper than a long one. Retargeting VUS
-# 8/16/32/64's iteration counts to hit a fixed wall-clock duration keeps the
-# taper a small, fixed-size tail instead of most of the cell. Recalibrated
-# every rep since per-rep throughput varies enough to matter.
+# concurrency tapers off near the end of a cell. That taper's absolute duration
+# is roughly fixed regardless of cell length, so a short cell spends a larger
+# fraction of itself in it. Retargeting CALIB_AFFECTED_LEVELS' iteration counts
+# to a fixed wall-clock duration keeps the taper a small tail instead of most of
+# the cell. Recalibrated every rep because per-rep throughput varies.
 CALIB_VUS=16
 CALIB_ITER_PER_VU=2000
 CALIB_TARGET_DURATION_S=60
 CALIB_AFFECTED_LEVELS="8 16 32 64"
 declare -A CALIB_ITERATIONS_PER_VU
 
-# Metrics analyze-results.py actually reads (verified by grepping every metric
-# name comparison in it). k6's raw trail carries roughly twice this many --
-# the http_req_* sub-metrics, http_reqs, iteration_duration, iterations,
-# checks, request_success, java_execution_time_ms -- none of which any table
-# or figure uses. Dropping them at write time roughly halves both on-disk
-# size and analyze-results.py's peak memory, since it currently loads every
-# Point it sees regardless of whether anything downstream reads it.
+# The metrics the analysis tables and figures read. k6's raw trail carries
+# roughly twice this many; dropping the rest at write time roughly halves both
+# on-disk size and analyze-results.py's peak memory, which loads every Point it
+# sees regardless of whether anything downstream reads it.
 KEEP_METRICS="http_req_duration,http_req_blocked,dropped_iterations,python_parsing_time_ms,python_thread_dispatch_time_ms,python_computation_time_ms,python_dataframe_construction_time_ms,python_model_inference_time_ms,python_compute_stall_time_ms,python_serialization_time_ms,python_total_time_ms,java_estimated_network_overhead_ms"
-# Unset by default -- warm-up.js's own 3000/60s defaults apply for the full
-# suite. Set for a reduced-scale run (e.g. the smoke test) so warm-up doesn't
-# dwarf it. Applies to the baseline and default-VUS scan warm-up passes only
-# -- the maxvus pass has its own override below, since it runs at a much
-# higher VUS and needs a different iteration/duration budget to converge.
+# Unset by default, which leaves warm-up.js on its duration-based path so
+# converge_warmup can drive it in chunks. Setting it (e.g. for the smoke test)
+# makes converge_warmup fall back to a single fixed-iteration pass, so a
+# reduced-scale run is not dwarfed by its own warm-up. Applies to the baseline
+# and default-VUS scan passes only -- the maxvus pass runs at a much higher VUS
+# and needs its own iteration/duration budget to converge, so it has separate
+# overrides below.
 WARMUP_ITERATIONS_PER_TARGET_OVERRIDE="${WARMUP_ITERATIONS_PER_TARGET_OVERRIDE:-}"
 WARMUP_MAX_DURATION_S_OVERRIDE="${WARMUP_MAX_DURATION_S_OVERRIDE:-}"
 
-# ITERATIONS_PER_TARGET is a total budget divided by VUS, so at the maxvus
-# pass's high VUS, the same target used for the VUS=5 passes yields far
-# fewer iterations per VU. Reusing one override for both means raising it
-# enough for maxvus to converge inflates the VUS=5 passes' output by the
-# same factor for no benefit -- each warm-up pass writes one raw k6 JSON
-# line per metric per request, so a large uniform target multiplies output
-# size and analyze-results.py's memory use across all three passes instead
-# of just the one that needs it. Separate variables avoid that. Falls back
-# to the shared override above when unset, so existing invocations still work.
+# ITERATIONS_PER_TARGET is a total budget divided by VUS, so the maxvus pass
+# gets far fewer iterations per VU out of the same value than the VUS=5 passes
+# do. A single shared override would have to be raised until maxvus converges,
+# which inflates the other two passes' raw JSON (one line per metric per
+# request) and analyze-results.py's memory for no benefit. Falls back to the
+# shared override above when unset.
 WARMUP_MAXVUS_ITERATIONS_PER_TARGET_OVERRIDE="${WARMUP_MAXVUS_ITERATIONS_PER_TARGET_OVERRIDE:-$WARMUP_ITERATIONS_PER_TARGET_OVERRIDE}"
 WARMUP_MAXVUS_MAX_DURATION_S_OVERRIDE="${WARMUP_MAXVUS_MAX_DURATION_S_OVERRIDE:-$WARMUP_MAX_DURATION_S_OVERRIDE}"
 
@@ -184,11 +182,10 @@ if [ -n "$WARMUP_MAXVUS_MAX_DURATION_S_OVERRIDE" ]; then
   WARMUP_MAXVUS_ENV_ARGS+=("WARMUP_MAX_DURATION_S=${WARMUP_MAXVUS_MAX_DURATION_S_OVERRIDE}")
 fi
 COOLDOWN_S=10
-# ACPI/DPTF thermal negotiation isn't guaranteed to work (some hardware never
-# completes it -- e.g. _SB.IETM._OSC aborting at boot), leaving the OS blind
-# to platform thermal policy. check_thermal_safety() below reads
-# /sys/class/thermal directly instead of trusting a userspace daemon, so a
-# long pinned-core run pauses or aborts instead of hard-hanging.
+# ACPI/DPTF thermal negotiation does not complete on every platform, which can
+# leave the OS blind to platform thermal policy. check_thermal_safety() below
+# reads /sys/class/thermal directly rather than trusting a userspace daemon, so
+# a long pinned-core run pauses or aborts instead of hard-hanging.
 THERMAL_WARN_C="${THERMAL_WARN_C_OVERRIDE:-90}"
 THERMAL_CRIT_C="${THERMAL_CRIT_C_OVERRIDE:-95}"
 THERMAL_COOLDOWN_S="${THERMAL_COOLDOWN_S_OVERRIDE:-60}"
@@ -306,9 +303,9 @@ capture_run_metadata() {
   # Escape backslashes/quotes in free-text fields before embedding in JSON.
   json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
-  # Resolve the cpuset each service is actually configured with (respects
-  # PYTHON_CPUSET overrides, though run-suite.sh never sets one) and sum
-  # cores pinned across the stack, to verify against cpu_count above.
+  # Resolved config, not the literal defaults: compose expands the PYTHON_CPUSET,
+  # JAVA_CPUSET and K6_CPUSET overrides. Summed to check the cores pinned across
+  # the stack against cpu_count above.
   local py_cpuset java_cpuset k6_cpuset
   py_cpuset=$(compose_service_value "python-service" cpuset)
   java_cpuset=$(compose_service_value "transaction-service" cpuset)
@@ -375,8 +372,8 @@ EOF
   echo "  [metadata] $(host_provenance_line)"
 }
 
-# Parses a Docker cpuset string (e.g., "3-5" or "0,2,4") to compute the target core
-# count dynamically, ensuring JVM processor validation scales with configuration.
+# Counts the logical CPUs in a Docker cpuset string ("3-5", "0,2,4"), so the expected
+# JVM processor count tracks the configured cpuset instead of a hard-coded number.
 count_cpuset_cores() {
   local cpuset="$1"
   local total=0
@@ -408,7 +405,6 @@ expand_cpuset() {
 }
 
 # Maps a logical CPU to its physical core via the lowest-numbered SMT sibling.
-# Guarantees CPU pinning isolates hardware execution units between services.
 core_key_of_cpu() {
   local siblings="/sys/devices/system/cpu/cpu${1}/topology/thread_siblings_list"
   [ -r "$siblings" ] || return 0
@@ -515,10 +511,9 @@ read_live_cpuset() {
 }
 
 
-# Aborts the suite: a rep with unverified CPU pinning must not produce k6
-# Any invalidating condition -- pinning, tier loading, or a cell failure --
-# tears the stack down and exits rather than continuing to produce output
-# that would just get rejected wholesale at analysis time anyway.
+# Any invalidating condition -- pinning, tier loading, thermal, or a cell
+# failure -- tears the stack down and exits rather than continuing to produce
+# output that analysis would reject wholesale anyway.
 abort_suite() {
   local label="$1"; shift
   local reason="$*"  # join remaining args -- callers pass the message across multiple lines
@@ -562,13 +557,13 @@ verify_cpu_pinning() {
       "on this Docker/cgroup driver version."
   fi
 
-  # Verify JVM cpuset detection. Reads "Effective CPU Count" from `-XshowSettings:system`
-  # (JDK 10+), which populates Runtime.availableProcessors() to size Netty event loops.
-  # This probe JVM inherits JAVA_TOOL_OPTIONS, so it opens -- and therefore truncates --
-  # /gc-logs/gc.log. Running it here, once per rep between readiness and the first cell,
-  # is what scopes each archived GC log to that rep's measured window rather than to the
-  # container's whole lifetime; table_gc_overhead's window_s is read from the log's own
-  # first and last timestamps, so it measures that same window.
+  # Reads "Effective CPU Count" from `-XshowSettings:system` (JDK 10+), the value
+  # backing Runtime.availableProcessors() and so the Netty event-loop sizing.
+  # The probe JVM inherits JAVA_TOOL_OPTIONS, so it opens -- and therefore
+  # truncates -- /gc-logs/gc.log. Running it once per rep between readiness and the
+  # first cell is what scopes each archived GC log to that rep's measured window
+  # rather than the container's whole lifetime; table_gc_overhead derives window_s
+  # from the log's own first and last timestamps.
   local java_cpus expected_java_cpus
   java_cpus=$(docker exec "$java_container" sh -c \
     'java -XshowSettings:system -version 2>&1 | grep -i "Effective CPU Count" | grep -o "[0-9]*"' \
@@ -680,9 +675,9 @@ except Exception:
       "!= expected (${EXPECTED_THREAD_LIMITER_TOKENS}) -- the pinned baseline did not take effect."
   fi
 
-  # Pins BLAS/OpenMP layers to 1 thread alongside n_jobs=1 for true single-threaded inference.
-  # Comma-delimited match: a bare substring match on *OMP_NUM_THREADS=1* also accepts 10, 16,
-  # 100, 1024. All four variables are asserted, per the README.
+  # Asserts every BLAS/OpenMP layer is pinned to one thread alongside n_jobs=1.
+  # The match is comma-delimited because a bare *OMP_NUM_THREADS=1* substring would
+  # also accept 10, 16, 100 or 1024.
   local tvar
   for tvar in OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS NUMEXPR_NUM_THREADS; do
     case ",${thread_env}," in
@@ -827,33 +822,31 @@ with open(raw_path) as fin, gzip.open(final_path, 'wt') as fout:
   rm -f "$raw"
 }
 
-# Different targets/tiers converge at different rates, so a fixed warm-up
-# budget is either wasteful for fast targets or insufficient for slow ones.
-# Runs warm-up.js in duration-bounded chunks (WARMUP_CHUNK_DURATION_S)
-# instead, checking convergence after each chunk with table0's own criterion
-# (last WARMUP_WINDOW requests vs. the WARMUP_WINDOW before them, converged
-# if drift < WARMUP_TAIL_TOLERANCE_PCT or the absolute gap is under
-# WARMUP_TAIL_ABS_FLOOR_MS), grouped per target so one slow target can't be
-# masked by faster ones finishing early. Stops once every target present has
-# converged, or after MAX_WARMUP_CHUNKS chunks -- table0 shows the real
-# outcome either way, so a capped-out warm-up is visible, not silently
-# accepted. An explicit WARMUP_ITERATIONS_PER_TARGET (smoke-test overrides)
-# skips this entirely and runs a single fixed-iteration pass instead, so
-# smoke tests stay fast.
+# Targets converge at different rates, so a fixed warm-up budget is either
+# wasteful for the fast ones or too short for the slow ones. Runs warm-up.js in
+# WARMUP_CHUNK_DURATION_S chunks instead, re-checking convergence after each one
+# with the same tail comparison table0 reports (the last WARMUP_WINDOW requests
+# against the WARMUP_WINDOW before them), grouped per target so one slow target
+# cannot be masked by faster ones finishing early. Stops once every target
+# present has converged, or after MAX_WARMUP_CHUNKS -- table0 shows the real
+# outcome either way, so a capped-out warm-up stays visible rather than being
+# silently accepted. An explicit WARMUP_ITERATIONS_PER_TARGET skips all of this
+# for a single fixed-iteration pass, which is what keeps smoke tests fast.
 #
-# A percentage-only tolerance is unreasonably tight for the fastest targets:
-# 5% of a sub-millisecond round trip is a few dozen microseconds, well
-# inside ordinary request-to-request timer and scheduler jitter at a genuine
-# steady state, so a purely relative check flags those targets as still
-# moving most of the time regardless of how settled they are.
-# WARMUP_TAIL_ABS_FLOOR_MS gives convergence an absolute floor alongside the
-# percentage one -- a target passes on whichever bound is looser for its own
-# latency scale, so this stops penalizing fast targets for jitter without
-# loosening the check for slower ones, where the percentage tolerance is
-# already a meaningful bound on its own.
+# WARMUP_TAIL_ABS_FLOOR_MS adds an absolute floor to that check, which table0
+# does not have: 5% of a sub-millisecond round trip is a few dozen microseconds,
+# well inside ordinary timer and scheduler jitter at a genuine steady state, so a
+# percentage-only bound flags the fastest targets as still moving however settled
+# they are. A target passes on whichever bound is looser for its own latency
+# scale, leaving the percentage tolerance intact for slower targets where it is
+# already meaningful on its own. WARMUP_WINDOW must be large enough that the
+# prev/last median comparison is not itself dominated by per-request sampling
+# noise at real request rates -- too small a window reports spurious
+# non-convergence on an already-stable target, independent of any real drift or
+# of the tolerance and floor above.
 WARMUP_CHUNK_DURATION_S=15
 MAX_WARMUP_CHUNKS=4
-WARMUP_WINDOW=100
+WARMUP_WINDOW=500
 WARMUP_TAIL_TOLERANCE_PCT=5.0
 WARMUP_TAIL_ABS_FLOOR_MS=0.25
 
@@ -940,12 +933,12 @@ PYEOF
   finalize_result "${out_prefix}.json"
 }
 
-# Measures this target's real throughput at CALIB_VUS, then derives the
+# Measures this target's throughput at CALIB_VUS, then derives the
 # ITERATIONS_PER_VU each of CALIB_AFFECTED_LEVELS needs to hit
-# CALIB_TARGET_DURATION_S, into CALIB_ITERATIONS_PER_VU. Call once per
-# target per rep, before that target's VUS loop. Throughput is roughly
-# constant across VUS within a tier (validated at v28/mock/tier5/tier20)
-# but varies ~2.4x across tiers, so this can't be a flat constant.
+# CALIB_TARGET_DURATION_S, into CALIB_ITERATIONS_PER_VU. Call once per target
+# per rep, before that target's VUS loop. Throughput is roughly flat across VUS
+# within a target but differs by a large factor between targets, so no single
+# iteration count reaches the same wall-clock duration for all of them.
 calibrate_target() {
   local target="$1" rep="$2"
   local raw_name="calib_${target}_vus${CALIB_VUS}_rep${rep}.json"
@@ -957,6 +950,11 @@ calibrate_target() {
 
   local host_path="${RESULTS_DIR}/${raw_name}.gz"
   local vus iters
+  # Cleared before each target: the derivation runs in a process substitution whose
+  # exit status is unreachable, so a calibration that yields no rows would otherwise
+  # leave the previous target's counts in place and silently calibrate this target
+  # against another target's throughput.
+  CALIB_ITERATIONS_PER_VU=()
   while read -r vus iters; do
     CALIB_ITERATIONS_PER_VU[$vus]="$iters"
   done < <(python3 - "$host_path" "$CALIB_TARGET_DURATION_S" $CALIB_AFFECTED_LEVELS <<'PYEOF'
@@ -985,7 +983,11 @@ with gzip.open(fp, "rt") as f:
             continue
         times.append(parse_iso(obj["data"]["time"]))
 times.sort()
+if len(times) < 2:
+    sys.exit(f"calibration produced {len(times)} usable scan point(s); need at least 2")
 duration = (times[-1] - times[0]).total_seconds()
+if duration <= 0:
+    sys.exit("calibration points all share one timestamp; cannot derive throughput")
 throughput = len(times) / duration
 target_total_requests = throughput * target_s
 for vus in levels:
@@ -994,6 +996,10 @@ PYEOF
   )
   local summary=""
   for vus in $CALIB_AFFECTED_LEVELS; do
+    if [ -z "${CALIB_ITERATIONS_PER_VU[$vus]:-}" ]; then
+      abort_suite "[calibrate] target=${target} rep=${rep}: no iteration count derived for VUS=${vus}." \
+                  "The calibration cell produced no usable scan points (see ${raw_name}.gz)."
+    fi
     summary="${summary}VUS${vus}=${CALIB_ITERATIONS_PER_VU[$vus]} "
   done
   echo "  [calibrate] target=${target} rep=${rep}: ${summary}"
@@ -1017,13 +1023,9 @@ check_oom_killed() {
   fi
 }
 
-# THERMAL_* constants live earlier, next to COOLDOWN_S -- already validated
-# before either function below runs.
-
-# Highest reading across all thermal zones, whole degrees C. Empty output
-# means no zone was readable -- callers treat that as "skip the check", not
-# as an abort, since this is a safety net on top of the real run, not a
-# requirement for it.
+# Highest reading across all thermal zones, whole degrees C. Empty means no zone
+# was readable; callers skip the check rather than abort, since this is a safety
+# net on top of the run, not a requirement for it.
 read_max_cpu_temp_c() {
   local max="" raw t zone
   for zone in /sys/class/thermal/thermal_zone*/temp; do
@@ -1039,10 +1041,9 @@ read_max_cpu_temp_c() {
   return 0
 }
 
-# Pauses if temps are at/above THERMAL_WARN_C, giving the system a chance to
-# cool; aborts if still at/above THERMAL_CRIT_C after MAX_THERMAL_COOLDOWNS
-# pauses. Errs toward pausing over aborting on the first warning -- a hard
-# hang loses the whole run, a paused one only costs wall-clock time.
+# Pauses at/above THERMAL_WARN_C and aborts only if still at/above
+# THERMAL_CRIT_C after MAX_THERMAL_COOLDOWNS pauses: a thermally wedged host
+# loses the whole run, a paused one costs only wall-clock time.
 check_thermal_safety() {
   local label="$1"
   local temp cooldowns=0
@@ -1060,9 +1061,9 @@ check_thermal_safety() {
   fi
 }
 
-# Moves the JVM's GC log (continuously written to gc.log for the container's
-# whole lifetime) to a rep-labeled file before the next restart_stack starts
-# a fresh JVM and overwrites it. Call once per rep, after that rep's cells.
+# Moves the JVM's GC log to a rep-labeled file before the next restart_stack
+# starts a fresh JVM over it. Call once per rep, after that rep's cells, so the
+# archived window is the one the probe JVM opened at rep start.
 archive_gc_log() {
   local label="$1"
   local src="$RESULTS_DIR/gc-logs/gc.log"

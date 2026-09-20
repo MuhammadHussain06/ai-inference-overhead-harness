@@ -146,11 +146,10 @@ K6_ENGINE_METRICS = frozenset({
 })
 
 # Counters whose exact sum a check depends on (truncated-cell detection, the
-# error-count cross-check) and which are inherently rare next to a per-request
-# metric like http_req_duration. Reservoir sampling below is uniform per file, so
-# without this exemption a handful of dropped_iterations points in a multi-million-
-# point file would almost certainly all get sampled out, making a truncated cell
-# silently look clean instead of tripping the check that exists to catch it.
+# error-count cross-check), and which are rare next to a per-request metric like
+# http_req_duration. Reservoir sampling below is uniform per file, so without this
+# exemption those few points would usually be sampled out and a truncated cell would
+# read as clean instead of tripping the check meant to catch it.
 ALWAYS_KEEP_METRICS = frozenset({"dropped_iterations", "request_http_error", "request_timeout_error"})
 
 
@@ -158,15 +157,16 @@ def load_results(results_dir, prefixes=None):
     """
     prefixes: optional tuple of filename prefixes to restrict loading to (e.g.
     ("scan_", "openloop_")). Used by main() to load baseline/warmup and
-    scan/openloop data in two separate passes, so the (much larger) scan
-    dataset is never held in memory at the same time as baseline/warmup --
-    on the full suite this roughly halves peak memory versus one combined load.
+    scan/openloop data in two separate passes, so the larger scan dataset is
+    never held in memory at the same time as baseline/warmup.
     Returns None if prefixes is given and no files in results_dir match it
     (distinct from the results_dir being empty/missing entirely, which is
     still a hard error either way).
     """
-    # run-suite.sh writes cells gzipped (*.json.gz); *.json still matches
-    # anything from before that change, or a manually-added raw file.
+    # run-suite.sh gzips each finalized cell (*.json.gz); plain *.json covers a
+    # manually produced cell. Both patterns also match non-cell JSON written into
+    # the results dir (run_metadata.json); the prefix filter below is what keeps
+    # those out, so load_results is always called with prefixes.
     files = sorted(
         glob.glob(os.path.join(results_dir, "*.json"))
         + glob.glob(os.path.join(results_dir, "*.json.gz"))
@@ -180,31 +180,24 @@ def load_results(results_dir, prefixes=None):
         if not files:
             return None
 
-    # Columnar accumulation instead of one dict per row: a list of ~13M small
-    # dicts (plus the DataFrame built from it, coexisting in memory during
-    # from_records) is far heavier than the same data held as 11 flat lists --
-    # each dict carries its own per-object overhead on top of the 11 values,
-    # multiplied by every single metric point.
+    # Columnar accumulation instead of one dict per row: a per-row dict carries
+    # its own object overhead on top of the 11 values it holds, multiplied by
+    # every metric point, and from_records holds that list and the resulting
+    # frame in memory at once. Eleven flat lists avoid both.
     col_metric, col_value, col_strategy, col_tier, col_vus = [], [], [], [], []
     col_phase, col_rep, col_rate, col_status, col_time, col_source = [], [], [], [], [], []
 
-    # json.loads() doesn't intern strings, so each tag column (a few dozen
-    # distinct values) pays for a new ~50-70 byte object per point instead of
-    # one shared object per distinct value -- the actual cost behind the OOM
-    # on an inflated warm-up file. Interning fixes that.
+    # json.loads() does not intern, so each tag column -- a few dozen distinct
+    # values repeated across millions of points -- would otherwise allocate a new
+    # string object per point instead of sharing one per distinct value.
     def _intern_tag(v):
         return sys.intern(v) if type(v) is str else v
 
-    # calibrate_target() recalibrates ITERATIONS_PER_VU to hit a fixed wall-clock
-    # duration regardless of throughput, so a trivial/reference target (mock,
-    # calibration) can log millions of points in the same window a model-inference
-    # tier logs a few hundred thousand in -- observed up to 4.8M points in one cell,
-    # which is what drove analyze-results.py past available memory. Reservoir-sampling
-    # each file down to a uniform random subset this size bounds memory regardless of
-    # a target's throughput; at this sample size, mean/percentile/bootstrap-CI
-    # estimates are statistically indistinguishable from the full population, so
-    # nothing downstream loses accuracy that matters. Every real tier's cell is
-    # currently well under this and passes through untouched.
+    # Cells are sized by wall-clock duration, not request count, so a trivial target
+    # (mock, calibration) can log an order of magnitude more points than a model-
+    # inference tier. Sampling each file down to a uniform random subset of this size
+    # bounds memory regardless of throughput, and mean/percentile/bootstrap-CI
+    # estimates remain unbiased at this sample size.
     MAX_POINTS_PER_FILE = 250_000
     rng = random.Random(42)
 
@@ -213,8 +206,8 @@ def load_results(results_dir, prefixes=None):
         # Reservoir: the bounded, sampled population (high-volume per-request metrics).
         res_metric, res_value, res_strategy, res_tier, res_vus = [], [], [], [], []
         res_phase, res_rep, res_rate, res_status, res_time = [], [], [], [], []
-        # Always-keep: ALWAYS_KEEP_METRICS points, unbounded but inherently rare --
-        # kept in a separate list so appending to it never touches reservoir slots.
+        # Always-keep: ALWAYS_KEEP_METRICS points, unbounded but rare -- kept in a
+        # separate list so appending to it never touches reservoir slots.
         keep_metric, keep_value, keep_strategy, keep_tier, keep_vus = [], [], [], [], []
         keep_phase, keep_rep, keep_rate, keep_status, keep_time = [], [], [], [], []
         n_seen = 0
@@ -292,17 +285,16 @@ def load_results(results_dir, prefixes=None):
         "tier": col_tier, "vus": col_vus, "phase": col_phase, "rep": col_rep,
         "rate": col_rate, "status": col_status, "time": col_time, "source_file": col_source,
     })
-    # Free the raw column lists before any further processing -- once the frame
-    # above is built, nothing needs them, and the full-suite dataset is large
-    # enough that holding both at once is the difference between fitting in
-    # memory and an OOM kill.
+    # Free the raw column lists before any further processing: the frame above no
+    # longer needs them, and on the full suite holding both at once doubles peak
+    # memory for no benefit.
     del col_metric, col_value, col_strategy, col_tier, col_vus
     del col_phase, col_rep, col_rate, col_status, col_time, col_source
     gc.collect()
 
-    # float32 halves this column's memory versus float64. k6 reports latencies
-    # to tenth-millisecond precision; float32 keeps ~7 significant digits, so
-    # nothing downstream (percentiles, bootstrap CIs, Mann-Whitney) is affected.
+    # float32 halves these columns' memory versus float64. k6 reports latencies to
+    # tenth-millisecond precision and float32 keeps ~7 significant digits, which
+    # covers the three decimals every reported statistic is rounded to.
     df["value"] = pd.to_numeric(df["value"], errors="coerce").astype(np.float32)
     df["vus"] = pd.to_numeric(df["vus"], errors="coerce").astype(np.float32)
     df["time"] = pd.to_datetime(df["time"], format="ISO8601", errors="coerce", utc=True)
@@ -315,9 +307,8 @@ def load_results(results_dir, prefixes=None):
               f"Throughput and warm-up convergence depend on them; check the k6 output format.")
 
     # A missing rep tag would merge every repetition into one cluster and silently
-    # revert the whole analysis to pseudoreplication.
-    # k6 emits these outside any HTTP request context, so they carry no per-request tags
-    # and are excluded here to keep this warning meaningful.
+    # revert the whole analysis to pseudoreplication. K6_ENGINE_METRICS carry no
+    # request tags by design and are excluded so the warning stays meaningful.
     n_untagged_reps = int(df.loc[~df["metric"].isin(K6_ENGINE_METRICS), "rep"].isna().sum())
     if n_untagged_reps:
         print(f"[!] {n_untagged_reps} per-request metric point(s) carry no 'rep' tag and are being "
@@ -338,18 +329,16 @@ def load_results(results_dir, prefixes=None):
                   f"{stray}. Those cells hit maxDuration and ran fewer requests than configured, "
                   f"so their iteration budget was not met -- treat their results as truncated.")
 
-    # Low-cardinality columns (a handful of distinct tiers/phases/metrics/etc.,
-    # repeated across every one of the millions of rows) cost far less as
-    # pandas categoricals -- small integer codes plus one shared table of the
-    # actual strings -- than as plain object columns holding a separate Python
-    # string per row. Values, comparisons (==, .isin()), and .groupby() all
-    # behave identically on a categorical column, so nothing downstream changes.
+    # These columns hold a handful of distinct values repeated across every row, so
+    # a categorical (integer codes plus one shared string table) costs far less than
+    # an object column holding a separate string per row. Comparisons, .isin() and
+    # .groupby() behave identically on a categorical.
     for col in ("metric", "strategy", "tier", "phase", "status", "source_file", "rep"):
         df[col] = df[col].astype("category")
 
     return df
 
-# Stats — within-run
+# Stats -- within-run
 
 def cluster_bootstrap_ci(sub_df, stat_fn, rep_col="rep", n_boot=2000, ci=0.95, seed=42):
     """
@@ -503,7 +492,8 @@ def _throughput_reqs_per_s(subset_df, rep_col="rep"):
 
 
 def client_diagnostics_summary(df, phase, group_cols, label_fn, blocked_warn_ms=5.0):
-    # Uses http_req_blocked as a diagnostic to isolate client-side connection pool bottlenecks from server performance issues.
+    # http_req_blocked is k6-side connection-pool wait, not server latency. Reported so a
+    # throughput plateau can be attributed to the server only after ruling the client out.
     sub = df[(df["metric"] == "http_req_blocked") & (df["phase"] == phase) & df["value"].notna()].copy()
     if sub.empty:
         return pd.DataFrame()
@@ -522,7 +512,7 @@ def client_diagnostics_summary(df, phase, group_cols, label_fn, blocked_warn_ms=
     return pd.DataFrame(rows)
 
 
-# Stats — significance
+# Stats -- significance
 
 def rank_biserial_effect_size(U, n1, n2):
     """
@@ -532,8 +522,8 @@ def rank_biserial_effect_size(U, n1, n2):
 
     Ranges [-1, 1]; 0 = no separation. NEGATIVE means group A's values are smaller
     than group B's, so along an increasing-latency axis (tier 5 -> 28) the expected
-    sign is negative. The previous form, 1 - 2U/(n1*n2), was the negative of this
-    and therefore reported +1 where Cliff's delta is -1.
+    sign is negative. Note the sign: the complementary form 1 - 2U/(n1*n2) carries
+    the opposite convention and would report +1 where Cliff's delta is -1.
     """
     return (2 * U) / (n1 * n2) - 1
 
@@ -557,7 +547,10 @@ def _fmt_p(p):
 
 
 def pairwise_mannwhitney(df, metric, phase, group_col, order, label_fn, fixed_filters=None, rep_col="rep"):
-    # Computes Mann-Whitney U tests on rep-level means to prevent pseudoreplication, applies Holm-Bonferroni correction, and reports rank-biserial effect sizes.
+    # Tests adjacent pairs in `order`, on rep-level means rather than pooled requests:
+    # requests within one run are correlated, so a pooled test counts them as independent
+    # observations and understates the p-value. Holm-Bonferroni corrects across the
+    # adjacent-pair family; the pooled p-value is carried through for reference only.
     sub = df[(df["metric"] == metric) & (df["phase"] == phase) & df["value"].notna()]
     if fixed_filters:
         for col, val in fixed_filters.items():
@@ -625,10 +618,11 @@ def pairwise_mannwhitney(df, metric, phase, group_col, order, label_fn, fixed_fi
     return pd.DataFrame(raw_rows)[cols]
 
 
-# Stats — between-run
+# Stats -- between-run
 
 def between_run_consistency(df, metric, phase, group_cols, label_fn):
-    # Computes between-run mean, SD, and CoV% across independent repetitions using per-repetition means.
+    # One observation per repetition (its mean), so the reported SD and CoV measure
+    # run-to-run spread rather than within-run request spread.
 
     sub = df[(df["metric"] == metric) & (df["phase"] == phase) & df["value"].notna()].copy()
     if sub.empty:
@@ -706,13 +700,21 @@ def save_figure(fig, name, output_dir):
 
 # warm-up convergence (post-hoc steady-state check)
 
-def analyze_warmup(df, output_dir, window_size=100, tail_tolerance_pct=5.0):
+def analyze_warmup(df, output_dir, window_size=500, tail_tolerance_pct=5.0,
+                   tail_abs_floor_ms=0.25):
     """Reports whether each warm-up window reached steady state before measurement began.
 
     Convergence is judged on the tail (last window vs. the one before it), not on
     total drift from the first window. Drift from the first window measures how
     much work warm-up did, which is large by design and says nothing about whether
     the stack had settled by the end.
+
+    window_size, tail_tolerance_pct and tail_abs_floor_ms mirror run-suite.sh's
+    WARMUP_WINDOW / WARMUP_TAIL_TOLERANCE_PCT / WARMUP_TAIL_ABS_FLOOR_MS so this
+    table reports the same verdict the live gate acted on. A window small relative
+    to per-request variance is dominated by sampling noise and reads as drift on an
+    already-settled target; the absolute floor keeps the percentage bound from being
+    unreachably tight for the sub-millisecond targets.
     """
     warm_any = df[(df["phase"] == "warmup") & (df["metric"] == "http_req_duration") &
                   df["value"].notna()]
@@ -739,7 +741,9 @@ def analyze_warmup(df, output_dir, window_size=100, tail_tolerance_pct=5.0):
 
         total_drift = 100 * (p50_last - p50_first) / p50_first if p50_first else np.nan
         tail_drift = 100 * (p50_last - p50_penultimate) / p50_penultimate if p50_penultimate else np.nan
-        converged = not np.isnan(tail_drift) and abs(tail_drift) < tail_tolerance_pct
+        converged = not np.isnan(tail_drift) and (
+            abs(p50_last - p50_penultimate) < tail_abs_floor_ms or abs(tail_drift) < tail_tolerance_pct
+        )
 
         rows.append({
             "Tier": _tier_label(tier),
@@ -750,25 +754,30 @@ def analyze_warmup(df, output_dir, window_size=100, tail_tolerance_pct=5.0):
             f"Last {window_size} P50 (ms)": round(p50_last, 3),
             "Total drift (%)": round(total_drift, 1) if not np.isnan(total_drift) else np.nan,
             "Tail drift (%)": round(tail_drift, 1) if not np.isnan(tail_drift) else np.nan,
-            f"Converged (tail <{tail_tolerance_pct:g}%)": "YES" if converged else "no",
+            f"Converged (tail <{tail_tolerance_pct:g}% or <{tail_abs_floor_ms:g}ms)":
+                "YES" if converged else "no",
         })
 
     table = pd.DataFrame(rows)
     save_table(table, "table0_warmup_convergence_check", output_dir,
-               caption=f"Per-rep, per-target warm-up convergence check. 'Total drift' is the P50 change "
-                       f"from the first to the last {window_size} requests of the window -- large values "
-                       f"are expected and show warm-up doing its job. 'Tail drift' compares the last "
-                       f"{window_size} requests to the {window_size} before them; only this indicates "
-                       f"whether the stack had reached steady state before the measured phase began. "
-                       f"A window failing the tail criterion means its warm-up budget was too small.",
+               caption=f"Per-rep, per-target warm-up convergence check, reporting the same criterion "
+                       f"run-suite.sh's gate applied. 'Total drift' is the P50 change from the first to "
+                       f"the last {window_size} requests of the window -- large values are expected and "
+                       f"show warm-up doing its job. 'Tail drift' compares the last {window_size} "
+                       f"requests to the {window_size} before them; only this indicates whether the "
+                       f"stack had reached steady state before the measured phase began. A window "
+                       f"converges on whichever bound is looser for its latency scale: tail drift under "
+                       f"{tail_tolerance_pct:g}% or an absolute gap under {tail_abs_floor_ms:g} ms.",
                label="tab:warmup-convergence")
 
     if not table.empty:
-        converged_col = f"Converged (tail <{tail_tolerance_pct:g}%)"
+        converged_col = f"Converged (tail <{tail_tolerance_pct:g}% or <{tail_abs_floor_ms:g}ms)"
         n_failed = int((table[converged_col] == "no").sum())
         if n_failed:
             print(f"[!] {n_failed}/{len(table)} warm-up windows had not converged at the tail. "
-                  f"Raise WARMUP_ITERATIONS_PER_TARGET before trusting the measured phase.")
+                  f"Raise MAX_WARMUP_CHUNKS or WARMUP_CHUNK_DURATION_S in run-suite.sh before "
+                  f"trusting the measured phase. (Setting WARMUP_ITERATIONS_PER_TARGET instead "
+                  f"disables the adaptive gate entirely and runs one fixed-iteration pass.)")
 
 
 def analyze_measurement_floor(e2e, order, output_dir, floor_tier="calibration"):
@@ -934,7 +943,8 @@ def analyze_baseline(df, output_dir):
                        "and is therefore counted in the \\texttt{predict\\_proba()} column, not here.",
                label="tab:df-share")
 
-    # Compares significance between adjacent tiers using only successful requests (status==200) to exclude errors from latency comparisons.
+    # Runs on e2e (status==200 only): an error or timeout response has a latency that
+    # reflects the failure path, not the tier's inference cost.
     table5 = pairwise_mannwhitney(e2e, "http_req_duration", "baseline", "tier", order, _tier_label)
     save_table(table5, "table5_baseline_adjacent_tier_significance", output_dir,
                caption="Mann-Whitney U test between adjacent feature-count tiers, end-to-end latency "
@@ -1115,8 +1125,10 @@ def analyze_scan(df, output_dir):
                        "clean-slate repetitions of the concurrency scan.",
                label="tab:scan-between-run")
 
-    # Table 6: Significance between adjacent concurrency levels per tier (status==200).
-    # Excludes errors/timeouts to prevent concurrency-driven failures from skewing latency metrics.
+    # Table 6: significance between adjacent concurrency levels, per tier, on e2e
+    # (status==200 only) -- a concurrency-driven failure's latency reflects the failure
+    # path, not the tier's cost at that level. Holm is applied within each tier's family,
+    # so one call per tier rather than one over the whole grid.
     table6_parts = []
     for t in order:
         part = pairwise_mannwhitney(
@@ -1227,7 +1239,8 @@ GC_LINE_RE = re.compile(
     r"^\[[^\]]+\]\[(?P<uptime>[\d.]+)s\]\[(?P<level>[a-z]+)\s*\]\[(?P<tags>[^\]]+?)\s*\]\s*(?P<msg>.*)$"
 )
 GC_DUR_RE = re.compile(r"(?P<dur_ms>[\d.]+)ms\s*$")
-# G1 messages are prefixed "GC(N) Pause ..."; startswith("Pause") never matches this.
+# Unified Logging prefixes each pause record with its cycle number: "GC(N) Pause ...",
+# so the message never begins with "Pause" itself.
 GC_PAUSE_RE = re.compile(r"^GC\(\d+\)\s+Pause")
 # Matches the JVM's one-line startup log, e.g. "Using G1".
 GC_COLLECTOR_RE = re.compile(r"^Using (?P<collector>\S.*)$")
@@ -1265,10 +1278,10 @@ def parse_gc_log(path):
             if dm:
                 pauses.append((uptime, float(dm.group("dur_ms"))))
 
-    # The collector is checked unconditionally, not only when no pauses were found.
-    # GC_PAUSE_RE matches Unified Logging's generic "GC(N) Pause ..." record, which is not
-    # G1-specific -- Serial, Parallel and Shenandoah all parse through it too, differing from
-    # G1 only in the parenthetical cause. Only ZGC's format does not match.
+    # Checked even when pauses were parsed: GC_PAUSE_RE matches Unified Logging's generic
+    # "GC(N) Pause ..." record, so Serial, Parallel and Shenandoah parse through it too,
+    # differing from G1 only in the parenthetical cause. Only ZGC's format does not match,
+    # which means a successful parse is not by itself evidence that G1 produced the data.
     if collector is not None and collector != "G1":
         print(f"[gc] WARNING: {os.path.basename(path)} selected '{collector}', not G1. "
               f"{len(pauses)} pause event(s) parsed from this log are that collector's, and are "
@@ -1346,7 +1359,8 @@ def analyze_gc_logs(results_dir, output_dir):
 
 
 def analyze_openloop_check(df, output_dir):
-    # Compares manual open-loop checks against closed-loop scans per tier, skipping silently if no open-loop files are present.
+    # Open-loop (constant-arrival-rate) cells are run manually, so this returns without a
+    # table when none are present.
     #
     # run-smoke-test.sh's own open-loop cell (openloop_28_smoke.json) lands in this same
     # results dir at a deliberately unsustainable RATE=5000, to prove dropped_iterations
@@ -1376,7 +1390,9 @@ def analyze_openloop_check(df, output_dir):
     file_meta = ol_all.groupby("source_file", observed=True)[["tier", "rate", "phase"]].first()
     dropped_by_file = dropped_all.groupby("source_file", observed=True)["value"].sum()
 
-    # Converts categorical indices to strings before reindexing to prevent Cython crashes caused by differing internal code widths.
+    # The two indexes are independent categoricals built from different subsets, so their
+    # category sets (and code widths) need not agree. Plain strings give the reindex below
+    # a well-defined label-to-label alignment.
     file_meta.index = file_meta.index.astype(str)
     dropped_by_file.index = dropped_by_file.index.astype(str)
     # A smoke file's dropped_iterations points carry no phase of their own (see above),
@@ -1462,7 +1478,8 @@ def main():
         print("[!] Exiting -- fix the cause and re-run the suite for a clean dataset.")
         sys.exit(1)
 
-    # Loads baseline and scan data in separate passes to reduce peak memory since no function processes both simultaneously.
+    # Two passes, not one combined load: no analysis below needs baseline/warmup and
+    # scan/openloop data at the same time, so only one of the two is ever resident.
     df1 = load_results(args.results_dir, prefixes=("warmup_", "baseline_"))
     if df1 is None:
         print("[!] No warmup_*/baseline_* files found; skipping warm-up check and baseline analysis.")

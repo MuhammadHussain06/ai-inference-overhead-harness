@@ -7,9 +7,10 @@ set -euo pipefail
 # in the SAME chunk, not on any one target in isolation. probe_warmup_settle.sh
 # only probes one target at a time, so it can't show whether that harder,
 # joint AND condition is actually reachable, or which target is the laggard
-# when it isn't. This runs the same all-six-targets-per-chunk warm-up.js call
-# converge_warmup() makes, past its MAX_WARMUP_CHUNKS cap, printing every
-# target's tail drift and the joint pass/fail at each checkpoint.
+# when it isn't. This warms all six targets per chunk as converge_warmup()
+# does (though as six separate warm-up.js calls -- see below), past its
+# MAX_WARMUP_CHUNKS cap, printing every target's tail drift and the joint
+# pass/fail at each checkpoint.
 #
 # Usage:
 #   ./probe_warmup_joint.sh LABEL VUS [CPUSET CPUS WORKERS TOKENS] [MAX_CHUNKS] [CHUNK_DURATION_S] [WINDOW] [TOL] [ABS_FLOOR_MS]
@@ -41,15 +42,15 @@ WORKERS="${5:-3}"
 TOKENS="${6:-40}"
 MAX_CHUNKS="${7:-20}"
 CHUNK_DURATION_S="${8:-15}"
-WINDOW="${9:-100}"
+WINDOW="${9:-500}"
 TOL="${10:-5.0}"
 ABS_FLOOR_MS="${11:-0.25}"
 
 # Matches run-suite.sh's TARGETS default and warm-up.js's own default ORDER.
 TARGETS="mock calibration 5 10 20 28"
 
-COMPOSE_FILE="../docker-compose.yml"
-RESULTS_DIR="../results/probes"
+COMPOSE_FILE="../../docker-compose.yml"
+RESULTS_DIR="../../results/probes"
 RAW_RESULTS_DIR="${RESULTS_DIR}/raw"
 mkdir -p "$RESULTS_DIR" "$RAW_RESULTS_DIR"
 
@@ -232,11 +233,10 @@ echo "[*] ${LABEL}: targets=(${TARGETS}) vus=${VUS} cpuset=${CPUSET} cpus=${CPUS
 echo "[*] running up to ${MAX_CHUNKS} chunks of ${CHUNK_DURATION_S}s/target, 6 targets/chunk as 6 separate calls" \
      "(~$((MAX_CHUNKS * CHUNK_DURATION_S * 6))s of load plus per-call container overhead) -- not stopping early, we want the full curve"
 
-# Each target in a chunk runs as its own warm-up.js call instead of one call
-# covering all six -- a single six-target call keeps the pinned cores under
-# continuous load for ~2.5 minutes before check_thermal_safety ever gets to
-# look, versus ~15-25s per target here, so a hot system gets caught between
-# targets instead of only between chunks.
+# Each target in a chunk runs as its own warm-up.js call rather than one call
+# covering all six: a single six-target call holds the pinned cores under
+# continuous load for the whole chunk before check_thermal_safety gets to look,
+# so splitting it catches a hot system between targets, not only between chunks.
 for chunk in $(seq 1 "$MAX_CHUNKS"); do
   for tier in $TARGETS; do
     target_name="${LABEL}_chunk${chunk}_${tier}.json"

@@ -32,8 +32,8 @@ public class TransactionController {
         if (stamp != null) {
             requestStartNanos = stamp;
         } else {
-            // Only reachable if the filter did not run. Falling back silently would
-            // understate every Java-side figure by the whole framework-ingress term.
+            // Only reachable if the filter did not run. Warns rather than falling back
+            // silently, since this stamp omits the whole framework-ingress term.
             requestStartNanos = System.nanoTime();
             log.warn("[{}] RequestTimingWebFilter did not stamp this exchange; timings for this "
                     + "request exclude framework ingress.", request.getTransactionId());

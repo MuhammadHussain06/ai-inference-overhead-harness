@@ -49,8 +49,8 @@ else
   echo "  [!] smoke-openloop: 0 dropped_iterations at RATE=5000 -- the open-loop executor did not detect the overload. Investigate before trusting the real suite's own open-loop checks." >&2
 fi
 
-# No reason for this to survive past this script -- table7's phase-based exclusion
-# is defense in depth, not a reason to leave a stale artifact in ../results/.
+# table7's phase-based exclusion is defense in depth; the raw file itself still has no
+# business outliving this script in ../results/.
 rm -f ../results/openloop_28_smoke.json
 
 echo "[*] Smoke test 3/4: ablation slice -- exercises the cpuset arm's multi-range values"
@@ -70,13 +70,14 @@ echo "[*] Smoke test 4/4: both analysis scripts"
 
 echo "[+] Smoke test complete. Before trusting this run, check:"
 echo "    ../results/run_failures_log.txt and ../results/ablation_run_failures_log.txt (both empty)"
-echo "    ../results/cpu_pin_check_log.txt, incl. the smt_check line"
-echo "    ../results/env_trace_log.txt"
+echo "    ../results/cpu_pin_check_log.txt and ../results/ablation_cpu_pin_check_log.txt, incl. the smt_check lines"
+echo "    ../results/env_trace_log.txt and ../results/ablation_env_trace_log.txt"
 echo "    the [+]/[!] smoke-openloop line printed above (dropped_iterations at RATE=5000);"
 echo "    table7 itself will not show this cell -- it excludes phase=smoke-openloop on purpose"
 echo "    table_ablation_decomposition lists both cpuset values, ordered by core count"
 echo ""
-echo "    Expected here: table0 is skipped as empty. Its convergence check needs 300+"
-echo "    warm-up requests per window and this run sends 20 -- that is the smoke test"
-echo "    being small, not a pipeline failure. The ablation tables carry no meaningful"
-echo "    statistics at 2 reps either; the point is that they render at all."
+echo "    Expected here: table0 is skipped as empty. Its convergence check needs 1500"
+echo "    warm-up requests per cell (three 500-request windows) and this run sends"
+echo "    about 20 -- that is the smoke test being small, not a pipeline failure. The"
+echo "    ablation tables carry no meaningful statistics at 2 reps either; the point is"
+echo "    that they render at all."

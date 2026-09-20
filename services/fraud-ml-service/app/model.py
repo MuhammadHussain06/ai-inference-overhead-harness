@@ -70,7 +70,7 @@ class FraudMLTier:
             dataframe_construction_time_ms = (time.perf_counter() - start_df) * 1000
 
             # Covers the whole predict_proba call: feature validation, the pandas to
-            # DMatrix conversion, and tree traversal. The conversion dominates.
+            # DMatrix conversion, and tree traversal.
             start_infer = time.perf_counter()
             risk_score = float(self.model.predict_proba(df_input)[0][1])
             model_inference_time_ms = (time.perf_counter() - start_infer) * 1000

@@ -24,7 +24,7 @@ services:
             timeout: 3s
             retries: 10
             start_period: 10s
-        # Sets default Python cpuset to physical cores 0, 2, and 4 (6 logical CPUs) for physical isolation from Java and k6.
+        # Physical cores 0, 2, 4 (CPUs 0-1, 4-5, 8-9) -- disjoint from both Java and k6.
         cpuset: "${PYTHON_CPUSET:-0-1,4-5,8-9}"
         # Enforced by plain `docker compose up` (unlike deploy.resources.limits).
         mem_limit: 3g
@@ -58,7 +58,7 @@ services:
         depends_on:
             python-service:
                 condition: service_healthy
-        # Physical cores 1, 3 (CPUs 2-3, 6-7) — interleaved with python-service's
+        # Physical cores 1, 3 (CPUs 2-3, 6-7) -- interleaved with python-service's
         # even-numbered cores so no physical core is shared between the two services.
         # These numbers name whole physical cores on the host they were picked for and
         # nowhere else; load-testing/recommend-cpusets.sh prints values for another host,
@@ -88,7 +88,7 @@ services:
             - ./results:/results
         environment:
             - BASE_URL=http://java:8080/api/v1/transactions
-        # Physical cores 5, 7 (CPUs 10-11, 14-15) — disjoint from both services.
+        # Physical cores 5, 7 (CPUs 10-11, 14-15) -- disjoint from both services.
         cpuset: "${K6_CPUSET:-10-11,14-15}"
         mem_limit: 1g
         cpus: ${K6_CPUS:-4.0}

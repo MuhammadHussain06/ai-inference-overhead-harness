@@ -1,7 +1,9 @@
 """Guards the analysis helpers that shape every reported table and figure."""
 
 import importlib.util
+import inspect
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -10,6 +12,7 @@ import pandas as pd
 import pytest
 
 ANALYSIS_DIR = Path(__file__).resolve().parents[1]
+LOAD_TESTING_DIR = ANALYSIS_DIR.parent / "load-testing"
 
 
 def _load(module_name, filename):
@@ -364,3 +367,204 @@ def test_warmup_skip_distinguishes_absent_data_from_a_failed_warmup(tmp_path, ca
     results.analyze_warmup(df, str(tmp_path))
     out = capsys.readouterr().out
     assert "none returned HTTP 200" in out and "run without" not in out
+
+# --- warm-up convergence criterion (table0) ---
+
+# The criterion is the looser of two bounds, so the column header has to name both --
+# a reader cannot otherwise tell which one admitted a given window.
+CONVERGED_COL = "Converged (tail <5% or <0.25ms)"
+WINDOW = 500
+
+
+def _shell_const(script, name):
+    """Reads a top-level constant out of a load-testing script's text."""
+    text = (LOAD_TESTING_DIR / script).read_text()
+    return re.search(rf"^{name}=(\S+)$", text, re.M).group(1)
+
+
+def _warmup_frame(segments, tier="28", source_file="warmup_scan_rep1"):
+    """A phase='warmup' frame whose HTTP 200 latencies run through `segments`
+    ((value, count) pairs) in time order."""
+    values, times = [], []
+    base = pd.Timestamp("2026-01-01T00:00:00Z")
+    for value, count in segments:
+        for _ in range(count):
+            times.append(base + pd.Timedelta(milliseconds=len(times)))
+            values.append(value)
+    return pd.DataFrame({"phase": "warmup", "metric": "http_req_duration",
+                         "value": values, "status": "200", "tier": tier,
+                         "source_file": source_file, "time": times})
+
+
+def _warmup_table(df, tmp_path):
+    results.analyze_warmup(df, str(tmp_path))
+    return pd.read_csv(tmp_path / "tables" / "table0_warmup_convergence_check.csv")
+
+
+def test_warmup_criterion_matches_the_live_shell_gate():
+    """table0 claims to report the verdict run-suite.sh's gate acted on. If the two
+    drift apart, the table says a window converged that warm-up never stopped for."""
+    for script in ("run-suite.sh", "run-ablation.sh"):
+        assert int(_shell_const(script, "WARMUP_WINDOW")) == WINDOW
+        assert float(_shell_const(script, "WARMUP_TAIL_TOLERANCE_PCT")) == 5.0
+        assert float(_shell_const(script, "WARMUP_TAIL_ABS_FLOOR_MS")) == 0.25
+
+    for fn in (results.analyze_warmup, ablation.build_ablation_warmup_table):
+        params = inspect.signature(fn).parameters
+        assert params["window_size"].default == WINDOW
+        assert params["tail_tolerance_pct"].default == 5.0
+        assert params["tail_abs_floor_ms"].default == 0.25
+
+
+def test_warmup_converges_within_the_percentage_tolerance(tmp_path):
+    table = _warmup_table(_warmup_frame([(100.0, 2 * WINDOW), (102.0, WINDOW)]), tmp_path)
+    assert table[CONVERGED_COL].tolist() == ["YES"]
+    assert table["Tail drift (%)"].iloc[0] == pytest.approx(2.0)
+
+
+def test_warmup_converges_on_the_absolute_floor_the_percentage_bound_rejects(tmp_path):
+    """5% of a sub-millisecond round trip is a few dozen microseconds -- inside
+    ordinary timer jitter, so a percentage-only bound never clears the fast tiers."""
+    table = _warmup_table(_warmup_frame([(0.20, 2 * WINDOW), (0.40, WINDOW)]), tmp_path)
+    assert table[CONVERGED_COL].tolist() == ["YES"]
+    # 100% tail drift: only the 0.20 ms absolute gap could have admitted this window.
+    assert table["Tail drift (%)"].iloc[0] == pytest.approx(100.0)
+
+
+def test_warmup_reports_no_when_both_bounds_are_exceeded(tmp_path, capsys):
+    table = _warmup_table(_warmup_frame([(10.0, 2 * WINDOW), (20.0, WINDOW)]), tmp_path)
+    assert table[CONVERGED_COL].tolist() == ["no"]
+    assert table["Tail drift (%)"].iloc[0] == pytest.approx(100.0)
+    out = capsys.readouterr().out
+    assert "1/1 warm-up windows had not converged" in out
+
+
+def test_warmup_reports_a_lagging_target_separately_from_a_settled_one(tmp_path):
+    """Per-target rows, not one pooled verdict: a tier still moving must stay visible
+    next to the tiers that settled, which is the same grouping the live gate applies."""
+    df = pd.concat([_warmup_frame([(0.50, 3 * WINDOW)], tier="mock"),
+                    _warmup_frame([(10.0, 2 * WINDOW), (20.0, WINDOW)], tier="28")])
+    table = _warmup_table(df, tmp_path).set_index("Tier")
+    assert table.loc["mock", CONVERGED_COL] == "YES"
+    assert table.loc["v28", CONVERGED_COL] == "no"
+
+
+def test_warmup_needs_three_full_windows_before_reporting(tmp_path, capsys):
+    """One point short of 3 * window_size leaves no penultimate window to compare
+    against; reporting that as converged would read "not measured" as "no drift"."""
+    results.analyze_warmup(_warmup_frame([(10.0, 3 * WINDOW - 1)]), str(tmp_path))
+    assert "Skipping empty table" in capsys.readouterr().out
+    assert not (tmp_path / "tables" / "table0_warmup_convergence_check.csv").exists()
+
+    table = _warmup_table(_warmup_frame([(10.0, 3 * WINDOW)]), tmp_path)
+    assert table["N Requests"].tolist() == [3 * WINDOW]
+
+
+def test_warmup_table_names_the_criterion_it_applied(tmp_path):
+    table = _warmup_table(_warmup_frame([(10.0, 3 * WINDOW)]), tmp_path)
+    assert CONVERGED_COL in table.columns
+    assert f"Prev {WINDOW} P50 (ms)" in table.columns
+    caption = (tmp_path / "tables" / "table0_warmup_convergence_check.tex").read_text()
+    assert "whichever bound is looser" in caption
+    assert "under 5% or an absolute gap under 0.25 ms" in caption
+
+
+def _ablation_warmup_file(path, segments):
+    """ablation_warmup_<arm>_<value>_rep<N>.json, as run-ablation.sh names it."""
+    lines, i = [], 0
+    for value, count in segments:
+        for _ in range(count):
+            lines.append(json.dumps({"type": "Point", "metric": "http_req_duration", "data": {
+                "time": f"2026-01-01T00:00:00.{i:06d}Z", "value": value,
+                "tags": {"tier": "28", "status": "200"}}}))
+            i += 1
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_ablation_warmup_table_applies_the_same_two_bound_criterion(tmp_path):
+    """run-ablation.sh keeps its own copy of the gate, so this table has to agree with
+    analyze-results.py's on both bounds and on the column that names them."""
+    _ablation_warmup_file(tmp_path / "ablation_warmup_cpuset_0-1_rep1.json",
+                          [(0.20, 2 * WINDOW), (0.40, WINDOW)])
+    _ablation_warmup_file(tmp_path / "ablation_warmup_cpuset_2-3_rep1.json",
+                          [(10.0, 2 * WINDOW), (20.0, WINDOW)])
+    table = ablation.build_ablation_warmup_table(str(tmp_path)).set_index("Value")
+    assert CONVERGED_COL in table.columns
+    assert table.loc["0-1", CONVERGED_COL] == "YES"
+    assert table.loc["2-3", CONVERGED_COL] == "no"
+
+
+def test_ablation_warmup_table_needs_three_full_windows(tmp_path, capsys):
+    _ablation_warmup_file(tmp_path / "ablation_warmup_cpuset_0-1_rep1.json",
+                          [(10.0, 3 * WINDOW - 1)])
+    assert ablation.build_ablation_warmup_table(str(tmp_path)).empty
+    assert f"none had >= {3 * WINDOW} HTTP 200 requests" in capsys.readouterr().out
+
+
+# --- reservoir sampling in load_results ---
+
+# analyze-results.py's own cap. Cells are sized by wall-clock duration, so a zero-work
+# target logs far more points than a model-inference tier; the cap is what keeps peak
+# memory independent of that.
+MAX_POINTS_PER_FILE = 250_000
+
+# Named here rather than read back from the module, so dropping one from the exemption
+# cannot make the test that guards it vacuously true. Truncated-cell detection sums
+# dropped_iterations; the error cross-check sums the other two.
+EXEMPT_METRICS = ("dropped_iterations", "request_http_error", "request_timeout_error")
+
+
+def _sampled_file(path, n_points, exempt=False):
+    """n_points http_req_duration points with distinct values, so which ones survived
+    sampling is observable, plus optionally one point of each exempt metric."""
+    with open(path, "w") as f:
+        for i in range(n_points):
+            f.write('{"type":"Point","metric":"http_req_duration","data":{"time":'
+                    f'"2026-01-01T00:00:00.000000Z","value":{i},'
+                    '"tags":{"tier":"28","status":"200","rep":"1","phase":"scan"}}}\n')
+        for metric in (EXEMPT_METRICS if exempt else ()):
+            f.write(f'{{"type":"Point","metric":"{metric}","data":{{"time":'
+                    '"2026-01-01T00:00:00.000000Z","value":1.0,'
+                    '"tags":{"scenario":"s"}}}\n')
+
+
+@pytest.fixture(scope="module")
+def oversized_results_dir(tmp_path_factory):
+    """One file past the cap by enough points to exercise many replacement draws,
+    shared across the sampling tests -- writing a quarter-million points per test
+    would dominate the suite's runtime."""
+    d = tmp_path_factory.mktemp("oversized")
+    _sampled_file(d / "scan_28_vus64_rep1.json", MAX_POINTS_PER_FILE + 1000, exempt=True)
+    return d
+
+
+def test_load_results_keeps_every_point_below_the_sampling_cap(tmp_path, capsys):
+    _sampled_file(tmp_path / "scan_28_vus64_rep1.json", 1000)
+    df = results.load_results(str(tmp_path), prefixes=("scan_",))
+    assert len(df) == 1000
+    assert sorted(df["value"].tolist()) == [float(i) for i in range(1000)]
+    assert "subsampled" not in capsys.readouterr().out
+
+
+def test_load_results_bounds_an_oversized_file_to_the_cap(oversized_results_dir, capsys):
+    df = results.load_results(str(oversized_results_dir), prefixes=("scan_",))
+    assert int((df["metric"] == "http_req_duration").sum()) == MAX_POINTS_PER_FILE
+    assert f"subsampled to {MAX_POINTS_PER_FILE}" in capsys.readouterr().out
+
+
+def test_load_results_never_samples_out_the_always_keep_metrics(oversized_results_dir):
+    """These counters are rare next to http_req_duration, so a uniform sample thins
+    them and a truncated cell reads as clean instead of tripping the check meant to
+    catch it. They must arrive on top of a full reservoir, not compete for its slots."""
+    assert sorted(results.ALWAYS_KEEP_METRICS) == sorted(EXEMPT_METRICS)
+    df = results.load_results(str(oversized_results_dir), prefixes=("scan_",))
+    assert sorted(df[df["metric"].isin(EXEMPT_METRICS)]["metric"]) == sorted(EXEMPT_METRICS)
+    assert len(df) == MAX_POINTS_PER_FILE + len(EXEMPT_METRICS)
+
+
+def test_load_results_samples_deterministically_from_the_fixed_seed(oversized_results_dir):
+    """Re-running the analysis on an unchanged dataset must not move the reported
+    numbers; the seed is what makes a sampled table reproducible for the paper."""
+    first = results.load_results(str(oversized_results_dir), prefixes=("scan_",))
+    second = results.load_results(str(oversized_results_dir), prefixes=("scan_",))
+    assert first["value"].tolist() == second["value"].tolist()

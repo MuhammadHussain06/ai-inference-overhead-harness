@@ -25,8 +25,8 @@ public class WebClientConfig {
     @Value("${python.service.response-timeout-ms:5000}")
     private long responseTimeoutMs;
 
-    // Must exceed peak VUs to prevent outbound queueing from inflating network/Python metrics.
-    // Scripts export 2x peak VUs; this fallback default applies to manual execution only.
+    // Must exceed peak VUs, or outbound queueing lands in the network/Python metrics.
+    // The harness scripts export 2x their peak VUs; this default is for manual runs.
     @Value("${python.service.max-connections:128}")
     private int maxConnections;
 

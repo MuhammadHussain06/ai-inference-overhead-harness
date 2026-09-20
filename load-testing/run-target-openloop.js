@@ -1,7 +1,9 @@
 import { sendTransaction, TARGETS } from './lib/common.js';
 
-// Standalone open-loop check for coordinated omission at peak concurrency (32/64 VUs).
-// Tracks dropped_iterations when MAX_VUS ceiling is breached to capture throughput limits.
+// Standalone open-loop check on the closed-loop scan's coordinated omission, run by
+// hand at the top concurrency cells. constant-arrival-rate fires on a fixed schedule
+// regardless of response time; k6's own dropped_iterations rises once maxVUs can no
+// longer sustain RATE, marking the point where the arrival rate exceeded capacity.
 
 const targetKey = __ENV.TARGET;
 if (!targetKey || !(targetKey in TARGETS)) {

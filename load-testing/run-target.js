@@ -1,7 +1,6 @@
 import { sendTransaction, TARGETS } from './lib/common.js';
 
-// Executes single-target k6 load tests per (target, VUs, rep) cell.
-// Uses ITERATIONS_PER_VU for concurrency scans and fixed ITERATIONS for VUS=1 baseline.
+// Runs one single-target k6 cell per (target, VUs, rep).
 
 const targetKey = __ENV.TARGET;
 if (!targetKey || !(targetKey in TARGETS)) {

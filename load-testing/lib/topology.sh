@@ -5,9 +5,9 @@
 # The cpusets in docker-compose.yml are logical CPU numbers, and which physical core a
 # number lands on differs by vendor, generation and firmware. verify_smt_isolation()
 # establishes that the three services do not share a core with each other; these checks
-# establish that each service owns its cores outright, and that the CPU quota beside a
-# cpuset is reachable within it. Both hold by construction on the host the values were
-# picked for, and neither is guaranteed anywhere else.
+# establish that each service owns its cores outright and that the CPU quota beside a
+# cpuset is reachable within it. Both hold by construction only on the host the values
+# were picked for.
 #
 # Requires the caller to define abort_suite() and CPU_PIN_LOG. TOPO_SYSFS_ROOT points the
 # readers at a different tree, which is how the fault-injection suite exercises these

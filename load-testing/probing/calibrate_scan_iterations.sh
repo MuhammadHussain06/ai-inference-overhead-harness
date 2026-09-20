@@ -6,9 +6,9 @@
 # What it does: runs one short cell at a reference VUS to measure that
 # tier's real throughput, then prints the ITERATIONS_PER_VU needed at each
 # affected concurrency level (8/16/32/64) to reach a target cell duration
-# (default 60s). Relies on the finding validated tonight at 4 tier/VUS
-# combinations: a given tier's total throughput stays roughly constant
-# across VUS, so one measurement is enough to derive all four levels.
+# (default 60s). Assumes what run-suite.sh's calibrate_target() assumes: a
+# tier's total throughput stays roughly constant across VUS, so one
+# measurement derives all four levels.
 #
 # Usage: ./calibrate_scan_iterations.sh TIER [REFERENCE_VUS] [TARGET_DURATION_S] [CALIBRATION_ITER_PER_VU]
 set -euo pipefail
@@ -18,8 +18,10 @@ REFERENCE_VUS="${2:-16}"
 TARGET_DURATION_S="${3:-60}"
 CALIBRATION_ITER_PER_VU="${4:-2000}"
 
-COMPOSE_FILE="../docker-compose.yml"
-RESULTS_DIR="${RESULTS_DIR_OVERRIDE:-../results}"
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+COMPOSE_FILE="../../docker-compose.yml"
+RESULTS_DIR="${RESULTS_DIR_OVERRIDE:-../../results}"
 # Path as the k6 container sees it (docker-compose.yml mounts ./results -> /results).
 CONTAINER_OUT="/results/calib_${TIER}_vus${REFERENCE_VUS}.json"
 # Same file, as this host sees it -- the python step below runs outside docker.

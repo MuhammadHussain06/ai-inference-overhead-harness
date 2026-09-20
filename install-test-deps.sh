@@ -97,7 +97,7 @@ build_venv() {
 echo "== Java (transaction-service, needs JDK ${MIN_JAVA_MAJOR}+) =="
 java_major=""
 if have java; then
-  java_major=$(java -version 2>&1 | grep -o '"[0-9]\+' | head -1 | tr -d '"')
+  java_major=$(java -version 2>&1 | grep -o '"[0-9]\+' | head -1 | tr -d '"' || true)
 fi
 if [ -n "$java_major" ] && [ "$java_major" -ge "$MIN_JAVA_MAJOR" ]; then
   echo "  found: $(java -version 2>&1 | grep -m1 'version')"
@@ -189,8 +189,9 @@ else
     elif have sudo; then
       sudo "$tmp_clone"/install.sh /usr/local
     else
-      echo "  not root and no sudo on PATH -- can't install to /usr/local. Install JDK" \
-           "manually or install bats-core to a directory already on PATH." >&2
+      echo "  not root and no sudo on PATH -- can't install to /usr/local. Install" \
+           "bats-core ${MIN_BATS_MAJOR}.${MIN_BATS_MINOR}+ yourself, to a directory" \
+           "already on PATH, and re-run this script." >&2
       exit 1
     fi
     new_ver=""

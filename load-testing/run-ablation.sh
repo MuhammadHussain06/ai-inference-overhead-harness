@@ -21,8 +21,8 @@ for _req_lib in lib/host-provenance.sh lib/jvm-pins.sh lib/topology.sh; do
   fi
 done
 
-# Host-state provenance for ablation_run_metadata.json, and the JVM collector/thread-pool
-# guards. The Java cpuset is fixed across cells, so its pins hold for every cell.
+# Host-state provenance for ablation_run_metadata.json, plus the CPU-topology and JVM
+# collector/thread-pool guards every cell is gated on.
 . lib/host-provenance.sh
 . lib/jvm-pins.sh
 . lib/topology.sh
@@ -53,10 +53,9 @@ RAW_RESULTS_DIR="${RESULTS_DIR}/raw"
 rm -rf "$RAW_RESULTS_DIR"
 mkdir -p "$RESULTS_DIR" "$RAW_RESULTS_DIR"
 
-# analyze-ablation.py only reads these three metrics (checked directly in its
-# METRICS dict). http_req_duration is also kept, unused today, so a
-# taper-contamination check on these cells has what it needs without costing
-# anything extra to collect.
+# The three metrics in analyze-ablation.py's METRICS dict, plus http_req_duration,
+# which calibrate_ablation_cell() and analyze-ablation.py's table0 both read back out
+# of the finalized files. Dropping it breaks calibration, not just a taper check.
 ABLATION_KEEP_METRICS="python_thread_dispatch_time_ms,python_model_inference_time_ms,python_total_time_ms,http_req_duration"
 
 # Separate log files from run-suite.sh's, so an ablation run never trips
@@ -84,8 +83,8 @@ CPU_PIN_LOG="${RESULTS_DIR}/ablation_cpu_pin_check_log.txt"
 
 ABLATION_TARGET="${ABLATION_TARGET_OVERRIDE:-28}"
 ABLATION_VUS="${ABLATION_VUS_OVERRIDE:-64}"
-# Fallback only -- calibrate_ablation_cell() sets the real per-cell value.
-# Kept here as the metadata-recorded reference value.
+# Recorded in metadata as a reference value only: calibrate_ablation_cell() sets the
+# ABLATION_ITER_PER_VU that every measured cell is actually run at.
 ITERATIONS_PER_VU="${ABLATION_ITERATIONS_PER_VU_OVERRIDE:-100}"
 
 # Every ablation cell runs this same TARGET/VUS, so per-vu-iterations' tail
@@ -94,14 +93,14 @@ ITERATIONS_PER_VU="${ABLATION_ITERATIONS_PER_VU_OVERRIDE:-100}"
 # reruns per (arm, value, rep) cell, not once per rep.
 ABLATION_CALIB_ITER_PER_VU="${ABLATION_CALIB_ITER_PER_VU_OVERRIDE:-500}"
 ABLATION_CALIB_TARGET_DURATION_S="${ABLATION_CALIB_TARGET_DURATION_S_OVERRIDE:-60}"
-# Sets default replicate count to n=7 per arm to ensure statistical power for Mann-Whitney tests and bootstrap CIs.
+# Replicates per arm value; n=7 is what analyze-ablation.py's Mann-Whitney tests and
+# bootstrap CIs are sized against.
 REPS_ABLATION="${REPS_ABLATION_OVERRIDE:-7}"
 
-# ACPI/DPTF thermal negotiation isn't guaranteed to work (some hardware never
-# completes it -- e.g. _SB.IETM._OSC aborting at boot), leaving the OS blind
-# to platform thermal policy. check_thermal_safety() below reads
-# /sys/class/thermal directly instead of trusting a userspace daemon, so a
-# long pinned-core run pauses or aborts instead of hard-hanging.
+# ACPI/DPTF negotiation can fail at boot, leaving the OS blind to platform thermal
+# policy, so check_thermal_safety() reads /sys/class/thermal directly rather than
+# trusting a userspace daemon: a long pinned-core run then pauses or aborts instead
+# of hard-hanging.
 THERMAL_WARN_C="${THERMAL_WARN_C_OVERRIDE:-90}"
 THERMAL_CRIT_C="${THERMAL_CRIT_C_OVERRIDE:-95}"
 THERMAL_COOLDOWN_S="${THERMAL_COOLDOWN_S_OVERRIDE:-60}"
@@ -174,8 +173,9 @@ if [ "${#CELLS[@]}" -eq 0 ]; then
   exit 1
 fi
 
-# Unset by default -- warm-up.js's own 3000 default applies for the full ablation.
-# Set for a reduced-scale run so warm-up doesn't dwarf it.
+# Unset by default, which leaves converge_warmup()'s chunked convergence gate in charge.
+# Setting it switches warm-up.js to a single fixed-iteration pass and skips that gate,
+# for reduced-scale runs where warm-up would otherwise dwarf the cells.
 WARMUP_ITERATIONS_PER_TARGET_OVERRIDE="${WARMUP_ITERATIONS_PER_TARGET_OVERRIDE:-}"
 WARMUP_ENV_ARGS=(WARMUP_TARGETS="$ABLATION_TARGET" WARMUP_VUS="$ABLATION_VUS")
 if [ -n "$WARMUP_ITERATIONS_PER_TARGET_OVERRIDE" ]; then
@@ -195,12 +195,10 @@ capture_run_metadata() {
   cpu_count=$(nproc 2>/dev/null || echo "unknown")
   total_mem_kb=$(grep -m1 "MemTotal" /proc/meminfo 2>/dev/null | grep -o '[0-9]*' || echo "unknown")
 
-  # Reads the control cpuset for each service from the resolved compose config.
-  # python-service's cpuset varies per cell during the ablation run; this
-  # records the baseline/control value (0-2) written in docker-compose.yml.
-  # --profile loadgen is required: k6 is profile-gated, so plain `config`
-  # omits it and extract_cpuset "k6" would always return empty, silently
-  # skipping k6 from the physical-core isolation check below.
+  # Records each service's cpuset as the resolved compose config declares it;
+  # python-service's is the control value, since the cpuset arm sweeps others at runtime.
+  # --profile loadgen is required: k6 is profile-gated, so plain `config` omits it and
+  # extract_cpuset "k6" would always return empty, silently dropping k6 from the counts.
   local resolved_config
   resolved_config=$(docker compose -f "$COMPOSE_FILE" --profile loadgen config 2>/dev/null || echo "")
 
@@ -338,8 +336,8 @@ unresolved_cpus_in_cpuset() {
   echo "$n"
 }
 
-# Validates python-service cpusets per cell before load runs to prevent SMT sibling contention.
-# Ensures widening CPU allocation measures true hardware scaling rather than shared-core contention.
+# Rejects a cell whose python-service cpuset shares a physical core with Java or k6.
+# Re-run per cell because the cpuset arm changes python-service's placement on every one.
 verify_smt_isolation() {
   local label="$1" py_cpuset="$2"
 
@@ -397,9 +395,8 @@ record_env_sample() {
     >> "$ENV_TRACE_LOG"
 }
 
-# Trimmed from run-suite.sh's verify_cpu_pinning: python-service's cpuset
-# varies per cell here, so this compares live-vs-requested only (still the
-# check that matters -- whether the cgroup driver honored what was asked).
+# python-service's cpuset varies per cell, so this compares live against requested
+# only: whether the cgroup driver honored what this cell asked for.
 verify_cpu_pinning() {
   local label="$1"
   local py_container py_requested py_live
@@ -467,9 +464,9 @@ except Exception:
     abort_suite "[health] ${label}" "threadLimiterTokens (${live_tokens:-EMPTY}) != expected (${expected_tokens}) -- override did not take effect."
   fi
 
-  # Matches run-suite.sh: n_jobs=1 alone does not constrain the OpenMP layer beneath it.
-  # Comma-delimited match: a bare substring match on *OMP_NUM_THREADS=1* also accepts 10, 16,
-  # 100, 1024. All four variables are asserted, per the README.
+  # n_jobs=1 alone does not constrain the OpenMP/BLAS layer beneath it, so all four
+  # variables are asserted. The match is comma-delimited: a bare *OMP_NUM_THREADS=1*
+  # substring would also accept 10, 100 or 1024.
   local tvar
   for tvar in OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS NUMEXPR_NUM_THREADS; do
     case ",${thread_env}," in
@@ -480,9 +477,9 @@ except Exception:
   done
 }
 
-# Polls for workerPid coverage across $workers workers (the caller's loop variable,
-# visible here since it isn't local) -- more critical than in run-suite.sh, since
-# worker count is the manipulated variable in the workers/workers_token_matched arms.
+# Polls until each of $workers workers has answered /health, so n_jobs is confirmed on
+# every one; worker count is itself the manipulated variable in two of the arms.
+# $workers is the cell loop's variable, which is deliberately not declared local there.
 verify_tiers_runtime() {
   local label="$1"
   local expected_workers="${workers:-1}"
@@ -574,10 +571,9 @@ check_oom_killed() {
   fi
 }
 
-# Highest reading across all thermal zones, whole degrees C. Empty output
-# means no zone was readable -- callers treat that as "skip the check", not
-# as an abort, since this is a safety net on top of the real run, not a
-# requirement for it.
+# Highest reading across all thermal zones, whole degrees C. Empty output means no zone
+# was readable; callers skip the check rather than abort, since this is a safety net on
+# the run, not a precondition for it.
 read_max_cpu_temp_c() {
   local max="" raw t zone
   for zone in /sys/class/thermal/thermal_zone*/temp; do
@@ -593,10 +589,9 @@ read_max_cpu_temp_c() {
   return 0
 }
 
-# Pauses if temps are at/above THERMAL_WARN_C, giving the system a chance to
-# cool; aborts if still at/above THERMAL_CRIT_C after MAX_THERMAL_COOLDOWNS
-# pauses. Errs toward pausing over aborting on the first warning -- a hard
-# hang loses the whole run, a paused one only costs wall-clock time.
+# Pauses while at/above THERMAL_WARN_C, aborting only if still at/above THERMAL_CRIT_C
+# after MAX_THERMAL_COOLDOWNS pauses: a thermal hang loses the whole run, a pause costs
+# only wall-clock time.
 check_thermal_safety() {
   local label="$1"
   local temp cooldowns=0
@@ -663,7 +658,7 @@ with open(raw_path) as fin, gzip.open(final_path, 'wt') as fout:
 # override skips gating and runs a single fixed-iteration pass instead.
 WARMUP_CHUNK_DURATION_S=15
 MAX_WARMUP_CHUNKS=4
-WARMUP_WINDOW=100
+WARMUP_WINDOW=500
 WARMUP_TAIL_TOLERANCE_PCT=5.0
 WARMUP_TAIL_ABS_FLOOR_MS=0.25
 

@@ -30,8 +30,8 @@ public class TransactionService {
     private final WebClient webClient;
     private final FeatureTierRegistry featureTierRegistry;
 
-    // Fallback matches application.properties' documented fail-safe default (false);
-    // only used if the property is ever missing entirely.
+    // Fail-safe default, matching application.properties; applies only if the
+    // property is missing entirely.
     @Value("${app.db.save.enabled:false}")
     private boolean dbSaveEnabled;
 
@@ -45,10 +45,8 @@ public class TransactionService {
     public Mono<ResponseDto> processTransaction(RequestDto request, long requestStartNanos) {
         long overallStartTime = requestStartNanos;
 
-        // request, amount (presence + > 0), and strategy (presence) are already
-        // guaranteed by @Valid + the RequestDto bean-validation annotations by
-        // the time this method runs -- WebFlux validates before dispatch, so
-        // there's no need to re-check them here.
+        // Field-level presence and format are already enforced by @Valid before
+        // dispatch; only the cross-field strategy/tier rules are checked here.
         String strategy = request.getStrategy().toUpperCase(Locale.ROOT);
         String endpoint;
         Integer featureTier = null;

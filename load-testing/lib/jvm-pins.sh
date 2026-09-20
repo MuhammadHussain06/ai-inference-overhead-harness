@@ -12,8 +12,7 @@
 # thread census reads /proc only and runs after warm-up, once every event loop has
 # served traffic.
 
-# Resolves the transaction-service container, so call sites stay one-liners like the
-# harness's other per-rep guards.
+# Resolves the transaction-service container ID for the checks below.
 jvm_container() {
   local id
   id=$(docker compose -f "$COMPOSE_FILE" ps -q transaction-service 2>/dev/null || echo "")
@@ -26,9 +25,12 @@ jvm_container() {
 
 # Extracts the JVM options the compose file pins, so expectations track the compose
 # file rather than a second copy of the same numbers maintained by hand.
+# || true: head -1 can SIGPIPE sed, and a compose file that will not resolve exits
+# nonzero -- under pipefail either would abort here instead of reaching the callers'
+# own "no options pinned" message.
 jvm_pinned_options() {
   docker compose -f "$COMPOSE_FILE" config 2>/dev/null \
-    | sed -n 's/^ *JAVA_TOOL_OPTIONS: *//p' | head -1
+    | sed -n 's/^ *JAVA_TOOL_OPTIONS: *//p' | head -1 || true
 }
 
 # Reads a numeric -XX: or -D option out of an options string.
@@ -39,6 +41,10 @@ jvm_option_value() {
 # Reports "<value>|<origin>" for a flag as the JVM itself resolves it. The origin
 # distinguishes a pinned value from an ergonomic one that happens to coincide on
 # this host, which a value comparison alone cannot.
+#
+# || true: awk exits at the first match, so the JVM's remaining flag output SIGPIPEs
+# docker exec. Under pipefail that would abort before assert_jvm_flag() can report an
+# unreadable flag as the specific failure it is.
 jvm_resolved_flag() {
   docker exec "$1" sh -c 'java -XX:+PrintFlagsFinal -version 2>/dev/null' 2>/dev/null \
     | awk -v flag="$2" '$2 == flag {
@@ -46,7 +52,7 @@ jvm_resolved_flag() {
         for (i = 5; i <= NF; i++) origin = origin (origin ? " " : "") $i
         print $4 "|" origin
         exit
-      }'
+      }' || true
 }
 
 # Aborts unless the JVM resolves the flag to the expected value from an explicit

@@ -23,9 +23,9 @@ class TimingMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Everything here runs before the first request is served: model loading and
-    # estimator seeding must not land inside a measured request, and the thread
-    # limiter must hold one value for the whole process lifetime.
+    # Runs before the first request is served: model loading and estimator seeding
+    # must not land inside a measured request, and the thread limiter has to hold
+    # one value for the whole process lifetime.
     model_registry.load_all()
     calibrate_serialization_estimate()
     if settings.THREAD_LIMITER_TOKENS is not None:
@@ -42,8 +42,8 @@ app.add_middleware(TimingMiddleware)
 async def health():
     return {
         "status": "ok",
-        # Uvicorn runs several worker processes; this response describes whichever
-        # one answered. workerPid lets the harness tell them apart across polls.
+        # Uvicorn runs several worker processes, so this response describes only
+        # whichever one answered; workerPid tells them apart across polls.
         "workerPid": os.getpid(),
         "loadedTiers": list(model_registry.tiers.keys()),
         "nJobsVerified": {n: tier.n_jobs_verified for n, tier in model_registry.tiers.items()},

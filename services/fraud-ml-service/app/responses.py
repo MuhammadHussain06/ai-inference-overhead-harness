@@ -5,9 +5,9 @@ from fastapi import Response
 from .schemas import PythonTelemetryDto, TransactionResponse
 
 # Serialization cost cannot be measured in the live path: the field reporting it sits
-# inside the object being serialized. An EWMA of previous requests' measured cost
-# stands in. build_response runs on the event loop, so this global has one writer
-# per worker process.
+# inside the object being serialized, so an EWMA over previous requests stands in.
+# build_response runs on the event loop with no await between the read and the update
+# below, so this global needs no lock.
 _serialization_estimate_ms = None
 _EWMA_ALPHA = 0.1
 
@@ -64,7 +64,8 @@ def build_response(payload, is_fraud, risk_score, parsing_time_ms, comp_time_ms,
     )
 
     # start_total is the middleware stamp, so this spans the full Python-side wall
-    # time. Set before the one serialize call below; those bytes are final.
+    # time. It must be assigned before the single serialize call below, whose output
+    # bytes are returned as-is -- a later write would not reach the client.
     response_model.pythonTelemetry.totalPythonExecutionTimeMs = (
             (time.perf_counter() - start_total) * 1000 + _serialization_estimate_ms
     )

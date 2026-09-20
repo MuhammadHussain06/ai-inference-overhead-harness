@@ -73,7 +73,8 @@ export function randomFeatures(n) {
 }
 
 // Executes a target transaction and records k6 metrics alongside the nested Python
-// telemetry. extraTags (vus/phase/rep/arm) are analyze-results.py's grouping keys.
+// telemetry. extraTags carries the grouping keys the analysis reads: vus/phase/rep/rate
+// for analyze-results.py, arm/arm_value for analyze-ablation.py.
 export function sendTransaction(target, extraTags) {
   const tierLabel = target.label;
 

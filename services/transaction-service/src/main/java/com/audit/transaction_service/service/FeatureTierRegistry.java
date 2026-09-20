@@ -12,8 +12,8 @@ import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-// Dynamically fetches valid feature tiers from Python's /health endpoint at startup,
-// eliminating manual sync between Java and fraud-ml-service's FEATURE_TIERS.
+// Fetches the valid feature tiers from fraud-ml-service /health at startup, so this
+// side cannot drift from the Python FEATURE_TIERS setting.
 @Slf4j
 @Component
 public class FeatureTierRegistry {
@@ -29,8 +29,8 @@ public class FeatureTierRegistry {
         this.webClient = webClient;
     }
 
-    // Runs during bean creation to fail application startup immediately if tier
-    // initialization fails, preventing the server from starting with invalid state.
+    // In @PostConstruct so an unreachable fraud-ml-service fails startup outright
+    // rather than leaving the server accepting requests with no tier set.
     @PostConstruct
     public void init() {
         RuntimeException lastError = null;
@@ -51,7 +51,9 @@ public class FeatureTierRegistry {
                 lastError = e;
                 log.warn("[FeatureTierRegistry] Attempt {}/{} to reach fraud-ml-service /health failed: {}",
                         attempt, MAX_ATTEMPTS, e.getMessage());
-                sleepQuietly();
+                if (attempt < MAX_ATTEMPTS) {
+                    sleepQuietly();
+                }
             }
         }
         throw new IllegalStateException(
