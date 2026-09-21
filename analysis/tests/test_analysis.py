@@ -202,16 +202,17 @@ def test_load_results_extracts_tags_and_skips_non_point_records(tmp_path):
         + "{ not json\n"
         + _point("python_model_inference_time_ms", 3.0, tags) + "\n"
     )
-    df = results.load_results(str(tmp_path), prefixes=("scan_",))
+    df, true_counts = results.load_results(str(tmp_path), prefixes=("scan_",))
     assert len(df) == 2
     assert set(df["metric"]) == {"http_req_duration", "python_model_inference_time_ms"}
     assert df["vus"].tolist() == [64, 64]
     assert df["rep"].tolist() == ["3", "3"]
+    assert int(true_counts["true_n"].sum()) == 2
 
 
 def test_load_results_returns_none_when_no_file_matches_the_prefix(tmp_path):
     (tmp_path / "baseline_28_rep1.json").write_text(_point("http_req_duration", 1.0, {"tier": "28"}) + "\n")
-    assert results.load_results(str(tmp_path), prefixes=("scan_",)) is None
+    assert results.load_results(str(tmp_path), prefixes=("scan_",)) == (None, None)
 
 
 def test_load_results_raises_when_the_directory_holds_nothing(tmp_path):
@@ -227,7 +228,7 @@ def test_error_summary_splits_timeouts_from_http_errors(tmp_path):
              + [_point("http_req_duration", 5.0, dict(tags, status="502"))] * 2
              + [_point("http_req_duration", 0.0, dict(tags, status="0"))])
     (tmp_path / "scan_28_vus1_rep1.json").write_text("\n".join(lines) + "\n")
-    df = results.load_results(str(tmp_path), prefixes=("scan_",))
+    df, _ = results.load_results(str(tmp_path), prefixes=("scan_",))
     table = results.error_summary(df, "scan", ["tier"], lambda k: results._tier_label(k[0]))
     row = table.iloc[0]
     assert row["Total Requests"] == 10
@@ -235,6 +236,50 @@ def test_error_summary_splits_timeouts_from_http_errors(tmp_path):
     assert row["HTTP Errors (non-200 response)"] == 2
     assert row["Timeouts / Network Errors (no response)"] == 1
     assert row["Error Rate (%)"] == pytest.approx(30.0)
+
+
+def test_error_summary_uses_true_n_for_successful_when_given_true_counts(tmp_path):
+    """HTTP Errors/Timeouts are already exact (exempt from the reservoir), so only
+    Successful needs a true_counts correction; Total Requests and Error Rate must
+    follow from the corrected Successful, not the pre-correction len(g)."""
+    tags = {"tier": "28", "phase": "scan"}
+    lines = ([_point("http_req_duration", 5.0, dict(tags, status="200"))] * 3
+             + [_point("http_req_duration", 5.0, dict(tags, status="502"))] * 2)
+    (tmp_path / "scan_28_vus1_rep1.json").write_text("\n".join(lines) + "\n")
+    df, _ = results.load_results(str(tmp_path), prefixes=("scan_",))
+    true_counts = pd.DataFrame([{
+        "metric": "http_req_duration", "tier": "28", "phase": "scan", "status": "200",
+        "true_n": 9000, "true_min_time": pd.NaT, "true_max_time": pd.NaT,
+    }])
+    table = results.error_summary(df, "scan", ["tier"], lambda k: results._tier_label(k[0]),
+                                  true_counts=true_counts)
+    row = table.iloc[0]
+    assert row["Successful (200)"] == 9000
+    assert row["HTTP Errors (non-200 response)"] == 2
+    assert row["Total Requests"] == 9002
+    assert row["Error Rate (%)"] == pytest.approx(round(100 * 2 / 9002, 2))
+
+
+def test_summarize_reports_true_n_when_given_true_counts():
+    """The corrected count is display-only: mean/percentiles must still come from
+    the sample actually passed in, not be invented from the true count."""
+    sub_df = pd.DataFrame({"value": [1.0, 2.0, 3.0], "rep": ["1", "1", "1"]})
+    true_counts = pd.DataFrame([{
+        "metric": "http_req_duration", "tier": "28", "phase": "scan", "status": "200",
+        "true_n": 500, "true_min_time": pd.NaT, "true_max_time": pd.NaT,
+    }])
+    stats = results.summarize(sub_df, "v28 @ VUS=8", true_counts=true_counts,
+                              metric="http_req_duration", tier="28", phase="scan", status="200")
+    assert stats["N (pooled, all reps)"] == 500
+    assert stats["Mean (ms)"] == pytest.approx(2.0)
+
+
+def test_summarize_falls_back_to_sample_n_without_a_true_counts_match():
+    """A filter that matches nothing (or true_counts=None) must not zero out N --
+    the sample count is what's actually known in that case."""
+    sub_df = pd.DataFrame({"value": [1.0, 2.0, 3.0], "rep": ["1", "1", "1"]})
+    stats = results.summarize(sub_df, "v28 @ VUS=8")
+    assert stats["N (pooled, all reps)"] == 3
 
 
 # --- GC log parsing, effect size, and throughput edge cases ---
@@ -514,9 +559,11 @@ MAX_POINTS_PER_FILE = 250_000
 EXEMPT_METRICS = ("dropped_iterations", "request_http_error", "request_timeout_error")
 
 
-def _sampled_file(path, n_points, exempt=False):
-    """n_points http_req_duration points with distinct values, so which ones survived
-    sampling is observable, plus optionally one point of each exempt metric."""
+def _sampled_file(path, n_points, exempt=False, n_errors=0):
+    """n_points status=200 http_req_duration points with distinct values, so which ones
+    survived sampling is observable, plus optionally one point of each exempt metric and
+    n_errors non-200 http_req_duration points (distinct negative values, so they can't be
+    mistaken for a survived 200 point)."""
     with open(path, "w") as f:
         for i in range(n_points):
             f.write('{"type":"Point","metric":"http_req_duration","data":{"time":'
@@ -526,6 +573,10 @@ def _sampled_file(path, n_points, exempt=False):
             f.write(f'{{"type":"Point","metric":"{metric}","data":{{"time":'
                     '"2026-01-01T00:00:00.000000Z","value":1.0,'
                     '"tags":{"scenario":"s"}}}\n')
+        for i in range(n_errors):
+            f.write('{"type":"Point","metric":"http_req_duration","data":{"time":'
+                    f'"2026-01-01T00:00:00.000000Z","value":{-1 - i},'
+                    '"tags":{"tier":"28","status":"502","rep":"1","phase":"scan"}}}\n')
 
 
 @pytest.fixture(scope="module")
@@ -538,16 +589,29 @@ def oversized_results_dir(tmp_path_factory):
     return d
 
 
+@pytest.fixture(scope="module")
+def oversized_results_dir_exemptions(tmp_path_factory):
+    """A second oversized directory, separate from oversized_results_dir so its extra
+    files cannot shift that fixture's already-asserted point counts. Carries an
+    oversized scan_ file with 50 non-200 points mixed into the sampled ones, and an
+    equally oversized warmup_-prefixed file, for the two subsampling exemptions that
+    fixture doesn't cover."""
+    d = tmp_path_factory.mktemp("oversized_exemptions")
+    _sampled_file(d / "scan_28_vus64_rep1.json", MAX_POINTS_PER_FILE + 1000, n_errors=50)
+    _sampled_file(d / "warmup_baseline_rep1.json", MAX_POINTS_PER_FILE + 1000)
+    return d
+
+
 def test_load_results_keeps_every_point_below_the_sampling_cap(tmp_path, capsys):
     _sampled_file(tmp_path / "scan_28_vus64_rep1.json", 1000)
-    df = results.load_results(str(tmp_path), prefixes=("scan_",))
+    df, _ = results.load_results(str(tmp_path), prefixes=("scan_",))
     assert len(df) == 1000
     assert sorted(df["value"].tolist()) == [float(i) for i in range(1000)]
     assert "subsampled" not in capsys.readouterr().out
 
 
 def test_load_results_bounds_an_oversized_file_to_the_cap(oversized_results_dir, capsys):
-    df = results.load_results(str(oversized_results_dir), prefixes=("scan_",))
+    df, _ = results.load_results(str(oversized_results_dir), prefixes=("scan_",))
     assert int((df["metric"] == "http_req_duration").sum()) == MAX_POINTS_PER_FILE
     assert f"subsampled to {MAX_POINTS_PER_FILE}" in capsys.readouterr().out
 
@@ -557,7 +621,7 @@ def test_load_results_never_samples_out_the_always_keep_metrics(oversized_result
     them and a truncated cell reads as clean instead of tripping the check meant to
     catch it. They must arrive on top of a full reservoir, not compete for its slots."""
     assert sorted(results.ALWAYS_KEEP_METRICS) == sorted(EXEMPT_METRICS)
-    df = results.load_results(str(oversized_results_dir), prefixes=("scan_",))
+    df, _ = results.load_results(str(oversized_results_dir), prefixes=("scan_",))
     assert sorted(df[df["metric"].isin(EXEMPT_METRICS)]["metric"]) == sorted(EXEMPT_METRICS)
     assert len(df) == MAX_POINTS_PER_FILE + len(EXEMPT_METRICS)
 
@@ -565,6 +629,201 @@ def test_load_results_never_samples_out_the_always_keep_metrics(oversized_result
 def test_load_results_samples_deterministically_from_the_fixed_seed(oversized_results_dir):
     """Re-running the analysis on an unchanged dataset must not move the reported
     numbers; the seed is what makes a sampled table reproducible for the paper."""
-    first = results.load_results(str(oversized_results_dir), prefixes=("scan_",))
-    second = results.load_results(str(oversized_results_dir), prefixes=("scan_",))
+    first, _ = results.load_results(str(oversized_results_dir), prefixes=("scan_",))
+    second, _ = results.load_results(str(oversized_results_dir), prefixes=("scan_",))
     assert first["value"].tolist() == second["value"].tolist()
+
+
+def test_load_results_keeps_every_non_200_point_regardless_of_the_cap(oversized_results_dir_exemptions):
+    """Non-200 http_req_duration points feed error_summary()'s status-derived counts,
+    which crosscheck_error_counters() compares against the independently-incremented
+    request_http_error/request_timeout_error counters. Subsampling them alongside the
+    far more numerous 200s would turn that comparison into an estimate instead of an
+    exact, genuinely independent cross-check."""
+    df, _ = results.load_results(str(oversized_results_dir_exemptions), prefixes=("scan_",))
+    non200 = df[(df["metric"] == "http_req_duration") & (df["status"] != "200")]
+    assert len(non200) == 50
+    assert sorted(non200["value"].tolist()) == sorted([-1.0 - i for i in range(50)])
+
+
+def test_load_results_keeps_every_warmup_point_regardless_of_the_cap(oversized_results_dir_exemptions, capsys):
+    """converge_warmup()'s tail-window check needs a genuinely contiguous, time-ordered
+    tail; random subsampling would break that, so warmup_* files are exempt from the
+    reservoir entirely, no matter how large."""
+    df, _ = results.load_results(str(oversized_results_dir_exemptions), prefixes=("warmup_",))
+    assert int((df["metric"] == "http_req_duration").sum()) == MAX_POINTS_PER_FILE + 1000
+    assert "subsampled" not in capsys.readouterr().out
+
+
+def test_load_results_true_counts_track_the_full_count_despite_subsampling(oversized_results_dir):
+    """true_n for a subsampled metric is the number of points that actually existed
+    (MAX_POINTS_PER_FILE + 1000, from the oversized_results_dir fixture), not the
+    number the reservoir kept -- the whole point of the true-count side channel."""
+    df, true_counts = results.load_results(str(oversized_results_dir), prefixes=("scan_",))
+    match = true_counts[
+        (true_counts["metric"] == "http_req_duration") & (true_counts["status"] == "200")
+        & (true_counts["tier"] == "28") & (true_counts["phase"] == "scan") & (true_counts["rep"] == "1")
+    ]
+    assert int(match["true_n"].sum()) == MAX_POINTS_PER_FILE + 1000
+    assert int((df["metric"] == "http_req_duration").sum()) == MAX_POINTS_PER_FILE
+
+
+def test_true_counts_keeps_different_rate_cells_of_the_same_tier_separate(tmp_path):
+    """Open-loop cells share tier/phase/rep across different RATEs (unlike scan/baseline,
+    which never tag rate at all), so true_counts must key on rate too -- otherwise two
+    open-loop cells at the same tier would sum into one inflated true_n."""
+    tags = {"tier": "28", "phase": "openloop-check", "rep": "1", "status": "200"}
+    lines_16 = [_point("http_req_duration", 1.0, dict(tags, rate="16"))] * 30
+    lines_32 = [_point("http_req_duration", 1.0, dict(tags, rate="32"))] * 70
+    (tmp_path / "openloop_28_rate16.json").write_text("\n".join(lines_16) + "\n")
+    (tmp_path / "openloop_28_rate32.json").write_text("\n".join(lines_32) + "\n")
+    _, true_counts = results.load_results(str(tmp_path), prefixes=("openloop_",))
+    n16 = int(true_counts.loc[true_counts["rate"] == "16", "true_n"].sum())
+    n32 = int(true_counts.loc[true_counts["rate"] == "32", "true_n"].sum())
+    assert (n16, n32) == (30, 70)
+
+
+def _sampled_file_over_time(path, n_points, duration_s, extra_metrics=()):
+    """n_points status=200 http_req_duration points spread evenly over duration_s
+    (so true throughput is exactly (n_points - 1) / duration_s), plus, at each of
+    those same timestamps, one point for each of extra_metrics -- reproducing the
+    real shape that under-filled the reservoir: several metrics sharing one point
+    budget per file, none of them individually near the cap."""
+    step = duration_s / (n_points - 1) if n_points > 1 else 0.0
+    with open(path, "w") as f:
+        for i in range(n_points):
+            us = round(i * step * 1e6)
+            ts = "2026-01-01T00:%02d:%02d.%06dZ" % (us // 60000000, us // 1000000 % 60, us % 1000000)
+            f.write('{"type":"Point","metric":"http_req_duration","data":{"time":'
+                    f'"{ts}","value":{i},'
+                    '"tags":{"tier":"28","status":"200","rep":"1","phase":"scan","vus":"8"}}}\n')
+            for metric in extra_metrics:
+                f.write(f'{{"type":"Point","metric":"{metric}","data":{{"time":'
+                        f'"{ts}","value":1.0,'
+                        '"tags":{"tier":"28","status":"200","rep":"1","phase":"scan","vus":"8"}}}\n')
+
+
+def test_throughput_is_not_deflated_by_cross_metric_reservoir_sharing(tmp_path):
+    """Reproduces the actual bug: one metric's own point count stays under
+    MAX_POINTS_PER_FILE, but several metrics sharing that file's single reservoir
+    push the combined total over it, so http_req_duration itself gets subsampled
+    and _throughput_reqs_per_s()'s (n-1)/span reads out at roughly the subsampling
+    ratio instead of the metric's own true rate."""
+    n_points = MAX_POINTS_PER_FILE // 3
+    duration_s = 60.0
+    true_throughput = (n_points - 1) / duration_s
+    extra_metrics = [f"python_metric_{i}_ms" for i in range(9)]  # 10 metrics/point total
+    _sampled_file_over_time(tmp_path / "scan_28_vus8_rep1.json", n_points, duration_s, extra_metrics)
+    df, true_counts = results.load_results(str(tmp_path), prefixes=("scan_",))
+
+    n_kept = int(((df["metric"] == "http_req_duration") & (df["status"] == "200")).sum())
+    assert n_kept < n_points  # the bug's precondition: this file really did get subsampled
+
+    cell = df[(df["metric"] == "http_req_duration") & (df["status"] == "200")]
+    uncorrected = results._throughput_reqs_per_s(cell)
+    assert uncorrected < true_throughput * 0.9  # deflated by roughly the subsampling ratio
+
+    corrected = results._throughput_reqs_per_s(
+        cell, true_counts=true_counts, metric="http_req_duration",
+        phase="scan", status="200", tier="28", vus=8,
+    )
+    assert corrected == pytest.approx(true_throughput, rel=1e-6)
+
+
+# --- significance floor at low rep counts ---
+
+def _rep_means_df(tier, values, phase="baseline"):
+    return [{"metric": "http_req_duration", "phase": phase, "tier": tier,
+              "rep": str(i + 1), "value": v} for i, v in enumerate(values)]
+
+
+def test_pairwise_mannwhitney_warns_when_even_perfect_separation_cannot_reach_alpha(capsys):
+    """At 2 reps/side the minimum achievable two-sided p-value is 0.333, so this
+    comparison reads "Significant: No" even though the two groups are perfectly
+    separated -- indistinguishable, without the warning, from an actual null result."""
+    df = pd.DataFrame(_rep_means_df("5", [1.0, 1.1]) + _rep_means_df("28", [100.0, 101.0]))
+    table = results.pairwise_mannwhitney(df, "http_req_duration", "baseline", "tier",
+                                          ["5", "28"], lambda t: f"v{t}")
+    assert table.iloc[0]["Significant (Holm, alpha=0.05)"] == "No"
+    out = capsys.readouterr().out
+    assert "even perfect" in out and "v5 vs v28" in out
+
+
+def test_pairwise_mannwhitney_no_warning_once_alpha_is_reachable(capsys):
+    """At 4 reps/side the minimum achievable p (~0.029) clears alpha=0.05, so the
+    warning must not fire and muddy a comparison that is actually well-powered."""
+    df = pd.DataFrame(_rep_means_df("5", [1.0, 1.1, 1.2, 1.3])
+                       + _rep_means_df("28", [100.0, 101.0, 102.0, 103.0]))
+    results.pairwise_mannwhitney(df, "http_req_duration", "baseline", "tier",
+                                  ["5", "28"], lambda t: f"v{t}")
+    assert "even perfect" not in capsys.readouterr().out
+
+
+# --- table7: a totally overloaded open-loop cell must not vanish ---
+
+def _overloaded_openloop_rows(source_file, phase, rate, tier, n_failed, n_dropped, rep="1"):
+    """Every attempted request timed out (status=0, k6's no-response code) -- the
+    totally-overloaded case: zero 200 responses, but the cell must still be
+    identifiable via its non-200 http_req_duration points."""
+    rows = []
+    for _ in range(n_failed):
+        rows.append({"metric": "http_req_duration", "value": 5000.0, "status": "0",
+                     "phase": phase, "tier": tier, "rate": rate, "rep": rep,
+                     "vus": np.nan, "source_file": source_file,
+                     "time": pd.Timestamp("2026-01-01T00:00:00Z")})
+    for _ in range(n_dropped):
+        rows.append({"metric": "dropped_iterations", "value": 1.0, "status": np.nan,
+                     "phase": np.nan, "tier": np.nan, "rate": np.nan, "rep": np.nan,
+                     "vus": np.nan, "source_file": source_file,
+                     "time": pd.Timestamp("2026-01-01T00:00:00Z")})
+    return rows
+
+
+def test_openloop_check_reports_a_totally_overloaded_cell_instead_of_dropping_it(tmp_path):
+    """A cell where every request timed out (zero 200 responses) must still get a row
+    carrying its dropped_iterations count -- the exact overload signal table7 exists
+    to surface -- instead of vanishing because cell identity was built from 200-only
+    data."""
+    rows = _overloaded_openloop_rows("openloop_28_rate5000.json", "openloop-check", "5000", "28",
+                                      n_failed=50, n_dropped=200)
+    df = pd.DataFrame(rows)
+    results.analyze_openloop_check(df, str(tmp_path))
+    table = pd.read_csv(tmp_path / "tables" / "table7_openloop_validity_check.csv")
+    ol_rows = table[table["Model"].str.startswith("Open-loop")]
+    assert len(ol_rows) == 1
+    assert ol_rows.iloc[0]["Dropped iterations"] == 200
+    assert pd.isna(ol_rows.iloc[0]["P95 (ms)"])
+    assert ol_rows.iloc[0]["N"] == 0
+
+
+# --- silent success on empty/missing input ---
+
+def test_crosscheck_error_counters_warns_when_no_duration_table_to_check_against(capsys):
+    """No http_req_duration-derived table (e.g. that phase's load pass was skipped)
+    previously returned with no message at all -- indistinguishable from a real,
+    passing cross-check."""
+    df = pd.DataFrame({"phase": [], "metric": [], "value": []})
+    results.crosscheck_error_counters(df, "scan", ["tier"], lambda k: str(k[0]), None)
+    assert "did not run for this phase" in capsys.readouterr().out
+
+
+def test_analyze_measurement_floor_warns_when_the_floor_tier_has_no_rows(tmp_path, capsys):
+    """floor_tier listed in the run's order but producing zero rows (e.g. a failed
+    calibration cell) previously returned silently instead of explaining why
+    table1e is absent."""
+    e2e = pd.DataFrame({"tier": ["5", "5"], "value": [10.0, 12.0]})
+    results.analyze_measurement_floor(e2e, ["calibration", "5"], str(tmp_path))
+    assert "no valid values" in capsys.readouterr().out
+
+
+def test_analyze_gc_logs_warns_when_a_rep_has_no_parsable_records(tmp_path, capsys):
+    """A gc log with zero parsable lines produces a NaN gc_overhead_pct that fails the
+    ">1.0" comparison silently -- previously indistinguishable from a rep that was
+    fully parsed and genuinely under 1%."""
+    gc_dir = tmp_path / "gc-logs"
+    gc_dir.mkdir()
+    (gc_dir / "gc_baseline_rep1.log").write_text("")
+    results.analyze_gc_logs(str(tmp_path), str(tmp_path))
+    out = capsys.readouterr().out
+    assert "no measurable GC overhead" in out
+    assert "<=1% of wall-clock time in all reps" not in out

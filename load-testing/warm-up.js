@@ -26,15 +26,17 @@ if (USE_ITERATIONS) {
     const ITERATIONS_PER_TARGET = parseInt(ITERATIONS_PER_TARGET_RAW, 10);
     const ITERATIONS_PER_VU = Math.max(1, Math.ceil(ITERATIONS_PER_TARGET / VUS));
     // Buffer past MAX_DURATION_S so the next target's scenario doesn't overlap this
-    // one's. Holds while iterations finish inside MAX_DURATION_S; a run actually
-    // capped by maxDuration would drain into k6's default 30s gracefulStop, which is
-    // longer than this buffer.
+    // one's. gracefulStop: '0s' matches the constant-vus branch below -- without it,
+    // a run actually capped by maxDuration would drain into k6's default 30s
+    // gracefulStop, which is longer than this buffer and could bleed into the next
+    // target's slot.
     SLOT_S = MAX_DURATION_S + 5;
     scenarioFor = (key, i) => ({
         executor: 'per-vu-iterations',
         vus: VUS,
         iterations: ITERATIONS_PER_VU,
         maxDuration: `${MAX_DURATION_S}s`,
+        gracefulStop: '0s',
         startTime: `${i * SLOT_S}s`,
         exec: `warm_${key}`,
     });

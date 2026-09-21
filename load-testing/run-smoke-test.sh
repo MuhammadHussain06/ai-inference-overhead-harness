@@ -58,9 +58,10 @@ echo "[*] Smoke test 3/4: ablation slice -- exercises the cpuset arm's multi-ran
 # so it is the arm that catches a parsing regression in analyze-ablation.py.
 ABLATION_CELLS_OVERRIDE="cpuset:0-1:0-1:2.0:3:40 cpuset:0-1,4-5,8-9:0-1,4-5,8-9:6.0:3:40" \
 REPS_ABLATION_OVERRIDE=2 \
-ABLATION_ITERATIONS_PER_VU_OVERRIDE=10 \
 ABLATION_VUS_OVERRIDE=8 \
 WARMUP_ITERATIONS_PER_TARGET_OVERRIDE=20 \
+ABLATION_CALIB_ITER_PER_VU_OVERRIDE=20 \
+ABLATION_CALIB_TARGET_DURATION_S_OVERRIDE=5 \
 ./run-ablation.sh
 
 echo "[*] Smoke test 4/4: both analysis scripts"

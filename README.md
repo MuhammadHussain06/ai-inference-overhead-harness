@@ -202,9 +202,9 @@ Content-Type: application/json
   "strategy": "DISTRIBUTED_AI_SYNCHRONOUS",
   "featureTier": 10,
   "executionTimeMs": 14.7,
-  "requestParsingTimeMs": 0.03,
+  "requestPreprocessingTimeMs": 0.03,
   "aiCallRoundTripTimeMs": 8.9,
-  "estimatedNetworkOverheadMs": 6.59,
+  "estimatedBridgeOverheadMs": 6.59,
   "dbWriteTimeMs": 2.1,
   "responseObjectBuildTimeMs": 0.05,
   "pythonTelemetry": {
@@ -224,9 +224,9 @@ Content-Type: application/json
 
 | Field | Meaning |
 |---|---|
-| `requestParsingTimeMs` | Parse and validate the incoming DTO, including the strategy and feature-tier cross-field checks |
-| `aiCallRoundTripTimeMs` | Full Java-side timing of the call to `fraud-ml-service` |
-| `estimatedNetworkOverheadMs` | `aiCallRoundTripTimeMs` minus Python's `totalPythonExecutionTimeMs`: transit, FastAPI routing, queuing, outbound-pool wait |
+| `requestPreprocessingTimeMs` | From the `RequestTimingWebFilter` stamp (taken before WebFlux dispatch) to the start of the AI call: WebFlux dispatch, request body decode, bean validation (`@Valid`), and this service's own strategy/feature-tier cross-field checks. Despite the name, none of that is pure deserialization, hence "preprocessing" rather than "parsing" |
+| `aiCallRoundTripTimeMs` | Java-side timing of the call to `fraud-ml-service`, from just before the outbound request is sent to just after the response is received. Timed inside a `Mono.defer`, so the clock starts at actual subscription rather than at Mono assembly; without that, the gap between building the call and WebFlux actually subscribing to it (handler return, the downstream `.map`, WebFlux's own result-handler dispatch) would be charged here as network time instead of framework overhead |
+| `estimatedBridgeOverheadMs` | `aiCallRoundTripTimeMs` minus Python's `totalPythonExecutionTimeMs`: Docker bridge-network transit, FastAPI routing, queuing, outbound-pool wait. Not a real network hop, see [Threats to validity](#threats-to-validity) |
 | `dbWriteTimeMs` | `0.0` when `APP_DB_SAVE_ENABLED=false` (required for benchmarks) |
 | `responseObjectBuildTimeMs` | Time to assemble the final `ResponseDto` |
 | `executionTimeMs` | Full Java-side duration, timestamped from the WebFlux filter chain (`RequestTimingWebFilter`), so it includes Netty and WebFlux routing |
@@ -256,7 +256,7 @@ Content-Type: application/json
 | Port | `8000` | `8080` | n/a |
 | Cores (`cpuset`) | `0-1,4-5,8-9` (physical 0, 2, 4) | `2-3,6-7` (physical 1, 3) | `10-11,14-15` (physical 5, 7) |
 | Limit / reserved | 6.0 CPU / 3G RAM (1G reserved) | 4.0 CPU / 3G RAM (1G reserved) | 4.0 CPU / 1G RAM |
-| Notes | `UVICORN_WORKERS=3` and `THREAD_LIMITER_TOKENS=40` at benchmark time; `n_jobs=1` plus BLAS env vars keep each `predict_proba` call single-threaded, independent from the 3-worker concurrency | Outbound pool to Python sized via `python.service.max-connections` (default `128`); must stay at or above the highest VUS in `run-suite.sh`'s `CONCURRENCY_LEVELS` (currently `64`) or queueing inflates `estimatedNetworkOverheadMs`. `python.service.pending-acquire-timeout-ms` (default `5000`) bounds the wait. Feature-tier set fetched from Python's `/health` at startup, retrying up to 60s. Heap fixed via `JAVA_TOOL_OPTIONS=-Xms1536m -Xmx1536m` for reproducible sizing across hosts and reps | Runs in its own container on a disjoint cpuset. Gated behind the `loadgen` Compose profile; invoked per-cell by `run-suite.sh` via `docker compose run`, not started by `docker compose up` |
+| Notes | `UVICORN_WORKERS=3` and `THREAD_LIMITER_TOKENS=40` at benchmark time; `n_jobs=1` plus BLAS env vars keep each `predict_proba` call single-threaded, independent from the 3-worker concurrency | Outbound pool to Python sized via `python.service.max-connections` (default `128`); must stay at or above the highest VUS in `run-suite.sh`'s `CONCURRENCY_LEVELS` (currently `64`) or queueing inflates `estimatedBridgeOverheadMs`. `python.service.pending-acquire-timeout-ms` (default `5000`) bounds the wait. Feature-tier set fetched from Python's `/health` at startup, retrying up to 60s. Heap fixed via `JAVA_TOOL_OPTIONS=-Xms1536m -Xmx1536m` for reproducible sizing across hosts and reps | Runs in its own container on a disjoint cpuset. Gated behind the `loadgen` Compose profile; invoked per-cell by `run-suite.sh` via `docker compose run`, not started by `docker compose up` |
 
 The k6 image tag is pinned rather than floating, because it is the only image not built from this tree. `run_metadata.json` records the resolved digest for each run.
 
@@ -297,7 +297,7 @@ Check `run_failures_log.txt` and `cpu_pin_check_log.txt` afterward, and confirm 
 
 Table 0 is also expected to come out empty on a smoke run: its convergence check needs 1500 warm-up requests per cell (three 500-request windows) and the smoke slice sends about 20.
 
-`run-suite.sh`'s `TARGETS`, `CONCURRENCY_LEVELS`, `REPS_BASELINE`, `REPS_SCAN`, `BASELINE_ITERATIONS`, and `SCAN_ITERATIONS_PER_VU` are all overridable via `TARGETS_OVERRIDE`, `CONCURRENCY_OVERRIDE`, `REPS_BASELINE_OVERRIDE`, `REPS_SCAN_OVERRIDE`, `BASELINE_ITERATIONS_OVERRIDE`, and `SCAN_ITERATIONS_PER_VU_OVERRIDE`. `run-ablation.sh` takes `ABLATION_CELLS_OVERRIDE`, `REPS_ABLATION_OVERRIDE`, `ABLATION_VUS_OVERRIDE`, `ABLATION_TARGET_OVERRIDE` and `ABLATION_ITERATIONS_PER_VU_OVERRIDE`. `run-smoke-test.sh` is a thin wrapper setting both to a small slice; unset, each script behaves exactly as before.
+`run-suite.sh`'s `TARGETS`, `CONCURRENCY_LEVELS`, `REPS_BASELINE`, `REPS_SCAN`, `BASELINE_ITERATIONS`, and `SCAN_ITERATIONS_PER_VU` are all overridable via `TARGETS_OVERRIDE`, `CONCURRENCY_OVERRIDE`, `REPS_BASELINE_OVERRIDE`, `REPS_SCAN_OVERRIDE`, `BASELINE_ITERATIONS_OVERRIDE`, and `SCAN_ITERATIONS_PER_VU_OVERRIDE`. `run-ablation.sh` takes `ABLATION_CELLS_OVERRIDE`, `REPS_ABLATION_OVERRIDE`, `ABLATION_VUS_OVERRIDE`, `ABLATION_TARGET_OVERRIDE`, `ABLATION_CALIB_ITER_PER_VU_OVERRIDE` and `ABLATION_CALIB_TARGET_DURATION_S_OVERRIDE` (`ABLATION_ITERATIONS_PER_VU_OVERRIDE` also exists but only sets a metadata fallback; the measured cell's actual count always comes from calibration, so the two `ABLATION_CALIB_*_OVERRIDE` variables are what actually shrink an ablation slice). `run-smoke-test.sh` is a thin wrapper setting both to a small slice; unset, each script behaves exactly as before.
 
 ### Full suite
 
@@ -326,6 +326,8 @@ cd load-testing
 ```
 
 It holds the workload fixed at `TARGET=28`, `VUS=64` and sweeps one mechanism at a time across 11 cells in four arms: `thread_limiter` (40/64/128 tokens), `cpuset` (narrow/control/wide), `workers` (1/2/3 uvicorn processes), and `workers_token_matched` (1 and 3 workers with aggregate token capacity held constant, since the limiter is per process and a worker change otherwise moves both variables at once). Each cell is throughput-calibrated the same way the main suite's are, and gets the same warm-up convergence gate, cpu-pin and JVM-pin verification, and abort-on-invalid behavior.
+
+`table_ablation_control_vs_extreme` tests each arm's `CONTROL_CELL` value against the sweep value farthest from it, not against the sweep's low/high endpoints: for `thread_limiter` those are the same thing, but `cpuset`'s control sits mid-sweep and `workers`' control (3) is the sweep's *high* end, not its low one, so keying off endpoints directly would pair the wrong two cells and, for `workers`, mislabel which one is even "Control". `workers_token_matched` has no `CONTROL_CELL` entry (its two values are a matched pair at fixed aggregate token capacity, not a control-anchored sweep) and falls back to comparing its two values directly.
 
 ### Manual or one-off run
 
@@ -368,13 +370,13 @@ Output filenames must start with `openloop` (for example `openloop_28_rate32.jso
 | `run_order_log.txt` | Shuffle order per repetition |
 | `run_metadata.json` | Timestamp, Docker/Compose versions and k6 image digest, git commit and dirty flag, CPU/RAM, CPU governor and frequency snapshot, host provenance (`isolcpus` live state and boot cmdline, AC/battery power source, `irqbalance` status) |
 | `cpu_pin_check_log.txt` | Per-repetition requested-vs-live cpuset, including the `smt_check` lines |
-| `env_trace_log.txt` | Governor and per-core frequency sampled at both ends of every rep |
+| `env_trace_log.txt` | Governor and per-core frequency sampled at both ends of every rep. `freqs_khz` is `cpuN=khz` pairs in core-index order, not the glob order (`cpu0, cpu1, cpu10, cpu11, cpu2, ...`) the underlying shell expansion would otherwise produce, so a value is attributable to a specific core |
 | `run_failures_log.txt` | Empty on a valid run; any entry makes `analyze-results.py` reject the dataset |
 | `gc-logs/gc_<phase>_rep<N>.log` | JVM GC events for that rep's transaction-service lifetime |
 
 `run-ablation.sh` writes the same shapes under `ablation_` prefixes: `ablation_<arm>_<value>_rep<N>.json.gz` plus `ablation_warmup_*`, `ablation_calib_*`, `ablation_run_order_log.txt`, `ablation_run_metadata.json`, `ablation_cpu_pin_check_log.txt`, `ablation_env_trace_log.txt`, and `ablation_run_failures_log.txt`.
 
-Two details matter when reading the stored files. k6 writes its full unfiltered trail to `results/raw/` first; `finalize_result()` keeps only the metrics the analysis reads (`KEEP_METRICS`), gzips the result into `results/`, and deletes the raw copy, so the stored file is a filtered subset of k6's output rather than the raw stream. And at the start of a run, the previous run's JSON and logs are moved into `results/archive/<timestamp>/` rather than deleted, so only the top level is cleared.
+Two details matter when reading the stored files. k6 writes its full unfiltered trail to `results/raw/` first; `finalize_result()` keeps only the metrics the analysis reads (`KEEP_METRICS`, which includes `request_http_error` and `request_timeout_error` so `crosscheck_error_counters()`'s independent error-count check has data to run against), gzips the result into `results/`, and deletes the raw copy, so the stored file is a filtered subset of k6's output rather than the raw stream. And at the start of a run, the previous run's JSON and logs are moved into `results/archive/<timestamp>/` rather than deleted, so only the top level is cleared.
 
 Analysis output lands in `analysis/output/tables/` and `analysis/output/figures/`, each table as `.csv`, `.md` and `.tex`:
 
@@ -430,23 +432,29 @@ automatically on first `./mvnw test`, so there is nothing to pre-install there.
 ```bash
 ./install-test-deps.sh   # once, sets up every test toolchain below
 
-# Python service (42 tests): timing invariants, EWMA convergence,
-# n_jobs pinning, telemetry symmetry across the three strategies
+# Python service (50 tests): timing invariants, EWMA convergence,
+# n_jobs pinning, telemetry symmetry across the three strategies,
+# server-fault vs. client-input error classification
 cd services/fraud-ml-service
 .venv/bin/python3 -m pytest tests/ -q
 
-# Analysis pipeline (46 tests): cell-value parsing, throughput measurement,
+# Analysis pipeline (60 tests): cell-value parsing, throughput measurement,
 # cluster bootstrap, effect size, GC log parsing, k6 JSON loading,
-# reservoir sampling, warm-up convergence criterion
+# reservoir sampling (including the warm-up-file and non-200-point
+# exemptions), true request counts/throughput under subsampling, warm-up
+# convergence criterion, low-rep significance floor, open-loop cell
+# identity, and the four silent-success-on-empty-input guards
 cd analysis
 venv/bin/python3 -m pytest tests/ -q
 
-# Java service: network-overhead derivation, telemetry pass-through,
-# strategy routing, request-timing filter ordering
+# Java service: bridge-overhead derivation, netStart captured at Mono
+# subscription rather than assembly, telemetry pass-through, strategy
+# routing, request-timing filter ordering, ResponseStatusException status
+# codes preserved rather than reported as 500
 cd services/transaction-service
 ./mvnw test
 
-# Load-testing harness helpers (62 tests, bats-core): CPU-topology expansion and
+# Load-testing harness helpers (63 tests, bats-core): CPU-topology expansion and
 # formatting, SMT-sibling and cpuset-quota guards, JVM flag-origin parsing, the
 # shared k6 helpers in lib/common.js, the warm-up convergence gate, and the
 # throughput calibration derivation
@@ -462,13 +470,20 @@ What they guard, and why it matters for the results:
 | `test_model.py` timing invariants | Compute stall is never negative and never exceeds wall time; computation covers its own components |
 | `test_api.py` telemetry symmetry | All three strategies emit identical telemetry fields, the precondition for decomposition by subtraction |
 | `test_api.py` baseline-floor tests | `mock` and `calibration` genuinely report zero compute, so they bound inference cost |
-| `TransactionServiceTest` overhead tests | `estimatedNetworkOverheadMs` is exactly round-trip minus Python total, and negative values are preserved rather than hidden |
+| `test_model.py` error-classification tests | A `ValueError` raised inside `predict_proba` itself (a server-side computation fault) reports 500, distinct from the 400 the same exception type gets when it is the explicit too-few-features check |
+| `TransactionServiceTest` overhead tests | `estimatedBridgeOverheadMs` is exactly round-trip minus Python total, negative values are preserved rather than hidden, and `netStart` is captured at `Mono` subscription rather than assembly (a real gap between building and subscribing to the call is not charged to `aiCallRoundTripTimeMs`) |
+| `GlobalExceptionHandlerTest` | A `ResponseStatusException` (e.g. Spring's own 415 for an unsupported `Content-Type`) reports its own status rather than falling through to the generic 500 handler |
 | `RequestTimingWebFilterTest` | The request-start stamp anchoring every Java-side figure is taken at highest filter precedence |
 | `test_topology.bats` | Cpuset expansion and formatting, and the SMT-sibling and cpuset-quota guards, behave correctly on synthetic topologies the running host may not have (via `TOPO_SYSFS_ROOT`), the same mechanism the fault-injection suite reuses below |
 | `test_jvm_pins.bats` | Flag-origin parsing tells a pinned JVM value from one that merely coincides with it by ergonomics |
 | `test_warmup_convergence.bats` | The gate's window is large enough not to read per-request noise as drift, both bounds behave as documented, one lagging target blocks the chunk, non-200 points are excluded, and `run-ablation.sh`'s duplicated copy of the gate decides identically to `run-suite.sh`'s |
-| `test_calibration.bats` | The per-target iteration derivation scales inversely with concurrency, clamps at one iteration per VU, and fails loudly rather than carrying a previous target's counts forward when a calibration yields nothing |
+| `test_calibration.bats` | The per-target iteration derivation scales inversely with concurrency, clamps at one iteration per VU, fails loudly rather than carrying a previous target's counts forward when a calibration yields nothing, and matches `analyze-results.py`'s own `(N-1)/span` throughput convention |
 | `test_analysis.py` warm-up criterion tests | Table 0's criterion stays numerically identical to the live shell gate, parsed out of both scripts, so the reported verdict is the one the suite acted on |
+| `test_analysis.py` reservoir-sampling exemption tests | `warmup_*` files and non-200 `http_req_duration` points are retained in full regardless of file size, so the tail-window convergence check and the error-count cross-check are never degraded by random subsampling |
+| `test_analysis.py` true-count tests | Table 1/4/7's reported N and throughput reflect every request seen, not the reservoir's sampled subset -- including the cross-metric case where no single metric individually neared the cap but the file's combined point count still did -- and open-loop cells at different rates for the same tier are kept separate rather than summed |
+| `test_analysis.py` significance-floor test | `pairwise_mannwhitney` emits a `[!]` when the rep count makes even perfect separation unable to clear alpha, so "Significant: No" at low N is never misread as a null result |
+| `test_analysis.py` open-loop cell-identity test | A cell with zero 200 responses (total overload) still gets a table 7 row with its `dropped_iterations` count, instead of vanishing because cell identity was built from 200-only data |
+| `test_analysis.py` silent-success guard tests | `crosscheck_error_counters`, `analyze_measurement_floor` and `analyze_gc_logs` each emit a `[!]`/warning on empty or unmeasurable input instead of returning as if the check had passed |
 
 ---
 
@@ -490,7 +505,9 @@ cd fault-injection
 Runs entirely against a generated copy of the compose configuration under
 `fault-injection/scratch/`, whose bind mounts and results directory point inside
 `fault-injection/`, so nothing under the top-level `results/` is touched. Output goes to
-`fault-injection/results/guard_verification_report.{md,csv}`.
+`fault-injection/results/guard_verification_report.{md,csv}`, which is gitignored: like the
+main suite's `results/`, it is host- and run-specific regenerable evidence, not something
+this repo carries a checked-in copy of.
 
 | Case | Fault | Guard |
 |---|---|---|
@@ -504,7 +521,8 @@ Runs entirely against a generated copy of the compose configuration under
 | `07-gc-threads-unpinned` | GC worker-thread count left to JVM ergonomics | `[jvm-pin]` |
 | `08-collector-swapped` | Collector swapped from G1 to Parallel | `[jvm-pin]` |
 
-All nine passed on the reference host. One gap is disclosed rather than
+All nine passed on the reference host when last run; re-run `./verify-guards.sh` to confirm
+on yours, since the report itself is not committed (see above). One gap is disclosed rather than
 covered: a configuration whose pinned options are present in the compose file but never
 reach the JVM. No compose-level fault reproduces that, so the `[jvm-pin]` guard is only
 checked through the flag origin the JVM itself reports, not against that specific failure
@@ -535,14 +553,17 @@ are covered by the unit tests above instead.
 
 ## Experimental design rationale
 
-- **7 repetitions per cell.** Each rep is a full clean-slate restart, so the count is a wall-clock tradeoff against statistical power. At n=7 vs 7 the smallest achievable two-sided Mann-Whitney p-value is `2/C(14,7) = 0.00058`, which still clears α=0.05 after Holm correction across the five adjacent-tier comparisons (0.0029). At n=5 the floor is 0.0079, or 0.0397 corrected: significant, but with no margin for one noisy rep. Achieved N is printed with every result.
+- **7 repetitions per cell.** Each rep is a full clean-slate restart, so the count is a wall-clock tradeoff against statistical power. At n=7 vs 7 the smallest achievable two-sided Mann-Whitney p-value is `2/C(14,7) = 0.00058`, which still clears α=0.05 after Holm correction across the five adjacent-tier comparisons (0.0029). At n=5 the floor is 0.0079, or 0.0397 corrected: significant, but with no margin for one noisy rep. Achieved N is printed with every result. Below 7 reps, `pairwise_mannwhitney` checks the minimum p-value actually achievable at the realized rep count against alpha and prints a `[!]` when even perfect separation could not clear it (at 2 reps/side the floor is 0.333), so "Significant: No" on a short or smoke run is never misread as an actual null result rather than an underpowered test.
 - **Rep-level statistics, not request-level.** Requests within a rep share a JVM, a page cache and a thermal state, so they are not independent. All significance tests rank per-rep means and all CIs are cluster bootstraps that resample whole reps. Pooled request-level p-values appear in table 5 marked *diagnostic only* precisely because they are pseudoreplicated and would overstate significance.
 - **Closed-loop load model for the main suite.** `per-vu-iterations` fixes the number of in-flight requests, which is the model that matches a bounded caller pool and avoids unbounded queue growth invalidating high-concurrency cells. Its known cost is coordinated omission, so `run-target-openloop.js` runs a `constant-arrival-rate` check at the top cells and table 7 reports both side by side. Read the open-loop figure as the validity check on the closed-loop tail, not as a competing result.
-- **Cells are calibrated to a fixed duration, not a fixed iteration count.** Throughput differs by a large factor between targets, so a flat `ITERATIONS_PER_VU` would make a trivial target's cell span seconds and an AI tier's span minutes at the same nominal setting. `calibrate_target()` measures each target's real throughput per rep and derives the count that makes every cell at VUS 8 and above span about 60s. VUS 1, 2 and 4 keep the flat `SCAN_ITERATIONS_PER_VU` default.
+- **Cells are calibrated to a fixed duration, not a fixed iteration count.** Throughput differs by a large factor between targets, so a flat `ITERATIONS_PER_VU` would make a trivial target's cell span seconds and an AI tier's span minutes at the same nominal setting. `calibrate_target()` measures each target's real throughput per rep and derives the count that makes every cell at VUS 8 and above span about 60s. VUS 1, 2 and 4 keep the flat `SCAN_ITERATIONS_PER_VU` default. Measured throughput is `(N-1)/span`, not `N/span`: N completion timestamps bound N-1 inter-completion intervals, the same convention `analyze-results.py`'s own throughput figures (table 4, figure 4) use, so a calibration cell's derived iteration count and a reported throughput number are the same quantity.
 - **Order randomization.** Targets and concurrency levels are shuffled independently per rep, so thermal drift or a background daemon cannot systematically favour whichever target would otherwise always run first.
 - **Fixed model hyperparameters.** `max_depth=4`, `learning_rate=0.1`, untuned. Accuracy is never a measured outcome; the model is a stand-in inference workload chosen for its four-tier feature structure. Tuning it would change latency without making any reported claim more valid.
 - **Warm-up is gated on convergence, not on a fixed budget.** `converge_warmup()` re-runs warm-up in 15s chunks, up to four, and stops as soon as every target's tail has settled. Settling is judged by comparing the median of the last 500 requests against the 500 before them, and a target passes on whichever bound is looser for its latency scale: tail drift under 5%, or an absolute gap under 0.25 ms. The window has to be wide enough that it is not dominated by per-request sampling noise, which reads as drift on an already-settled target; the absolute floor exists because a percentage bound alone is unreachably tight for the sub-millisecond targets. If four chunks are not enough, the suite proceeds and records the fact rather than aborting, and table 0 reports the same criterion the gate applied, so an under-warmed window is visible rather than silently accepted.
 - **Warm-up convergence is judged on the tail.** Table 0 reports both drift from the first window, which is large by design and shows warm-up doing its job, and drift between the last two windows. Only the latter indicates steady state, and only it gates the `Converged` column.
+- **Table 1/4/7's request counts and throughput are corrected for reservoir subsampling.** `load_results()` pools every metric in a results file into one shared subsampling cap; a scan cell logging several metrics per request could have any single metric's own count stay well under the cap while the file's combined point count still tripped it, deflating the reported N and throughput by roughly the subsampling ratio. A true-count side channel tracks the exact pre-subsampling count and time span per cell, independent of what the reservoir kept, and `summarize`/`error_summary`/`_throughput_reqs_per_s` report from it instead of the subsampled sample's own count. Table 6's diagnostic-only Pooled N column is the one place this is not wired in -- correcting it without also recomputing its diagnostic p-value against the true full dataset would leave the row internally inconsistent.
+- **Warm-up files are exempt from `analyze-results.py`'s reservoir sampling entirely**, regardless of size. The tail-window convergence check needs a genuinely contiguous, time-ordered tail; randomly subsampling a `warmup_*` file the way scan/baseline files are capped would break that assumption right where table 0 reads it.
+- **An open-loop cell where every request fails still gets a table 7 row.** Cell identity (which tiers and rates were actually run) is read from all `http_req_duration` points regardless of status, not just the 200s; a cell so overloaded that nothing succeeded is exactly the case the open-loop check exists to surface, and it now reports `N=0` with its `dropped_iterations` count rather than disappearing from the table.
 
 ---
 
@@ -553,8 +574,8 @@ are covered by the unit tests above instead.
 - **Instrumentation overhead is measured, not removed.** The `calibration` target bounds it as a floor; it stays baked into the AI and mock numbers.
 - **`modelInferenceTimeMs` is the cost of obtaining a prediction, not the cost of tree traversal.** It covers the whole `predict_proba` call, and on this software stack that call is dominated by XGBoost's ingestion of the pandas DataFrame rather than by the booster. Micro-benchmarked against the committed artifacts at the pinned dependency versions, tier 28: the complete call is about 3.0 ms, of which the DataFrame to `DMatrix` conversion is about 2.9 ms (95%) and booster traversal about 0.05 ms (2%). The conversion cost is linear in column count, because XGBoost's dtype-inspection path runs per column per call, so the *tier scaling* of this field is predominantly a scaling of framework-level input marshalling. Reported as measured, because that is what a service written this way pays. Read it as such rather than as model-evaluation cost.
 - **The serialization figure is a self-referential estimate.** `totalPythonExecutionTimeMs` includes an EWMA estimate of the cost of serializing the very response that carries it. Table 2's `Serialization (% of total)` column bounds how much that circularity can matter, under 1% of total on every AI tier in practice.
-- **`estimatedNetworkOverheadMs` is a derived difference across two independent clocks**, so it can go negative. It is deliberately not clamped; table 2 reports the negative rate and minimum per tier. A small, tier-consistent rate is timer noise between processes; a large or tier-clustered rate would be a real measurement fault.
-- **"Network overhead" is Docker bridge-network overhead**, not a real network hop. It is the bridge and NAT path between two containers on one host, plus that serialization-estimation error. It is constant across strategies, so it cancels in differential comparisons, but should not be read as a WAN figure.
+- **`estimatedBridgeOverheadMs` is a derived difference across two independent clocks**, so it can go negative. It is deliberately not clamped; table 2 reports the negative rate and minimum per tier. A small, tier-consistent rate is timer noise between processes; a large or tier-clustered rate would be a real measurement fault. `aiCallRoundTripTimeMs`, the clock this is derived from, is timed inside a `Mono.defer` so its own clock starts at subscription rather than at Mono assembly; the field name reflects what it actually measures (see below), not a network hop.
+- **It is named for what it is: Docker bridge-network overhead, not a real network hop.** It is the bridge and NAT path between two containers on one host, plus that serialization-estimation error. It is constant across strategies, so it cancels in differential comparisons, but should not be read as a WAN figure.
 - **Requests can complete below the physical floor.** Table 1e counts requests faster than the fastest `calibration` request. Anything there is a timing artifact rather than a fast inference, and the affected tier's reported minimum should not be read as a real latency.
 - **`n_jobs=1` is verified at load and again after real inference**, and the BLAS/OpenMP caps (`OMP_NUM_THREADS` and friends) are asserted from `/health` each rep. Together that is a strong, not absolute, single-threading guarantee.
 - **The two zero-compute baselines are intrinsically noisier in relative terms.** `mock` and `calibration` cross the same wire and the same thread-dispatch path as the AI tiers but do no model computation, so there is no compute term to dilute scheduling and queueing jitter. Their coefficient of variation is roughly three times the AI tiers' at maximum concurrency, and their tail-to-median ratio several times larger. This is a property of what they measure, not a defect, but it does mean they clear the warm-up convergence gate less reliably than the tiers do, and that per-request variance on those two targets should not be read as instability of the harness.
@@ -596,7 +617,7 @@ are covered by the unit tests above instead.
 │   ├── analyze-results.py        # tables, figures, significance tests
 │   ├── analyze-ablation.py       # thread-dispatch mechanism sweep
 │   ├── plot_warmup_curve.py      # thermal diagnostic: latency vs VUs, temp and core frequency
-│   ├── tests/                    # pytest (46): parsing, throughput, bootstrap, GC, sampling, convergence
+│   ├── tests/                    # pytest (60): parsing, throughput, bootstrap, GC, sampling, convergence
 │   ├── requirements.txt
 │   └── requirements-dev.txt      # test-only: pytest, kept off analyze-*.py's real runtime deps
 ├── load-testing/
@@ -617,7 +638,7 @@ are covered by the unit tests above instead.
 │   │   ├── probe_warmup_settle.sh        # one target, past the cap, widenable criterion
 │   │   ├── calibrate_scan_iterations.sh  # per-host ITERATIONS_PER_VU derivation
 │   │   └── probe_ablation_taper.sh       # per-arm cell-duration check
-│   └── tests/                    # bats-core (62): topology, JVM pins, lib/common.js, warm-up gate, calibration
+│   └── tests/                    # bats-core (63): topology, JVM pins, lib/common.js, warm-up gate, calibration
 ├── fault-injection/
 │   ├── verify-guards.sh          # runs each case, records whether the expected guard fired
 │   ├── cases/*.case              # 9 cases, one misconfigured pinned setting each
@@ -635,7 +656,7 @@ are covered by the unit tests above instead.
     │   │   ├── schemas.py
     │   │   ├── responses.py         # shared response/telemetry builder
     │   │   └── routers/predict.py (POST /predict/v{n}), mock.py, calibration.py
-    │   ├── tests/                   # pytest (42): timing invariants, EWMA, telemetry symmetry
+    │   ├── tests/                   # pytest (50): timing invariants, EWMA, telemetry symmetry
     │   ├── requirements-dev.txt     # test-only deps, kept out of the service image
     │   ├── models/fraud_model_v{5,10,20,28}.joblib   # pretrained, committed
     │   └── training/train_model.py  # --n-features {5,10,20,28}, omit for all four

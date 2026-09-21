@@ -10,6 +10,13 @@
 # Usage: ./probe_ablation_taper.sh LABEL CPUSET CPUS WORKERS TOKENS [TARGET_DURATION_S]
 set -euo pipefail
 
+for _req_cmd in docker curl python3; do
+  if ! command -v "$_req_cmd" >/dev/null 2>&1; then
+    echo "[!] Required command not found: ${_req_cmd}. Aborting before touching any containers." >&2
+    exit 1
+  fi
+done
+
 LABEL="${1:?usage: probe_ablation_taper.sh LABEL CPUSET CPUS WORKERS TOKENS [TARGET_DURATION_S]}"
 CPUSET="${2:?cpuset required}"
 CPUS="${3:?cpus required}"
@@ -83,8 +90,19 @@ with open(fp) as f:
             continue
         times.append(parse_iso(obj["data"]["time"]))
 times.sort()
+if len(times) < 2:
+    print(f"[!] only {len(times)} phase=ablation http_req_duration point(s) -- need at least 2 "
+          f"to measure a time span. Check the calibration cell actually ran and produced traffic.",
+          file=sys.stderr)
+    sys.exit(1)
 duration = (times[-1] - times[0]).total_seconds()
-throughput = len(times) / duration
+if duration <= 0:
+    print(f"[!] {len(times)} points but a zero-length time span -- cannot compute throughput.",
+          file=sys.stderr)
+    sys.exit(1)
+# N completion timestamps bound N-1 inter-completion intervals, so the rate over that
+# span is (N-1)/span -- same convention as analyze-results.py's _throughput_reqs_per_s.
+throughput = (len(times) - 1) / duration
 target_total_requests = throughput * target_s
 print(max(1, round(target_total_requests / vus)))
 PYEOF

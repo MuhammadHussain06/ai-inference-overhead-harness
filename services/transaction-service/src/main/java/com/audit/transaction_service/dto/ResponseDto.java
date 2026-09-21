@@ -14,9 +14,9 @@ public class ResponseDto {
     private String transactionStatus;
 
     private double executionTimeMs;
-    private double requestParsingTimeMs;
+    private double requestPreprocessingTimeMs;
     private double aiCallRoundTripTimeMs;
-    private double estimatedNetworkOverheadMs;
+    private double estimatedBridgeOverheadMs;
     private double dbWriteTimeMs;
     private double responseObjectBuildTimeMs;
 
@@ -59,14 +59,14 @@ public class ResponseDto {
     public double getExecutionTimeMs() { return executionTimeMs; }
     public void setExecutionTimeMs(double executionTimeMs) { this.executionTimeMs = executionTimeMs; }
 
-    public double getRequestParsingTimeMs() { return requestParsingTimeMs; }
-    public void setRequestParsingTimeMs(double requestParsingTimeMs) { this.requestParsingTimeMs = requestParsingTimeMs; }
+    public double getRequestPreprocessingTimeMs() { return requestPreprocessingTimeMs; }
+    public void setRequestPreprocessingTimeMs(double requestPreprocessingTimeMs) { this.requestPreprocessingTimeMs = requestPreprocessingTimeMs; }
 
     public double getAiCallRoundTripTimeMs() { return aiCallRoundTripTimeMs; }
     public void setAiCallRoundTripTimeMs(double aiCallRoundTripTimeMs) { this.aiCallRoundTripTimeMs = aiCallRoundTripTimeMs; }
 
-    public double getEstimatedNetworkOverheadMs() { return estimatedNetworkOverheadMs; }
-    public void setEstimatedNetworkOverheadMs(double estimatedNetworkOverheadMs) { this.estimatedNetworkOverheadMs = estimatedNetworkOverheadMs; }
+    public double getEstimatedBridgeOverheadMs() { return estimatedBridgeOverheadMs; }
+    public void setEstimatedBridgeOverheadMs(double estimatedBridgeOverheadMs) { this.estimatedBridgeOverheadMs = estimatedBridgeOverheadMs; }
 
     public double getDbWriteTimeMs() { return dbWriteTimeMs; }
     public void setDbWriteTimeMs(double dbWriteTimeMs) { this.dbWriteTimeMs = dbWriteTimeMs; }

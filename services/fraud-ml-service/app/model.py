@@ -57,8 +57,13 @@ class FraudMLTier:
         cpu_start = time.thread_time()
         try:
             if len(payload.features) < self.n_features:
-                raise ValueError(
-                    f"Expected at least {self.n_features} feature values, got {len(payload.features)}"
+                # Raised as HTTPException directly, not ValueError: a bare ValueError
+                # here would be indistinguishable from one predict_proba raises for a
+                # server-side computation fault, and the except clause below would
+                # report both as this client error.
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Expected at least {self.n_features} feature values, got {len(payload.features)}"
                 )
 
             # log1p matches the transform train_model.py applies to Amount.
@@ -76,11 +81,12 @@ class FraudMLTier:
             model_inference_time_ms = (time.perf_counter() - start_infer) * 1000
 
             is_fraud = bool(risk_score >= settings.FRAUD_THRESHOLD)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid request: {e}")
         except HTTPException:
             raise
         except Exception as e:
+            # Includes ValueError raised inside predict_proba itself (e.g. a shape or
+            # NaN fault) -- those are server-side computation faults, not the client
+            # input problem the explicit HTTPException above already carves out.
             raise HTTPException(status_code=500, detail=f"Inference failed: {e}")  # server fault, not client error
 
         computation_time_ms = (time.perf_counter() - start_comp) * 1000

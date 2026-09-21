@@ -16,26 +16,30 @@ setup_file() {
   export ABLATION_SH="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)/run-ablation.sh"
 
   # n http_req_duration points spread evenly over duration_s, so the measured
-  # throughput is exactly n/duration_s. Extra non-scan and non-latency points are
-  # appended at the same timestamps: the derivation must ignore them rather than
-  # count them as completed requests.
+  # throughput is exactly (n-1)/duration_s (n timestamps bound n-1 intervals; see
+  # _throughput_reqs_per_s in analyze-results.py for the same convention). Extra
+  # non-scan and non-latency points are appended at the same timestamps: the
+  # derivation must ignore them rather than count them as completed requests.
+  # http_status defaults to "200"; a failed-request fixture passes "0" so tests
+  # can assert the derivation ignores points that never reached the service.
   cat > "${BATS_FILE_TMPDIR}/gen_calib.py" <<'EOF'
 import sys
 
 out, n, dur, phase = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
 noise = sys.argv[5] == "noise"
+http_status = sys.argv[6] if len(sys.argv) > 6 else "200"
 step = dur / (n - 1) if n > 1 else 0.0
 POINT = ('{"type":"Point","metric":"%s","data":{"time":"%s","value":1.0,'
-         '"tags":{"phase":"%s","tier":"28","status":"200"}}}\n')
+         '"tags":{"phase":"%s","tier":"28","status":"%s"}}}\n')
 with open(out, "w") as f:
     for i in range(n):
         us = round(i * step * 1e6)
         ts = "2026-01-01T00:%02d:%02d.%06dZ" % (us // 60000000, us // 1000000 % 60,
                                                 us % 1000000)
-        f.write(POINT % ("http_req_duration", ts, phase))
+        f.write(POINT % ("http_req_duration", ts, phase, http_status))
         if noise:
-            f.write(POINT % ("http_req_duration", ts, "warmup"))
-            f.write(POINT % ("python_total_time_ms", ts, phase))
+            f.write(POINT % ("http_req_duration", ts, "warmup", http_status))
+            f.write(POINT % ("python_total_time_ms", ts, phase, http_status))
 EOF
 
   # Constants plus the function, taken from the live script so the derivation runs
@@ -61,9 +65,10 @@ setup() {
   mkdir -p "$RESULTS_DIR"
 }
 
-# Writes the measurement k6 would have produced. Usage: measurement <n> <duration_s> [phase] [noise]
+# Writes the measurement k6 would have produced.
+# Usage: measurement <n> <duration_s> [phase] [noise] [http_status]
 measurement() {
-  python3 "${BATS_FILE_TMPDIR}/gen_calib.py" "$FIXTURE" "$1" "$2" "${3:-scan}" "${4:-clean}"
+  python3 "${BATS_FILE_TMPDIR}/gen_calib.py" "$FIXTURE" "$1" "$2" "${3:-scan}" "${4:-clean}" "${5:-200}"
 }
 
 # Builds a runnable harness around one extracted function. The suite runs under
@@ -89,9 +94,9 @@ harness() {
 # --- calibrate_target: the derivation ---
 
 @test "iterations per VU are derived so every level spans the target duration" {
-  # 128 requests over 6s is 21.33 req/s; at CALIB_TARGET_DURATION_S=60 a cell needs
-  # 1280 requests, split across each level's VUs.
-  measurement 128 6.0 scan noise
+  # 129 points span 128 intervals over 6s, 21.33 req/s; at CALIB_TARGET_DURATION_S=60
+  # a cell needs 1280 requests, split across each level's VUs.
+  measurement 129 6.0 scan noise
   harness extract_calib "$SUITE_SH" 'calibrate_target 28 1'
   run bash "${WORKDIR}/harness.sh"
   [ "$status" -eq 0 ]
@@ -101,7 +106,7 @@ harness() {
 @test "the derived counts scale inversely with concurrency, not with throughput alone" {
   # Twice the throughput of the case above: every level's count doubles, and the
   # 8:1 ratio between the lowest and highest level is unchanged.
-  measurement 256 6.0
+  measurement 257 6.0
   harness extract_calib "$SUITE_SH" 'calibrate_target 28 1'
   run bash "${WORKDIR}/harness.sh"
   [ "$status" -eq 0 ]
@@ -136,13 +141,13 @@ harness() {
   # CALIB_ITERATIONS_PER_VU is a global reused across targets. Carrying stale keys
   # into a target whose throughput they were never measured for would size every one
   # of its cells against another target, while the log reports them as calibrated.
-  measurement 128 6.0 scan
+  measurement 129 6.0 scan
   harness extract_calib "$SUITE_SH" 'calibrate_target 5 1'
   # Target 5 calibrates normally; the fixture is then replaced with one holding no
   # scan points, so target 28's calibration derives nothing.
   {
     cat "${WORKDIR}/harness.sh"
-    echo 'python3 "${GEN}" "$FIXTURE" 128 6.0 warmup clean'
+    echo 'python3 "${GEN}" "$FIXTURE" 129 6.0 warmup clean'
     echo 'calibrate_target 28 1'
   } > "${WORKDIR}/harness2.sh"
   GEN="${BATS_FILE_TMPDIR}/gen_calib.py" run bash "${WORKDIR}/harness2.sh"
@@ -160,6 +165,20 @@ harness() {
   run bash "${WORKDIR}/harness.sh"
   [ "$status" -ne 0 ]
   [[ "$output" != *"VUS8="* ]]
+}
+
+@test "a measurement whose points all failed yields no iteration count" {
+  # Every point present and phase=scan, but status!=200 (DNS/connection failure,
+  # timeout): the same "nothing usable" outcome as no scan points at all, not a
+  # throughput -- and iteration counts -- derived from traffic that never reached
+  # the service.
+  measurement 129 6.0 scan clean 0
+  harness extract_calib "$SUITE_SH" 'calibrate_target 28 1'
+  run bash "${WORKDIR}/harness.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"VUS8="* ]]
+  [[ "$output" == *"[FATAL]"* ]]
+  [[ "$output" == *"no iteration count derived"* ]]
 }
 
 # --- calibrate_ablation_cell: the same derivation at a single concurrency ---
@@ -187,6 +206,15 @@ harness() {
 
 @test "an ablation measurement with no usable points yields no iteration count" {
   measurement 128 6.0 scan
+  harness extract_ablation_calib "$ABLATION_SH" \
+    'calibrate_ablation_cell cpuset 0-1 1'
+  run bash "${WORKDIR}/harness.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"ITERATIONS_PER_VU="* ]]
+}
+
+@test "an ablation measurement whose points all failed yields no iteration count" {
+  measurement 128 6.0 ablation-calib clean 0
   harness extract_ablation_calib "$ABLATION_SH" \
     'calibrate_ablation_cell cpuset 0-1 1'
   run bash "${WORKDIR}/harness.sh"

@@ -25,7 +25,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.within;
 
 /**
- * Guards the Java-side measurement constructs the paper reports: the network-overhead
+ * Guards the Java-side measurement constructs the paper reports: the bridge-overhead
  * derivation, telemetry pass-through, and strategy routing.
  */
 class TransactionServiceTest {
@@ -96,27 +96,27 @@ class TransactionServiceTest {
         return service.processTransaction(request, System.nanoTime()).block();
     }
 
-    // network overhead derivation
+    // bridge overhead derivation
 
     @Test
-    void networkOverheadIsRoundTripMinusPythonTotal() {
+    void bridgeOverheadIsRoundTripMinusPythonTotal() {
         ResponseDto response = call(serviceReturning(pythonResponse(TELEMETRY_JSON), null),
                 request("DISTRIBUTED_AI_SYNCHRONOUS", 5));
 
-        assertThat(response.getEstimatedNetworkOverheadMs()).isEqualTo(
+        assertThat(response.getEstimatedBridgeOverheadMs()).isEqualTo(
                 response.getAiCallRoundTripTimeMs()
                         - response.getPythonTelemetry().getTotalPythonExecutionTimeMs());
     }
 
     @Test
-    void negativeNetworkOverheadIsPreservedNotClamped() {
+    void negativeBridgeOverheadIsPreservedNotClamped() {
         String inflated = TELEMETRY_JSON.replace("\"totalPythonExecutionTimeMs\":0.88",
                 "\"totalPythonExecutionTimeMs\":100000.0");
 
         ResponseDto response = call(serviceReturning(pythonResponse(inflated), null),
                 request("DISTRIBUTED_AI_SYNCHRONOUS", 5));
 
-        assertThat(response.getEstimatedNetworkOverheadMs()).isNegative();
+        assertThat(response.getEstimatedBridgeOverheadMs()).isNegative();
     }
 
     @Test
@@ -126,6 +126,20 @@ class TransactionServiceTest {
 
         assertThat(response.getAiCallRoundTripTimeMs()).isPositive();
         assertThat(response.getExecutionTimeMs()).isGreaterThanOrEqualTo(response.getAiCallRoundTripTimeMs());
+    }
+
+    @Test
+    void netStartIsCapturedAtSubscriptionNotAssembly() throws InterruptedException {
+        Mono<ResponseDto> unsubscribed = serviceReturning(pythonResponse(TELEMETRY_JSON), null)
+                .processTransaction(request("DISTRIBUTED_AI_SYNCHRONOUS", 5), System.nanoTime());
+
+        // A real gap between building the Mono and subscribing to it: exactly the gap
+        // Mono.defer excludes from aiCallRoundTripTimeMs.
+        Thread.sleep(50);
+
+        ResponseDto response = unsubscribed.block();
+
+        assertThat(response.getAiCallRoundTripTimeMs()).isLessThan(50.0);
     }
 
     @Test

@@ -215,6 +215,14 @@ capture_run_metadata() {
   java_cpuset=$(extract_cpuset "transaction-service")
   k6_cpuset=$(extract_cpuset "k6")
 
+  # extract_cpuset resolves empty if a service is missing from resolved_config, its
+  # cpuset key was renamed, or the compose file failed to resolve -- left unchecked,
+  # the metadata below would silently record "unknown" for a real, running service
+  # instead of surfacing the resolution failure.
+  [ -z "$py_cpuset" ] && abort_suite "[metadata]" "extract_cpuset resolved no cpuset for python-service."
+  [ -z "$java_cpuset" ] && abort_suite "[metadata]" "extract_cpuset resolved no cpuset for transaction-service."
+  [ -z "$k6_cpuset" ] && abort_suite "[metadata]" "extract_cpuset resolved no cpuset for k6."
+
   local py_cores java_cores k6_cores total_pinned_cores
   py_cores=$(count_cpuset_cores "${py_cpuset:-}")
   java_cores=$(count_cpuset_cores "${java_cpuset:-}")
@@ -267,8 +275,11 @@ EOF
 
 abort_suite() {
   local label="$1"; shift
-  echo "" | tee -a "$FAILURES_LOG"
-  echo "  [FATAL] ${label}: $*" | tee -a "$FAILURES_LOG"
+  # >&2 on every line: some callers (e.g. jvm_container()) run inside a caller's
+  # $( ), which would otherwise capture tee's stdout copy into that caller's
+  # variable instead of letting it reach the console.
+  echo "" | tee -a "$FAILURES_LOG" >&2
+  echo "  [FATAL] ${label}: $*" | tee -a "$FAILURES_LOG" >&2
   docker compose -f "$COMPOSE_FILE" down || true
   exit 1
 }
@@ -692,6 +703,15 @@ import json, sys
 from collections import defaultdict
 
 fp, window, tol, abs_floor = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+
+def ts_key(t):
+    # Go trims trailing zero fractional digits, so plain string comparison would
+    # sort a whole-second timestamp after a fractional one. Zero-pad the
+    # fractional part to a fixed width so comparison is numeric in effect.
+    body = t[:-1] if t.endswith("Z") else t
+    whole, _, frac = body.partition(".")
+    return whole, frac.ljust(9, "0")
+
 by_tier = defaultdict(list)
 with open(fp) as f:
     for line in f:
@@ -721,7 +741,7 @@ for pts in by_tier.values():
     if len(pts) < 3 * window:
         all_converged = False
         continue
-    pts.sort(key=lambda p: p[0])
+    pts.sort(key=lambda p: ts_key(p[0]))
     prev = sorted(v for _, v in pts[-2 * window:-window])[window // 2]
     last = sorted(v for _, v in pts[-window:])[window // 2]
     drift = 100 * (last - prev) / prev if prev else float("inf")
@@ -783,12 +803,26 @@ with gzip.open(fp, "rt") as f:
         obj = json.loads(line)
         if obj.get("type") != "Point" or obj.get("metric") != "http_req_duration":
             continue
-        if (obj["data"].get("tags") or {}).get("phase") != "ablation-calib":
+        tags = obj["data"].get("tags") or {}
+        if tags.get("phase") != "ablation-calib":
+            continue
+        # Same fix as calibrate_target() in run-suite.sh: a failed request still
+        # emits a phase=ablation-calib point, and counting it in would derive the
+        # cell's iteration count from traffic that never reached the service.
+        if tags.get("status") != "200":
             continue
         times.append(parse_iso(obj["data"]["time"]))
 times.sort()
+if len(times) < 2:
+    sys.exit(f"calibration produced {len(times)} usable ablation-calib point(s); need at least 2")
 duration = (times[-1] - times[0]).total_seconds()
-throughput = len(times) / duration
+if duration <= 0:
+    sys.exit("calibration points all share one timestamp; cannot derive throughput")
+# N completion timestamps bound N-1 inter-completion intervals, so the rate over that
+# span is (N-1)/span -- same convention as analyze-results.py's _throughput_reqs_per_s.
+# N/span overestimates by a factor of N/(N-1), negligible at real cell sizes but not
+# the same quantity.
+throughput = (len(times) - 1) / duration
 target_total_requests = throughput * target_s
 print(max(1, round(target_total_requests / vus)))
 PYEOF
@@ -848,8 +882,11 @@ done
 
 docker compose -f "$COMPOSE_FILE" down
 # Guards against an empty run: the completion banner would otherwise report success after
-# executing no cells at all.
-_n_cells=$(find "$RESULTS_DIR" -maxdepth 1 -name 'ablation_*_rep*.json.gz' 2>/dev/null | wc -l)
+# executing no cells at all. Excludes ablation_calib_* and ablation_warmup_* explicitly --
+# both also match 'ablation_*_rep*.json.gz', so without the exclusion this counted
+# calibration/warm-up files as cells and could never actually reach zero.
+_n_cells=$(find "$RESULTS_DIR" -maxdepth 1 -name 'ablation_*_rep*.json.gz' \
+  ! -name 'ablation_calib_*' ! -name 'ablation_warmup_*' 2>/dev/null | wc -l)
 if [ "$_n_cells" -eq 0 ]; then
   abort_suite "[ablation]" "no ablation cells were executed -- check ABLATION_CELLS_OVERRIDE and" \
     "REPS_ABLATION_OVERRIDE. Not reporting this run as successful."

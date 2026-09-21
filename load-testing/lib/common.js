@@ -32,7 +32,9 @@ const serializationTime = new Trend('python_serialization_time_ms', true);
 const totalPythonTime = new Trend('python_total_time_ms', true);
 
 // Java-side estimate: aiCallRoundTripTimeMs minus Python's own totalPythonExecutionTimeMs.
-const javaEstimatedNetworkOverhead = new Trend('java_estimated_network_overhead_ms', true);
+// Docker bridge-network and HTTP/serialization overhead between the two containers, not
+// a real network hop -- see README's telemetry notes.
+const javaEstimatedBridgeOverhead = new Trend('java_estimated_bridge_overhead_ms', true);
 // Java-side end-to-end. Recorded so http_req_duration minus this figure -- Netty
 // ingress, response encoding and the client hop -- is computable from the dataset.
 const javaExecutionTime = new Trend('java_execution_time_ms', true);
@@ -122,8 +124,8 @@ export function sendTransaction(target, extraTags) {
       } else {
         console.error(`200 response carried no pythonTelemetry [${target.strategy}/${tierLabel}]`);
       }
-      if (responseBody.estimatedNetworkOverheadMs !== undefined) {
-        javaEstimatedNetworkOverhead.add(responseBody.estimatedNetworkOverheadMs, tags);
+      if (responseBody.estimatedBridgeOverheadMs !== undefined) {
+        javaEstimatedBridgeOverhead.add(responseBody.estimatedBridgeOverheadMs, tags);
       }
       if (responseBody.executionTimeMs !== undefined) {
         javaExecutionTime.add(responseBody.executionTimeMs, tags);
