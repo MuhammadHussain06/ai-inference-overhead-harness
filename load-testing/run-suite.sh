@@ -142,7 +142,7 @@ declare -A CALIB_ITERATIONS_PER_VU
 # roughly twice this many; dropping the rest at write time roughly halves both
 # on-disk size and analyze-results.py's peak memory, which loads every Point it
 # sees regardless of whether anything downstream reads it.
-KEEP_METRICS="http_req_duration,http_req_blocked,dropped_iterations,python_parsing_time_ms,python_thread_dispatch_time_ms,python_computation_time_ms,python_dataframe_construction_time_ms,python_model_inference_time_ms,python_compute_stall_time_ms,python_serialization_time_ms,python_total_time_ms,java_estimated_network_overhead_ms"
+KEEP_METRICS="http_req_duration,http_req_blocked,dropped_iterations,request_http_error,request_timeout_error,python_parsing_time_ms,python_thread_dispatch_time_ms,python_computation_time_ms,python_dataframe_construction_time_ms,python_model_inference_time_ms,python_compute_stall_time_ms,python_serialization_time_ms,python_total_time_ms,java_estimated_bridge_overhead_ms"
 # Unset by default, which leaves warm-up.js on its duration-based path so
 # converge_warmup can drive it in chunks. Setting it (e.g. for the smoke test)
 # makes converge_warmup fall back to a single fixed-iteration pass, so a
@@ -496,7 +496,19 @@ verify_smt_isolation() {
 record_env_sample() {
   local governor freqs
   governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")
-  freqs=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | paste -sd, - || true)
+  # cpu* globs in lexicographic order (cpu0, cpu1, cpu10, cpu11, cpu2, ...), not core
+  # index order, and a bare comma list gave no way to tell which value was which core.
+  # Sorted numerically by core index and labeled "cpuN=khz" so each value attributes
+  # to a specific core.
+  freqs=$(
+    local f core
+    for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do
+      [ -r "$f" ] || continue
+      core="${f#/sys/devices/system/cpu/cpu}"
+      core="${core%%/*}"
+      echo "${core} cpu${core}=$(cat "$f" 2>/dev/null)"
+    done | sort -n -k1,1 | cut -d' ' -f2- | paste -sd, -
+  )
   echo "env_sample label=${1} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) governor=${governor} freqs_khz=${freqs:-unavailable}" \
     >> "$ENV_TRACE_LOG"
 }
@@ -517,12 +529,15 @@ read_live_cpuset() {
 abort_suite() {
   local label="$1"; shift
   local reason="$*"  # join remaining args -- callers pass the message across multiple lines
-  echo "" | tee -a "$FAILURES_LOG"
-  echo "  [FATAL] ${label}: ${reason}" | tee -a "$FAILURES_LOG"
-  echo "  [FATAL] Aborting suite. No results were written for this rep. Prior reps" | tee -a "$FAILURES_LOG"
-  echo "  [FATAL] already on disk in ${RESULTS_DIR} are unaffected and can be kept," | tee -a "$FAILURES_LOG"
-  echo "  [FATAL] but this suite invocation is incomplete -- fix the cause and" | tee -a "$FAILURES_LOG"
-  echo "  [FATAL] re-run run-suite.sh from the beginning." | tee -a "$FAILURES_LOG"
+  # >&2 on every line: some callers (e.g. jvm_container()) run inside a caller's
+  # $( ), which would otherwise capture tee's stdout copy into that caller's
+  # variable instead of letting it reach the console.
+  echo "" | tee -a "$FAILURES_LOG" >&2
+  echo "  [FATAL] ${label}: ${reason}" | tee -a "$FAILURES_LOG" >&2
+  echo "  [FATAL] Aborting suite. No results were written for this rep. Prior reps" | tee -a "$FAILURES_LOG" >&2
+  echo "  [FATAL] already on disk in ${RESULTS_DIR} are unaffected and can be kept," | tee -a "$FAILURES_LOG" >&2
+  echo "  [FATAL] but this suite invocation is incomplete -- fix the cause and" | tee -a "$FAILURES_LOG" >&2
+  echo "  [FATAL] re-run run-suite.sh from the beginning." | tee -a "$FAILURES_LOG" >&2
   docker compose -f "$COMPOSE_FILE" down || true
   exit 1
 }
@@ -693,7 +708,16 @@ except Exception:
 # configured worker count or exhausts its attempts, and reports how many it covered.
 verify_tiers_runtime() {
   local label="$1"
-  local expected_workers="${UVICORN_WORKERS:-3}"
+  local expected_workers
+  # Reads the resolved compose config rather than this shell's own UVICORN_WORKERS:
+  # a value set via .env (which compose reads directly) would never reach this
+  # process's environment, leaving the poll count silently wrong for whatever the
+  # container actually started with.
+  expected_workers=$(compose_service_value "python-service" UVICORN_WORKERS)
+  if [ -z "$expected_workers" ]; then
+    abort_suite "[tier-runtime] ${label}" "could not resolve UVICORN_WORKERS from the resolved compose" \
+      "config for python-service -- the worker count to poll for is unknown rather than assumed."
+  fi
   local seen_pids="" runtime_state sample pid
   local attempts=$((expected_workers * 10))
 
@@ -880,6 +904,15 @@ import json, sys
 from collections import defaultdict
 
 fp, window, tol, abs_floor = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+
+def ts_key(t):
+    # Go trims trailing zero fractional digits, so plain string comparison would
+    # sort a whole-second timestamp after a fractional one. Zero-pad the
+    # fractional part to a fixed width so comparison is numeric in effect.
+    body = t[:-1] if t.endswith("Z") else t
+    whole, _, frac = body.partition(".")
+    return whole, frac.ljust(9, "0")
+
 by_tier = defaultdict(list)
 with open(fp) as f:
     for line in f:
@@ -909,7 +942,7 @@ for pts in by_tier.values():
     if len(pts) < 3 * window:
         all_converged = False
         continue
-    pts.sort(key=lambda p: p[0])
+    pts.sort(key=lambda p: ts_key(p[0]))
     prev = sorted(v for _, v in pts[-2 * window:-window])[window // 2]
     last = sorted(v for _, v in pts[-window:])[window // 2]
     drift = 100 * (last - prev) / prev if prev else float("inf")
@@ -979,7 +1012,15 @@ with gzip.open(fp, "rt") as f:
         obj = json.loads(line)
         if obj.get("type") != "Point" or obj.get("metric") != "http_req_duration":
             continue
-        if (obj["data"].get("tags") or {}).get("phase") != "scan":
+        tags = obj["data"].get("tags") or {}
+        if tags.get("phase") != "scan":
+            continue
+        # A failed request (connection error, timeout, DNS failure) still emits a
+        # phase=scan point; counting it in would derive throughput -- and therefore
+        # every level's iteration count -- from traffic that never reached the
+        # service. Same filter analyze-results.py applies before its own throughput
+        # calcs (e.g. table2's scan-phase e2e figures).
+        if tags.get("status") != "200":
             continue
         times.append(parse_iso(obj["data"]["time"]))
 times.sort()
@@ -988,7 +1029,11 @@ if len(times) < 2:
 duration = (times[-1] - times[0]).total_seconds()
 if duration <= 0:
     sys.exit("calibration points all share one timestamp; cannot derive throughput")
-throughput = len(times) / duration
+# N completion timestamps bound N-1 inter-completion intervals, so the rate over that
+# span is (N-1)/span -- same convention as analyze-results.py's _throughput_reqs_per_s.
+# N/span overestimates by a factor of N/(N-1), negligible at real cell sizes but not
+# the same quantity.
+throughput = (len(times) - 1) / duration
 target_total_requests = throughput * target_s
 for vus in levels:
     print(vus, max(1, round(target_total_requests / vus)))

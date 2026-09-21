@@ -13,6 +13,13 @@
 # Usage: ./calibrate_scan_iterations.sh TIER [REFERENCE_VUS] [TARGET_DURATION_S] [CALIBRATION_ITER_PER_VU]
 set -euo pipefail
 
+for _req_cmd in docker curl python3; do
+  if ! command -v "$_req_cmd" >/dev/null 2>&1; then
+    echo "[!] Required command not found: ${_req_cmd}. Aborting before touching any containers." >&2
+    exit 1
+  fi
+done
+
 TIER="${1:?usage: calibrate_scan_iterations.sh TIER [REFERENCE_VUS] [TARGET_DURATION_S] [CALIBRATION_ITER_PER_VU]}"
 REFERENCE_VUS="${2:-16}"
 TARGET_DURATION_S="${3:-60}"
@@ -21,7 +28,10 @@ CALIBRATION_ITER_PER_VU="${4:-2000}"
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 COMPOSE_FILE="../../docker-compose.yml"
-RESULTS_DIR="${RESULTS_DIR_OVERRIDE:-../../results}"
+# No override: RESULTS_DIR_OVERRIDE used to redirect only this host-side path,
+# not CONTAINER_OUT below, so any non-default value made the python step read
+# a file k6 never wrote. Nothing in the tree ever set it.
+RESULTS_DIR="../../results"
 # Path as the k6 container sees it (docker-compose.yml mounts ./results -> /results).
 CONTAINER_OUT="/results/calib_${TIER}_vus${REFERENCE_VUS}.json"
 # Same file, as this host sees it -- the python step below runs outside docker.
@@ -65,8 +75,20 @@ with open(fp) as f:
         times.append(parse_iso(obj["data"]["time"]))
 
 n = len(times)
+if n < 2:
+    print(f"[!] only {n} phase=scan http_req_duration point(s) in {fp!r} -- need at least 2 "
+          f"to measure a time span. Check the cell actually ran and produced traffic.",
+          file=sys.stderr)
+    sys.exit(1)
+
 duration = (max(times) - min(times)).total_seconds()
-throughput = n / duration
+if duration <= 0:
+    print(f"[!] {n} points but a zero-length time span -- cannot compute throughput.",
+          file=sys.stderr)
+    sys.exit(1)
+# N completion timestamps bound N-1 inter-completion intervals, so the rate over that
+# span is (N-1)/span -- same convention as analyze-results.py's _throughput_reqs_per_s.
+throughput = (n - 1) / duration
 target_total_requests = throughput * target_s
 
 print(f"measured: n={n} duration={duration:.2f}s throughput={throughput:.1f} req/s")

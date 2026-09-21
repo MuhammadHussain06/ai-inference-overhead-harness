@@ -263,9 +263,15 @@ def build_control_agreement_table(df, metric="python_thread_dispatch_time_ms"):
 
 
 def control_vs_extreme_test(df, metric="python_thread_dispatch_time_ms"):
-    """Rep-level Mann-Whitney between the endpoints of each arm's ordered sweep:
-    lowest- against highest-sorting arm_value. For cpuset, workers and
-    workers_token_matched the low endpoint is not the CONTROL_CELL value.
+    """Rep-level Mann-Whitney between each arm's CONTROL_CELL value and the sweep
+    point farthest from it in sorted order. thread_limiter's control already sits
+    at a sweep endpoint, so its comparison is unchanged by this; cpuset's control
+    is mid-sweep, and workers' control (3) is the high end, not the low one -- for
+    both, keying off the sweep endpoints directly previously paired the wrong two
+    cells and, for workers, swapped which one was even labelled Control.
+    workers_token_matched has no CONTROL_CELL entry (its two values are a matched
+    pair at fixed token capacity, not a control-anchored sweep), so it falls back
+    to comparing its two values directly.
     One planned comparison per arm, so no multiple-comparison correction applies."""
     rows = []
     for arm in sorted(df["arm"].unique()):
@@ -273,7 +279,13 @@ def control_vs_extreme_test(df, metric="python_thread_dispatch_time_ms"):
         values = sorted(arm_df["arm_value"].unique(), key=_value_sort_key)
         if len(values) < 2:
             continue
-        control, extreme = values[0], values[-1]
+        control_value = CONTROL_CELL.get(arm)
+        if control_value is not None and control_value in values:
+            control = control_value
+            idx = values.index(control)
+            extreme = values[-1] if idx <= (len(values) - 1 - idx) else values[0]
+        else:
+            control, extreme = values[0], values[-1]
         control_means = arm_df[arm_df["arm_value"] == control].groupby("rep")["value"].mean()
         extreme_means = arm_df[arm_df["arm_value"] == extreme].groupby("rep")["value"].mean()
         if len(control_means) < 2 or len(extreme_means) < 2:
@@ -365,6 +377,17 @@ def plot_ablation(df, output_dir):
     print(f"[+] Figure -> {figures_dir}/figure_ablation_mechanisms.png / .pdf")
 
 
+def _ts_sort_key(t):
+    """Sort key for an RFC3339Nano timestamp string. Go trims trailing zero
+    fractional digits (and the '.' entirely for a whole-second value), so plain
+    string comparison would sort '...07Z' after '...07.5Z'. Splitting off the
+    fractional part and zero-padding it to a fixed width restores numeric order
+    without needing full datetime parsing (which caps at microsecond precision)."""
+    body = t[:-1] if t.endswith("Z") else t
+    whole, _, frac = body.partition(".")
+    return whole, frac.ljust(9, "0")
+
+
 def build_ablation_warmup_table(results_dir, window_size=500, tail_tolerance_pct=5.0,
                                 tail_abs_floor_ms=0.25):
     """Per-cell warm-up convergence check -- same criterion as analyze-results.py's
@@ -407,7 +430,7 @@ def build_ablation_warmup_table(results_dir, window_size=500, tail_tolerance_pct
                     points.append((t, v))
         if len(points) < 3 * window_size:
             continue
-        points.sort(key=lambda p: p[0])
+        points.sort(key=lambda p: _ts_sort_key(p[0]))
         values = [v for _, v in points]
         p50_first = float(np.percentile(values[:window_size], 50))
         p50_prev = float(np.percentile(values[-2 * window_size:-window_size], 50))
