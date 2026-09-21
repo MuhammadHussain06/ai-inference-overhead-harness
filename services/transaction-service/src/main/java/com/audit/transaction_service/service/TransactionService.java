@@ -81,7 +81,10 @@ public class TransactionService {
 
         final Integer resolvedFeatureTier = featureTier;
 
-        double requestParsingTimeMs = (System.nanoTime() - requestStartNanos) / 1_000_000.0;
+        // Covers WebFlux dispatch, body decode and bean validation (timed from the
+        // filter's stamp) plus the cross-field switch above; despite the name, none of
+        // that is pure deserialization.
+        double requestPreprocessingTimeMs = (System.nanoTime() - requestStartNanos) / 1_000_000.0;
 
         // Forwards the full feature list unsliced, so the request body is the same size
         // for every tier and payload size cannot explain a tier difference.
@@ -91,24 +94,27 @@ public class TransactionService {
                 request.getFeatures()
         );
 
-        // Taken immediately before the call so aiCallRoundTripTimeMs covers the wire
-        // and the peer, not local object construction.
-        long netStart = System.nanoTime();
+        // Deferred so netStart is read at subscription, not here at assembly time.
+        // Without this, the gap between assembly and Spring actually subscribing
+        // (handler return, downstream .map, WebFlux's result-handler dispatch) is
+        // charged to aiCallRoundTripTimeMs instead of framework overhead.
+        return Mono.defer(() -> {
+                    long netStart = System.nanoTime();
+                    return webClient.post()
+                            .uri(endpoint)
+                            .bodyValue(aiPayload)
+                            .retrieve()
+                            .bodyToMono(AiRiskResponse.class)
+                            .map(aiResponse -> {
+                                double aiCallRoundTripTimeMs = (System.nanoTime() - netStart) / 1_000_000.0;
+                                double riskScore = (aiResponse != null) ? aiResponse.getRiskScore() : 0.0;
+                                boolean isFraud = (aiResponse != null) && aiResponse.isFraud();
+                                ResponseDto.PythonTelemetryDto pythonTelemetry = (aiResponse != null && aiResponse.getPythonTelemetry() != null)
+                                        ? aiResponse.getPythonTelemetry()
+                                        : new ResponseDto.PythonTelemetryDto();
 
-        return webClient.post()
-                .uri(endpoint)
-                .bodyValue(aiPayload)
-                .retrieve()
-                .bodyToMono(AiRiskResponse.class)
-                .map(aiResponse -> {
-                    double aiCallRoundTripTimeMs = (System.nanoTime() - netStart) / 1_000_000.0;
-                    double riskScore = (aiResponse != null) ? aiResponse.getRiskScore() : 0.0;
-                    boolean isFraud = (aiResponse != null) && aiResponse.isFraud();
-                    ResponseDto.PythonTelemetryDto pythonTelemetry = (aiResponse != null && aiResponse.getPythonTelemetry() != null)
-                            ? aiResponse.getPythonTelemetry()
-                            : new ResponseDto.PythonTelemetryDto();
-
-                    return new IntermediateResult(riskScore, isFraud, aiCallRoundTripTimeMs, pythonTelemetry);
+                                return new IntermediateResult(riskScore, isFraud, aiCallRoundTripTimeMs, pythonTelemetry);
+                            });
                 })
 
                 .onErrorMap(e -> !(e instanceof UpstreamInferenceException), e -> {
@@ -167,18 +173,18 @@ public class TransactionService {
                                 .map(savedEntity -> {
                                     double dbWriteTimeMs = (System.nanoTime() - dbStart) / 1_000_000.0;
                                     return buildResponse(request, riskScore, status, strategy, resolvedFeatureTier,
-                                            overallStartTime, requestParsingTimeMs, aiCallRoundTripTimeMs,
+                                            overallStartTime, requestPreprocessingTimeMs, aiCallRoundTripTimeMs,
                                             dbWriteTimeMs, pythonTelemetry);
                                 });
                     } else {
                         return Mono.fromCallable(() -> buildResponse(request, riskScore, status, strategy, resolvedFeatureTier,
-                                overallStartTime, requestParsingTimeMs, aiCallRoundTripTimeMs, 0.0, pythonTelemetry));
+                                overallStartTime, requestPreprocessingTimeMs, aiCallRoundTripTimeMs, 0.0, pythonTelemetry));
                     }
                 });
     }
 
     private ResponseDto buildResponse(RequestDto request, double riskScore, String status, String strategy,
-                                      Integer featureTier, long overallStartTime, double parseTime, double netTime,
+                                      Integer featureTier, long overallStartTime, double preprocessingTime, double netTime,
                                       double dbTime, ResponseDto.PythonTelemetryDto pythonTelemetry) {
         // executionTimeMs first, so responseObjectBuildTimeMs measures the DTO assembly
         // alone. Neither includes WebFlux's serialization of the response body.
@@ -196,14 +202,14 @@ public class TransactionService {
         response.setAmount(request.getAmount());
         response.setTransactionType(request.getTransactionType());
         response.setFeatureTier(featureTier);
-        response.setRequestParsingTimeMs(parseTime);
+        response.setRequestPreprocessingTimeMs(preprocessingTime);
         response.setAiCallRoundTripTimeMs(netTime);
 
         // Unclamped: a negative value means Python's reported total exceeded Java's round
         // trip, which is a measurement signal. Clamping would hide it and bias the mean
         // upward. analyze-results.py reports the rate and minimum per tier.
-        double estimatedNetworkOverheadMs = netTime - pythonTelemetry.getTotalPythonExecutionTimeMs();
-        response.setEstimatedNetworkOverheadMs(estimatedNetworkOverheadMs);
+        double estimatedBridgeOverheadMs = netTime - pythonTelemetry.getTotalPythonExecutionTimeMs();
+        response.setEstimatedBridgeOverheadMs(estimatedBridgeOverheadMs);
         response.setDbWriteTimeMs(dbTime);
         response.setPythonTelemetry(pythonTelemetry);
         response.setResponseObjectBuildTimeMs((System.nanoTime() - responseBuildStart) / 1_000_000.0);
