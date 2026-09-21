@@ -25,3 +25,11 @@ class UnpinnableModel(StubModel):
     def set_params(self, **params):
         params.pop("n_jobs", None)
         return super().set_params(**params)
+
+
+class FailingModel(StubModel):
+    """Raises ValueError from predict_proba, reproducing a server-side computation
+    fault (e.g. a shape or NaN error) rather than a client input problem."""
+
+    def predict_proba(self, frame):
+        raise ValueError("simulated internal computation fault")

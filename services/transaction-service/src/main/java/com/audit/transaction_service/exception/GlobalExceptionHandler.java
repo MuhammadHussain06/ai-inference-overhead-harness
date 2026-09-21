@@ -6,6 +6,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.bind.support.WebExchangeBindException;
+import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.server.ServerWebInputException;
 
 import java.time.LocalDateTime;
@@ -72,6 +73,25 @@ public class GlobalExceptionHandler {
                 status.value(),
                 errorLabel,
                 ex.getMessage(),
+                null
+        );
+        return ResponseEntity.status(status).body(response);
+    }
+
+    // ResponseStatusException (e.g. Spring's own 415 for an unsupported Content-Type)
+    // is itself a RuntimeException: without this handler ahead of the generic one
+    // below, its actual status would be discarded and every case reported as 500.
+    @ExceptionHandler(ResponseStatusException.class)
+    public ResponseEntity<ErrorResponseDto> handleResponseStatusException(ResponseStatusException ex) {
+        HttpStatus status = HttpStatus.resolve(ex.getStatusCode().value());
+        if (status == null) {
+            status = HttpStatus.INTERNAL_SERVER_ERROR;
+        }
+        ErrorResponseDto response = new ErrorResponseDto(
+                LocalDateTime.now(),
+                status.value(),
+                status.getReasonPhrase(),
+                ex.getReason() != null ? ex.getReason() : ex.getMessage(),
                 null
         );
         return ResponseEntity.status(status).body(response);

@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from app.model import FraudMLTier, FraudModelRegistry
 from app.schemas import TransactionPayload
 
-from stubs import StubModel, UnpinnableModel
+from stubs import FailingModel, StubModel, UnpinnableModel
 
 
 def test_column_names_match_tier():
@@ -54,6 +54,15 @@ def test_rejects_payload_with_too_few_features(tier):
     with pytest.raises(HTTPException) as exc:
         tier.predict(short)
     assert exc.value.status_code == 400
+
+
+def test_predict_proba_value_error_is_a_server_fault_not_400(tier, payload):
+    """A ValueError from inside predict_proba itself is a computation fault, not the
+    same client input problem the too-few-features check above reports as 400."""
+    tier.model = FailingModel()
+    with pytest.raises(HTTPException) as exc:
+        tier.predict(payload)
+    assert exc.value.status_code == 500
 
 
 def test_frame_is_sliced_to_tier_width_with_log_amount(tier, payload):

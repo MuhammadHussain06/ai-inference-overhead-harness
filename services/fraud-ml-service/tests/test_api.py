@@ -39,7 +39,7 @@ def _telemetry(client, endpoint, body=None):
 
 def test_timing_middleware_is_the_outermost_user_middleware():
     """A middleware added after this one would run before the stamp, and its cost
-    would leave totalPythonExecutionTimeMs for estimatedNetworkOverheadMs instead."""
+    would leave totalPythonExecutionTimeMs for estimatedBridgeOverheadMs instead."""
     assert app.user_middleware[0].cls is TimingMiddleware
 
 
