@@ -7,10 +7,12 @@
 #
 # The gate's decision lives in a python3 heredoc that is only reachable by running
 # the whole function, so these tests source the real function and constants out of
-# the live script text (never a copy) and stub the three things it calls out to:
-# k6_run, finalize_result and check_thermal_safety. k6_run replays a crafted JSON
-# chunk instead of starting a container, following the same PATH/stub approach
-# test_jvm_pins.bats and test_load_testing_helpers.bats use for docker.
+# the live script text (never a copy). filter_chunk and gzip_only are sourced the
+# same way, since converge_warmup's output depends on their real behavior. Only
+# k6_run, finalize_result and check_thermal_safety are stubbed. k6_run replays a
+# crafted JSON chunk instead of starting a container, following the same
+# PATH/stub approach test_jvm_pins.bats and test_load_testing_helpers.bats use
+# for docker.
 
 setup_file() {
   export SUITE_SH="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)/run-suite.sh"
@@ -54,17 +56,27 @@ EOF
          p && /^PYEOF$/ { exit } p { print }' "$1"
   }
   export -f extract_gate_python
+
+  # A single named function's body, for sourcing filter_chunk/gzip_only for
+  # real rather than stubbing them.
+  extract_fn() {
+    awk -v name="$2" '$0 ~ "^" name "\\(\\) \\{" { f = 1 } f { print } f && /^}/ { exit }' "$1"
+  }
+  export -f extract_fn
 }
 
 setup() {
   WORKDIR="$BATS_TEST_TMPDIR"
   FIXTURE_DIR="${WORKDIR}/fixtures"
   RAW_RESULTS_DIR="${WORKDIR}/raw"
-  mkdir -p "$FIXTURE_DIR" "$RAW_RESULTS_DIR"
+  RESULTS_DIR="${WORKDIR}/results"
+  mkdir -p "$FIXTURE_DIR" "$RAW_RESULTS_DIR" "$RESULTS_DIR"
   K6_LOG="${WORKDIR}/k6_calls.log"
   FINALIZE_LOG="${WORKDIR}/finalized.log"
+  THERMAL_LOG="${WORKDIR}/thermal_calls.log"
   : > "$K6_LOG"
   : > "$FINALIZE_LOG"
+  : > "$THERMAL_LOG"
   K6_CHUNK=0
 
   # Stands in for the container run: records the invocation and writes this
@@ -85,7 +97,14 @@ setup() {
     fi
   }
   finalize_result() { printf '%s\n' "$1" >> "$FINALIZE_LOG"; }
-  check_thermal_safety() { :; }
+  check_thermal_safety() { printf '%s\n' "$1" >> "$THERMAL_LOG"; }
+
+  # KEEP_METRICS and the two filter/gzip helpers are sourced for real: the
+  # gate's chunked path depends on their actual filtering behavior, not just
+  # on being called.
+  eval "$(grep -E '^KEEP_METRICS=' "$SUITE_SH")"
+  eval "$(extract_fn "$SUITE_SH" filter_chunk)"
+  eval "$(extract_fn "$SUITE_SH" gzip_only)"
 
   extract_gate "$SUITE_SH" > "${WORKDIR}/gate.sh"
   source "${WORKDIR}/gate.sh"
@@ -203,14 +222,49 @@ k6_call_count() { grep -c . "$K6_LOG"; }
 
 # --- the result the gate leaves behind ---
 
-@test "chunks are concatenated into one finalized file for the target" {
+@test "chunks are filtered and merged into one gzipped file for the target" {
   chunk 1 0 "28:200:10.0:1000" "28:200:20.0:500"
   chunk 2 3000 "28:200:20.0:1500"
   run converge_warmup "warmup_scan_rep1" WARMUP_VUS=5 REP=1
   [ "$status" -eq 0 ]
-  [ "$(cat "$FINALIZE_LOG")" = "warmup_scan_rep1.json" ]
   [ ! -e "${RAW_RESULTS_DIR}/warmup_scan_rep1_combined.json" ]
-  [ "$(grep -c . "${RAW_RESULTS_DIR}/warmup_scan_rep1.json")" = "3000" ]
+  [ -e "${RESULTS_DIR}/warmup_scan_rep1.json.gz" ]
+  [ "$(gunzip -c "${RESULTS_DIR}/warmup_scan_rep1.json.gz" | grep -c .)" = "3000" ]
+  # The chunked path gzips the already-filtered file directly; finalize_result
+  # is only used by the WARMUP_ITERATIONS_PER_TARGET bypass.
+  [ ! -s "$FINALIZE_LOG" ]
+}
+
+@test "a metric outside KEEP_METRICS is filtered out of the gzipped file" {
+  chunk 1 0 "28:200:10.0:1500"
+  echo '{"type":"Point","metric":"vus","data":{"time":"2026-01-01T00:00:00.000000Z","value":5,"tags":{"tier":"28"}}}' \
+    >> "${FIXTURE_DIR}/chunk1.json"
+  run converge_warmup "warmup_scan_rep1" WARMUP_VUS=5 REP=1
+  [ "$status" -eq 0 ]
+  run gunzip -c "${RESULTS_DIR}/warmup_scan_rep1.json.gz"
+  [[ "$output" != *'"metric":"vus"'* ]]
+}
+
+@test "the last chunk's convergence result is never checked" {
+  # Every point is flat (10.0ms); point count grows chunk by chunk and only
+  # reaches the 3*WARMUP_WINDOW floor on chunk 4. A check at chunk 4 would
+  # see enough points and zero drift and converge -- but chunk 4 is the one
+  # chunk whose check is skipped, since the loop exits after it regardless.
+  chunk 1 0    "28:200:10.0:400"
+  chunk 2 400  "28:200:10.0:400"
+  chunk 3 800  "28:200:10.0:400"
+  chunk 4 1200 "28:200:10.0:600"
+  run converge_warmup "warmup_scan_rep1" WARMUP_VUS=5 REP=1
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"did not converge within 4 chunk(s)"* ]]
+  [ "$(k6_call_count)" = "4" ]
+}
+
+@test "check_thermal_safety runs once more immediately before the gzip" {
+  chunk 1 0 "28:200:10.0:1500"
+  run converge_warmup "warmup_scan_rep1" WARMUP_VUS=5 REP=1
+  [ "$status" -eq 0 ]
+  [ "$(tail -n1 "$THERMAL_LOG")" = "warmup_scan_rep1 pre-finalize" ]
 }
 
 # --- the fixed-iteration escape hatch ---

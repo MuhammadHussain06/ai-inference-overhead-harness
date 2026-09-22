@@ -846,28 +846,54 @@ with open(raw_path) as fin, gzip.open(final_path, 'wt') as fout:
   rm -f "$raw"
 }
 
-# Targets converge at different rates, so a fixed warm-up budget is either
-# wasteful for the fast ones or too short for the slow ones. Runs warm-up.js in
-# WARMUP_CHUNK_DURATION_S chunks instead, re-checking convergence after each one
-# with the same tail comparison table0 reports (the last WARMUP_WINDOW requests
-# against the WARMUP_WINDOW before them), grouped per target so one slow target
-# cannot be masked by faster ones finishing early. Stops once every target
-# present has converged, or after MAX_WARMUP_CHUNKS -- table0 shows the real
-# outcome either way, so a capped-out warm-up stays visible rather than being
-# silently accepted. An explicit WARMUP_ITERATIONS_PER_TARGET skips all of this
-# for a single fixed-iteration pass, which is what keeps smoke tests fast.
-#
-# WARMUP_TAIL_ABS_FLOOR_MS adds an absolute floor to that check, which table0
-# does not have: 5% of a sub-millisecond round trip is a few dozen microseconds,
-# well inside ordinary timer and scheduler jitter at a genuine steady state, so a
-# percentage-only bound flags the fastest targets as still moving however settled
-# they are. A target passes on whichever bound is looser for its own latency
-# scale, leaving the percentage tolerance intact for slower targets where it is
-# already meaningful on its own. WARMUP_WINDOW must be large enough that the
-# prev/last median comparison is not itself dominated by per-request sampling
-# noise at real request rates -- too small a window reports spurious
-# non-convergence on an already-stable target, independent of any real drift or
-# of the tolerance and floor above.
+# Filters a raw k6 JSON chunk down to KEEP_METRICS and appends it to a plain
+# (uncompressed) file. Used by converge_warmup to filter each chunk on
+# arrival instead of accumulating raw chunks.
+filter_chunk() {
+  local raw="$1" out="$2"
+  python3 -c "
+import json, sys
+
+keep = set('${KEEP_METRICS}'.split(','))
+raw_path, out_path = sys.argv[1], sys.argv[2]
+with open(raw_path) as fin, open(out_path, 'a') as fout:
+    for line in fin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get('type') != 'Point' or obj.get('metric') not in keep:
+            continue
+        fout.write(line + '\n')
+" "$raw" "$out"
+}
+
+# Gzips a file that is already filtered. Streams the copy; no JSON parsing.
+gzip_only() {
+  local plain="$1" final="$2"
+  python3 -c "
+import gzip, sys
+
+plain_path, final_path = sys.argv[1], sys.argv[2]
+with open(plain_path, 'rb') as fin, gzip.open(final_path, 'wb') as fout:
+    for block in iter(lambda: fin.read(1 << 20), b''):
+        fout.write(block)
+" "$plain" "$final"
+  rm -f "$plain"
+}
+
+# Dynamic Chunks: Targets converge at different rates, so warmup.js runs in WARMUP_CHUNK_DURATION_S chunks instead of a fixed budget to avoid waste or short-changing.
+# Per-Target Tail Comparison: Re-checks convergence per target after each chunk (except the last) using table0's tail comparison (last vs. previous WARMUP_WINDOW), ensuring slow targets aren't masked by fast ones.
+# Exit Conditions: Stops when all targets converge or MAX_WARMUP_CHUNKS is reached; table0 shows the outcome either way, preventing capped-out warm-ups from being silently accepted.
+# Smoke Test Bypass: An explicit WARMUP_ITERATIONS_PER_TARGET skips this dynamic check for a single fixed-iteration pass.
+
+# Absolute Floor (WARMUP_TAIL_ABS_FLOOR_MS): Adds a floor because percentage-only bounds on sub-millisecond round trips (where 5% is just dozens of microseconds) are vulnerable to timer/scheduler jitter;
+# targets pass on whichever bound is looser for their latency scale.
+# Window Size (WARMUP_WINDOW): Must be large enough to prevent per-request sampling noise from dominating prev/last median comparisons,
+# avoiding spurious non-convergence reports on stable targets independent of real drift, tolerance, or floor.
 WARMUP_CHUNK_DURATION_S=15
 MAX_WARMUP_CHUNKS=4
 WARMUP_WINDOW=500
@@ -895,9 +921,12 @@ converge_warmup() {
     local chunk_name="${out_prefix}_chunk${chunk}.json"
     k6_run warm-up.js "${base_args[@]}" "WARMUP_DURATION_S=${WARMUP_CHUNK_DURATION_S}" -- \
       --out "json=/results/raw/${chunk_name}"
-    cat "${RAW_RESULTS_DIR}/${chunk_name}" >> "$combined"
+    filter_chunk "${RAW_RESULTS_DIR}/${chunk_name}" "$combined"
     rm -f "${RAW_RESULTS_DIR}/${chunk_name}"
     check_thermal_safety "${out_prefix} chunk${chunk}"
+
+    # Last chunk: the loop exits regardless of the result, so skip the check.
+    [ "$chunk" -eq "$MAX_WARMUP_CHUNKS" ] && break
 
     converged=$(python3 - "$combined" "$WARMUP_WINDOW" "$WARMUP_TAIL_TOLERANCE_PCT" "$WARMUP_TAIL_ABS_FLOOR_MS" <<'PYEOF'
 import json, sys
@@ -906,9 +935,8 @@ from collections import defaultdict
 fp, window, tol, abs_floor = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
 
 def ts_key(t):
-    # Go trims trailing zero fractional digits, so plain string comparison would
-    # sort a whole-second timestamp after a fractional one. Zero-pad the
-    # fractional part to a fixed width so comparison is numeric in effect.
+    # Go trims trailing zero fractional digits. Zero-pad the fractional part
+    # to a fixed width so comparison sorts numerically, not lexically.
     body = t[:-1] if t.endswith("Z") else t
     whole, _, frac = body.partition(".")
     return whole, frac.ljust(9, "0")
@@ -962,8 +990,8 @@ PYEOF
          "(~$((MAX_WARMUP_CHUNKS * WARMUP_CHUNK_DURATION_S))s/target) -- proceeding with " \
          "what was collected. Check table0 for this file's actual tail drift."
   fi
-  mv "$combined" "${RAW_RESULTS_DIR}/${out_prefix}.json"
-  finalize_result "${out_prefix}.json"
+  check_thermal_safety "${out_prefix} pre-finalize"
+  gzip_only "$combined" "${RESULTS_DIR}/${out_prefix}.json.gz"
 }
 
 # Measures this target's throughput at CALIB_VUS, then derives the

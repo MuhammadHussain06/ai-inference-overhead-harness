@@ -659,14 +659,54 @@ with open(raw_path) as fin, gzip.open(final_path, 'wt') as fout:
   rm -f "$raw"
 }
 
+# Filters a raw k6 JSON chunk down to ABLATION_KEEP_METRICS and appends it to
+# a plain (uncompressed) file. Used by converge_warmup to filter each chunk
+# on arrival instead of accumulating raw chunks.
+filter_chunk() {
+  local raw="$1" out="$2"
+  python3 -c "
+import json, sys
+
+keep = set('${ABLATION_KEEP_METRICS}'.split(','))
+raw_path, out_path = sys.argv[1], sys.argv[2]
+with open(raw_path) as fin, open(out_path, 'a') as fout:
+    for line in fin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get('type') != 'Point' or obj.get('metric') not in keep:
+            continue
+        fout.write(line + '\n')
+" "$raw" "$out"
+}
+
+# Gzips a file that is already filtered. Streams the copy; no JSON parsing.
+gzip_only() {
+  local plain="$1" final="$2"
+  python3 -c "
+import gzip, sys
+
+plain_path, final_path = sys.argv[1], sys.argv[2]
+with open(plain_path, 'rb') as fin, gzip.open(final_path, 'wb') as fout:
+    for block in iter(lambda: fin.read(1 << 20), b''):
+        fout.write(block)
+" "$plain" "$final"
+  rm -f "$plain"
+}
+
 # Same convergence gate as run-suite.sh's converge_warmup(), reused verbatim
 # -- see that function's comment for the full rationale, including why
 # WARMUP_TAIL_ABS_FLOOR_MS gives the tail-drift criterion an absolute floor
 # alongside its percentage one. Runs warm-up.js in duration-bounded chunks
 # (WARMUP_CHUNK_DURATION_S), checks table0's own tail-drift criterion after
-# each chunk, stops once ABLATION_TARGET has converged or after
-# MAX_WARMUP_CHUNKS chunks. An explicit WARMUP_ITERATIONS_PER_TARGET
-# override skips gating and runs a single fixed-iteration pass instead.
+# each chunk but the last (whose result cannot change the loop's exit),
+# stops once ABLATION_TARGET has converged or after MAX_WARMUP_CHUNKS
+# chunks. An explicit WARMUP_ITERATIONS_PER_TARGET override skips gating
+# and runs a single fixed-iteration pass instead.
 WARMUP_CHUNK_DURATION_S=15
 MAX_WARMUP_CHUNKS=4
 WARMUP_WINDOW=500
@@ -694,9 +734,12 @@ converge_warmup() {
     local chunk_name="${out_prefix}_chunk${chunk}.json"
     k6_run warm-up.js "${base_args[@]}" "WARMUP_DURATION_S=${WARMUP_CHUNK_DURATION_S}" -- \
       --out "json=/results/raw/${chunk_name}"
-    cat "${RAW_RESULTS_DIR}/${chunk_name}" >> "$combined"
+    filter_chunk "${RAW_RESULTS_DIR}/${chunk_name}" "$combined"
     rm -f "${RAW_RESULTS_DIR}/${chunk_name}"
     check_thermal_safety "${out_prefix} chunk${chunk}"
+
+    # Last chunk: the loop exits regardless of the result, so skip the check.
+    [ "$chunk" -eq "$MAX_WARMUP_CHUNKS" ] && break
 
     converged=$(python3 - "$combined" "$WARMUP_WINDOW" "$WARMUP_TAIL_TOLERANCE_PCT" "$WARMUP_TAIL_ABS_FLOOR_MS" <<'PYEOF'
 import json, sys
@@ -705,9 +748,8 @@ from collections import defaultdict
 fp, window, tol, abs_floor = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
 
 def ts_key(t):
-    # Go trims trailing zero fractional digits, so plain string comparison would
-    # sort a whole-second timestamp after a fractional one. Zero-pad the
-    # fractional part to a fixed width so comparison is numeric in effect.
+    # Go trims trailing zero fractional digits. Zero-pad the fractional part
+    # to a fixed width so comparison sorts numerically, not lexically.
     body = t[:-1] if t.endswith("Z") else t
     whole, _, frac = body.partition(".")
     return whole, frac.ljust(9, "0")
@@ -761,8 +803,8 @@ PYEOF
          "(~$((MAX_WARMUP_CHUNKS * WARMUP_CHUNK_DURATION_S))s/target) -- proceeding with " \
          "what was collected. Check table0_ablation_warmup_convergence_check for this cell's actual tail drift."
   fi
-  mv "$combined" "${RAW_RESULTS_DIR}/${out_prefix}.json"
-  finalize_result "${out_prefix}.json"
+  check_thermal_safety "${out_prefix} pre-finalize"
+  gzip_only "$combined" "${RESULTS_DIR}/${out_prefix}.json.gz"
 }
 
 # Measures this cell's real throughput at ABLATION_CALIB_ITER_PER_VU, then sets
