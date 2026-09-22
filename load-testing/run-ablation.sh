@@ -53,6 +53,19 @@ RAW_RESULTS_DIR="${RESULTS_DIR}/raw"
 rm -rf "$RAW_RESULTS_DIR"
 mkdir -p "$RESULTS_DIR" "$RAW_RESULTS_DIR"
 
+# Moves a prior ablation run's own files into a timestamped subdirectory before this
+# run writes any. Scoped to ablation_* -- RESULTS_DIR is shared with run-suite.sh, and
+# an unscoped sweep here would archive a main-suite run's results out from under it.
+if compgen -G "${RESULTS_DIR}/ablation_*.json" > /dev/null 2>&1 || compgen -G "${RESULTS_DIR}/ablation_*.json.gz" > /dev/null 2>&1 \
+    || [ -f "${RESULTS_DIR}/ablation_run_order_log.txt" ]; then
+  ABLATION_ARCHIVE_DIR="${RESULTS_DIR}/archive/$(date +%Y%m%d_%H%M%S)_ablation"
+  mkdir -p "$ABLATION_ARCHIVE_DIR"
+  find "$RESULTS_DIR" -maxdepth 1 -name 'ablation_*.json' -exec mv {} "$ABLATION_ARCHIVE_DIR/" \;
+  find "$RESULTS_DIR" -maxdepth 1 -name 'ablation_*.json.gz' -exec mv {} "$ABLATION_ARCHIVE_DIR/" \;
+  find "$RESULTS_DIR" -maxdepth 1 -name 'ablation_*_log.txt' -exec mv {} "$ABLATION_ARCHIVE_DIR/" \;
+  echo "[*] Archives previous ablation run's results to ${ABLATION_ARCHIVE_DIR}"
+fi
+
 # The three metrics in analyze-ablation.py's METRICS dict, plus http_req_duration,
 # which calibrate_ablation_cell() and analyze-ablation.py's table0 both read back out
 # of the finalized files. Dropping it breaks calibration, not just a taper check.
@@ -399,9 +412,19 @@ verify_smt_isolation() {
 record_env_sample() {
   local governor freqs
   governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")
-  # || true: the glob fails to expand and cat exits nonzero when cpufreq isn't
-  # exposed (e.g. WSL2), which pipefail would otherwise treat as this call failing.
-  freqs=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | paste -sd, - || true)
+  # cpu* globs in lexicographic order (cpu0, cpu1, cpu10, cpu11, cpu2, ...), not core
+  # index order, and a bare comma list gave no way to tell which value was which core.
+  # Sorted numerically by core index and labeled "cpuN=khz" so each value attributes
+  # to a specific core -- matches run-suite.sh's env_trace_log.txt format.
+  freqs=$(
+    local f core
+    for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do
+      [ -r "$f" ] || continue
+      core="${f#/sys/devices/system/cpu/cpu}"
+      core="${core%%/*}"
+      echo "${core} cpu${core}=$(cat "$f" 2>/dev/null)"
+    done | sort -n -k1,1 | cut -d' ' -f2- | paste -sd, -
+  )
   echo "env_sample label=${1} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) governor=${governor} freqs_khz=${freqs:-unavailable}" \
     >> "$ENV_TRACE_LOG"
 }
@@ -410,16 +433,74 @@ record_env_sample() {
 # only: whether the cgroup driver honored what this cell asked for.
 verify_cpu_pinning() {
   local label="$1"
-  local py_container py_requested py_live
+  local py_container java_container
   py_container=$(docker compose -f "$COMPOSE_FILE" ps -q python-service 2>/dev/null || echo "")
-  [ -z "$py_container" ] && abort_suite "[cpu-pin] ${label}" "could not resolve python-service container ID."
-  py_requested=$(docker inspect --format '{{.HostConfig.CpusetCpus}}' "$py_container" 2>/dev/null || echo "")
-  py_live=$(read_live_cpuset "$py_container")
-  echo "  [cpu-pin] ${label}: requested(${py_requested:-EMPTY}) live(${py_live:-EMPTY})"
-  echo "cpu_pin_check label=${label} python_requested=${py_requested:-EMPTY} python_live=${py_live:-EMPTY}" >> "$CPU_PIN_LOG"
-  if [ -z "$py_live" ] || [ "$py_live" != "$py_requested" ]; then
-    abort_suite "[cpu-pin] ${label}" "live cpuset (${py_live:-EMPTY}) does not match requested (${py_requested:-EMPTY})."
+  java_container=$(docker compose -f "$COMPOSE_FILE" ps -q transaction-service 2>/dev/null || echo "")
+
+  if [ -z "$py_container" ] || [ -z "$java_container" ]; then
+    abort_suite "[cpu-pin] ${label}" "could not resolve container IDs -- cannot verify pinning at all."
   fi
+
+  local py_requested java_requested py_live java_live
+  py_requested=$(docker inspect --format '{{.HostConfig.CpusetCpus}}' "$py_container" 2>/dev/null || echo "")
+  java_requested=$(docker inspect --format '{{.HostConfig.CpusetCpus}}' "$java_container" 2>/dev/null || echo "")
+  py_live=$(read_live_cpuset "$py_container")
+  java_live=$(read_live_cpuset "$java_container")
+
+  echo "  [cpu-pin] ${label}: python-service requested(${py_requested:-EMPTY}) live(${py_live:-EMPTY}) |" \
+       "transaction-service requested(${java_requested:-EMPTY}) live(${java_live:-EMPTY})"
+  echo "cpu_pin_check label=${label} python_requested=${py_requested:-EMPTY} python_live=${py_live:-EMPTY}" \
+       "java_requested=${java_requested:-EMPTY} java_live=${java_live:-EMPTY}" >> "$CPU_PIN_LOG"
+
+  if [ -z "$py_live" ] || [ -z "$java_live" ]; then
+    echo "  [cpu-pin] ${label}: WARN -- could not read live cgroup cpuset for python/java (WSL2/cgroup-v2 limitation); skipping live-vs-requested check."
+    echo "cpu_pin_check label=${label} python_live=UNREADABLE java_live=UNREADABLE result=WARN_SKIPPED" >> "$CPU_PIN_LOG"
+  elif [ "$py_live" != "$py_requested" ] || [ "$java_live" != "$java_requested" ]; then
+    abort_suite "[cpu-pin] ${label}" "live cgroup cpuset (python=${py_live} java=${java_live}) does not match" \
+      "the requested cpuset (python=${py_requested} java=${java_requested}) -- pinning was not honored" \
+      "on this Docker/cgroup driver version."
+  fi
+
+  # Same JVM effective-CPU-count cross-check as run-suite.sh: a cpuset match above
+  # doesn't confirm the JVM itself sized its thread pools off the right core count.
+  local java_cpus expected_java_cpus
+  java_cpus=$(docker exec "$java_container" sh -c \
+    'java -XshowSettings:system -version 2>&1 | grep -i "Effective CPU Count" | grep -o "[0-9]*"' \
+    2>/dev/null || echo "")
+  expected_java_cpus=$(count_cpuset_cores "$java_requested")
+  echo "  [cpu-pin] ${label}: JVM-reported effective CPU count(${java_cpus:-EMPTY}), expected(${expected_java_cpus:-EMPTY} from requested cpuset ${java_requested:-EMPTY})"
+  echo "cpu_pin_check label=${label} jvm_effective_cpu_count=${java_cpus:-EMPTY} expected_from_cpuset=${expected_java_cpus:-EMPTY}" >> "$CPU_PIN_LOG"
+
+  if [ -z "$java_cpus" ]; then
+    abort_suite "[cpu-pin] ${label}" "could not read the JVM-reported Effective CPU Count -- Netty event-loop" \
+      "sizing is unverifiable for this cell."
+  elif [ -z "$expected_java_cpus" ] || [ "$expected_java_cpus" = "0" ]; then
+    abort_suite "[cpu-pin] ${label}" "could not derive an expected core count from the requested cpuset" \
+      "(${java_requested:-EMPTY}) -- cannot verify JVM core detection for this cell."
+  elif [ "$java_cpus" != "$expected_java_cpus" ]; then
+    abort_suite "[cpu-pin] ${label}" "JVM reports ${java_cpus} effective CPUs, expected ${expected_java_cpus}" \
+      "(derived from requested cpuset ${java_requested}). availableProcessors() sizes Reactor Netty's" \
+      "event-loop pool (max(availableProcessors(), 4)), ForkJoinPool.commonPool, the G1 worker threads" \
+      "and the JIT compiler threads -- all of them would be sized off the wrong core count for this cell."
+  fi
+
+  # K6_CPUSET is fixed for the whole ablation (unlike python-service's), so it is
+  # this check's own expected value rather than a compose-config re-parse.
+  local k6_live
+  k6_live=$(docker compose -f "$COMPOSE_FILE" --profile loadgen run --rm -T --entrypoint sh k6 \
+    -c 'cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || cat /sys/fs/cgroup/cpuset/cpuset.cpus 2>/dev/null' \
+    2>/dev/null || echo "")
+  echo "  [cpu-pin] ${label}: k6 live(${k6_live:-EMPTY}) expected(${K6_CPUSET})"
+  echo "cpu_pin_check label=${label} k6_live=${k6_live:-EMPTY} k6_expected=${K6_CPUSET}" >> "$CPU_PIN_LOG"
+  if [ -z "$k6_live" ]; then
+    echo "  [cpu-pin] ${label}: WARN -- could not read k6 cgroup cpuset (WSL2/cgroup-v2 limitation); skipping k6 pin check."
+    echo "cpu_pin_check label=${label} k6_live=UNREADABLE k6_expected=${K6_CPUSET} result=WARN_SKIPPED" >> "$CPU_PIN_LOG"
+  elif [ "$k6_live" != "$K6_CPUSET" ]; then
+    abort_suite "[cpu-pin] ${label}" "k6's live cgroup cpuset (${k6_live}) does not match the requested" \
+      "cpuset (${K6_CPUSET}) -- k6 core isolation was not honored on this Docker/cgroup driver version."
+  fi
+
+  echo "  [cpu-pin] ${label}: OK -- pinning verified, proceeding."
 }
 
 verify_tiers_and_limiter() {

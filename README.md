@@ -454,7 +454,7 @@ venv/bin/python3 -m pytest tests/ -q
 cd services/transaction-service
 ./mvnw test
 
-# Load-testing harness helpers (63 tests, bats-core): CPU-topology expansion and
+# Load-testing harness helpers (68 tests, bats-core): CPU-topology expansion and
 # formatting, SMT-sibling and cpuset-quota guards, JVM flag-origin parsing, the
 # shared k6 helpers in lib/common.js, the warm-up convergence gate, and the
 # throughput calibration derivation
@@ -602,7 +602,7 @@ are covered by the unit tests above instead.
 - **Core pinning is host-specific.** Results are not comparable across different core counts or SMT settings without re-picking `cpuset` values, and the SMT check will abort rather than silently produce incomparable numbers.
 - **Concurrency-scan P99s are not uniformly powered.** Cells at VUS 8 and above are calibrated to a fixed wall-clock duration rather than a fixed sample count, so total N varies by target and by rep; VUS 1, 2 and 4 use the flat `SCAN_ITERATIONS_PER_VU` instead. P99 confidence intervals therefore differ in width across a row. Do not read a row of per-concurrency P99s as equally precise; the achieved N is printed alongside every result.
 - **Mock and calibration are latency baselines only**, never real fraud checks. `--synthetic` training data is a smoke test, not a benchmark source.
-- **In-memory H2** is wiped on restart, and the top-level log files reflect the last run only. `run_metadata.json`, `run_order_log.txt`, `run_failures_log.txt`, `cpu_pin_check_log.txt` and `env_trace_log.txt` are written fresh each run, with the previous run's copies moved into `results/archive/<timestamp>/`.
+- **In-memory H2** is wiped on restart, and the top-level log files reflect the last run only. `run_metadata.json`, `run_order_log.txt`, `run_failures_log.txt`, `cpu_pin_check_log.txt` and `env_trace_log.txt` (and their `ablation_`-prefixed counterparts) are written fresh each run, with the previous run's copies moved into `results/archive/<timestamp>/`.
 
 ---
 
@@ -638,7 +638,7 @@ are covered by the unit tests above instead.
 │   │   ├── probe_warmup_settle.sh        # one target, past the cap, widenable criterion
 │   │   ├── calibrate_scan_iterations.sh  # per-host ITERATIONS_PER_VU derivation
 │   │   └── probe_ablation_taper.sh       # per-arm cell-duration check
-│   └── tests/                    # bats-core (63): topology, JVM pins, lib/common.js, warm-up gate, calibration
+│   └── tests/                    # bats-core (68): topology, JVM pins, lib/common.js, warm-up gate, calibration
 ├── fault-injection/
 │   ├── verify-guards.sh          # runs each case, records whether the expected guard fired
 │   ├── cases/*.case              # 9 cases, one misconfigured pinned setting each
