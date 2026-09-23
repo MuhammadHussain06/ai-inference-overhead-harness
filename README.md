@@ -110,7 +110,7 @@ Each service runs in its own container, pinned to a disjoint CPU range, so they 
 <details>
 <summary><b>Telemetry</b></summary>
 
-- Stage-by-stage latency nested in every response: parsing, network, DB write, response build, serialization (Java); parsing, thread dispatch, DataFrame construction, model inference, compute stall, serialization (Python).
+- Stage-by-stage latency nested in every response: parsing, network, DB write, response build (Java); parsing, thread dispatch, DataFrame construction, model inference, compute stall, serialization (Python). WebFlux's serialization of the Java response body is not captured on either side.
 - Timeouts and connection errors (`status=0`) tracked separately from HTTP errors.
 - Client-side connection contention (`http_req_blocked`) reported as its own diagnostic, so a throughput plateau can be checked against the load generator before blaming server capacity.
 </details>
@@ -119,13 +119,13 @@ Each service runs in its own container, pinned to a disjoint CPU range, so they 
 <summary><b>Isolation and verification</b></summary>
 
 - Reactive Java stack end to end (WebFlux + R2DBC).
-- CPU pinning verified per repetition against each container's *live* cgroup cpuset, not just the requested compose config.
+- CPU pinning verified per repetition against each container's *live* cgroup cpuset, since the requested compose config alone does not confirm what the container actually got.
 - Physical-core isolation verified before any container starts: each cpuset is resolved to physical cores via `thread_siblings_list`, and the suite aborts if python, java and k6 turn out to share cores through SMT siblings. Disjoint cpusets do not imply disjoint hardware.
 - Model inference pinned to `n_jobs=1`, read back at load *and* re-read after real inference (`nJobsVerified` / `nJobsRuntimeVerified` on `/health`). `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS` are pinned to 1 and asserted from `/health` each rep, since `n_jobs` alone does not constrain the BLAS layer beneath it.
 - `THREAD_LIMITER_TOKENS` (default `40`) pins anyio's thread-limiter capacity as an explicit experimental parameter rather than leaving it to the library default. It is re-read from `/health` every rep and a mismatch aborts the run.
 - Host thermal state is recorded, not inferred. `env_trace_log.txt` carries the CPU governor, per-core frequency, highest thermal-zone temperature and the kernel's per-core thermal-throttle counters at both ends of every rep and of every measured cell, plus every thermal check with the time it paused for (`load-testing/lib/thermal.sh`). The analysis turns that into per-cell temperature and throttling, the wall-clock cost of thermal pauses, and a test of whether either tracks latency.
 - Valid feature-tier set is fetched from `fraud-ml-service`'s `/health` at startup, never hardcoded in Java. `run-suite.sh` re-verifies this per rep (`loadedTiers` matches expected, `nJobsVerified` all true) and aborts the suite if it does not.
-- JVM thread pins are verified against how the JVM itself resolved them, not just what was requested. G1 as the collector and its worker-thread ceilings are read back via `-XX:+PrintFlagsFinal` (`load-testing/lib/jvm-pins.sh`), including each flag's *origin*, so a value that merely coincides with the pinned one because of JVM ergonomics is distinguished from a value the compose file actually set. The Reactor Netty event-loop count is a system property rather than a JVM flag, so it is checked by the `/proc` thread census instead, which counts live GC and event-loop threads against their pinned ceilings. The flag-origin check runs at the start of every rep; the census runs after warm-up, once every event loop has served traffic. Either mismatch aborts the suite, same as a cpu-pin failure.
+- JVM thread pins are verified against how the JVM itself resolved them. G1 as the collector and its worker-thread ceilings are read back via `-XX:+PrintFlagsFinal` (`load-testing/lib/jvm-pins.sh`), including each flag's *origin*, distinguishing a value that merely coincides with the pinned one through JVM ergonomics from a value the compose file actually set. The Reactor Netty event-loop count is a system property, invisible to that flag dump, so it is checked instead by a `/proc` thread census counting live GC and event-loop threads against their pinned ceilings. The flag-origin check runs at the start of every rep; the census runs after warm-up, once every event loop has served traffic. Either mismatch aborts the suite, same as a cpu-pin failure.
 - Host-level state that can shift measured latency without appearing in this project's own configuration (kernel `isolcpus`, AC vs. battery power, whether `irqbalance` is migrating interrupts across pinned cores) is sampled every rep (`load-testing/lib/host-provenance.sh`) and recorded in `run_metadata.json`. Warn-only by design: none of the three has one correct value for every host, so the harness records what it found rather than dictating a setting. Only conditions that invalidate a measurement outright (cpu-pin, tier, JVM-pin mismatches) abort the run.
 - Outbound Java to Python connection pool is sized by the harness at 2x the run's peak VUS (`PYTHON_SERVICE_MAX_CONNECTIONS`), so it can never become the bottleneck being measured, and is logged at startup. A hand-started stack falls back to `128`.
 - A thermal guard samples every readable `thermal_zone*` after every cell and warm-up chunk. At or above `THERMAL_WARN_C` (90C) the run pauses for `THERMAL_COOLDOWN_S` (60s) and retries, up to `MAX_THERMAL_COOLDOWNS` (2) times; still at or above `THERMAL_CRIT_C` (95C) after that aborts the suite. Every check is logged with the time it paused for, so a long run's thermal cost is measured rather than absorbed into the numbers.
@@ -197,6 +197,9 @@ Content-Type: application/json
 ```json
 {
   "transactionId": "062e5e0e-398d-4e59-a29b-63175c8e345e",
+  "accountId": "ACC-12345",
+  "amount": 12500.50,
+  "transactionType": "WIRE_TRANSFER",
   "riskScore": 0.9123,
   "transactionStatus": "FLAGGED",
   "strategy": "DISTRIBUTED_AI_SYNCHRONOUS",
@@ -265,9 +268,10 @@ Resource limits (`mem_limit`/`mem_reservation`/`cpus`) use Compose's plain (non-
 **Requirements**
 
 - Docker + Docker Compose v2 (`docker compose`)
-- 16 logical cores. The `cpuset` values span CPUs 0 to 15 and are chosen for a host whose SMT siblings are *adjacent* logical CPUs, so that each service owns whole physical cores. On a host that enumerates siblings differently (Intel's classic `N` / `N+8` layout, for instance), `verify_smt_isolation()` resolves each cpuset through `thread_siblings_list` and aborts before any container starts rather than producing incomparable data. Re-pick the values for your topology with `cat /sys/devices/system/cpu/cpu*/topology/thread_siblings_list`, or let `load-testing/recommend-cpusets.sh` do it: it reads this host's topology, restricts itself to performance cores on a hybrid CPU, and prints `export` lines for `PYTHON_CPUSET`/`JAVA_CPUSET`/`K6_CPUSET` (plus the ablation's narrow and wide cpuset values) that are pre-checked against the same guard the suite runs, so a value it prints can never be one the suite then refuses. It only recommends: review the output, `export` it, then run the suite.
+- 16 logical cores. The `cpuset` values span CPUs 0 to 15 and are chosen for a host whose SMT siblings are *adjacent* logical CPUs, so each service owns whole physical cores. On a host that enumerates siblings differently (Intel's classic `N` / `N+8` layout, for instance), `verify_smt_isolation()` resolves each cpuset through `thread_siblings_list` and aborts before any container starts, avoiding incomparable data.
+- Re-pick the values for your topology with `cat /sys/devices/system/cpu/cpu*/topology/thread_siblings_list`, or let `load-testing/recommend-cpusets.sh` do it: it reads this host's topology, restricts itself to performance cores on a hybrid CPU, and prints `export` lines for `PYTHON_CPUSET`/`JAVA_CPUSET`/`K6_CPUSET` (plus the ablation's narrow and wide cpuset values), pre-checked against the same guard the suite runs. It only recommends: review the output, `export` it, then run the suite.
 - About 7GB free RAM
-- k6 runs containerized, pulled automatically on first `run-suite.sh` invocation, so no host install is needed
+- k6 runs containerized for `run-suite.sh` and `run-ablation.sh`, pulled automatically on first invocation, so no host install is needed for either. A host-installed `k6` binary is only needed for the manual and open-loop commands below
 - Python 3 on the host, required by `run-suite.sh` itself (tier verification) in addition to `pip install -r analysis/requirements.txt` (pandas, numpy, matplotlib, scipy, statsmodels, tabulate, jinja2) for the analysis phase. `jinja2` backs the LaTeX table export, so omitting it breaks `.tex` output. `requirements.txt` pins floors, not ceilings: recent CPython (3.13+) needs recent-enough wheels of these anyway, and older exact pins can fail a from-source build on a newer compiler toolchain
 - No GPU required
 
@@ -325,7 +329,7 @@ cd load-testing
 ../analysis/venv/bin/python3 ../analysis/analyze-ablation.py   # ablation tables + figure
 ```
 
-It holds the workload fixed at `TARGET=28`, `VUS=64` and sweeps one mechanism at a time across 11 cells in four arms: `thread_limiter` (40/64/128 tokens), `cpuset` (narrow/control/wide), `workers` (1/2/3 uvicorn processes), and `workers_token_matched` (1 and 3 workers with aggregate token capacity held constant, since the limiter is per process and a worker change otherwise moves both variables at once). Each cell is throughput-calibrated once, in a pass before the reps that restarts the stack at that cell's configuration and warms it up exactly as its reps will, and every rep of the cell runs that count. Every cell gets the same warm-up convergence gate, cpu-pin and JVM-pin verification, thermal telemetry and abort-on-invalid behavior as the main suite.
+It holds the workload fixed at `TARGET=28`, `VUS=64` and sweeps one mechanism at a time across 11 cells in four arms: `thread_limiter` (40/64/128 tokens), `cpuset` (narrow/control/wide), `workers` (1/2/3 uvicorn processes), and `workers_token_matched` (1 worker at 40 tokens vs. 3 workers at 13 tokens each, aggregate capacity matched to the nearest integer since the limiter is per process and a worker change otherwise moves both variables at once). Each cell is throughput-calibrated once, in a pass before the reps that restarts the stack at that cell's configuration and warms it up exactly as its reps will, and every rep of the cell runs that count. Every cell gets the same warm-up convergence gate, cpu-pin and JVM-pin verification, thermal telemetry and abort-on-invalid behavior as the main suite.
 
 `table_ablation_control_vs_extreme` makes one planned comparison per arm: its control value, as `run-ablation.sh` recorded it in `ablation_run_metadata.json`, against the sweep value farthest from it by value (logical CPUs for a cpuset). That is the arm's largest manipulation whether the control sits at an end of the sweep (`thread_limiter` 40, `workers` 3) or inside it (`cpuset`, where the 2-CPU cell is farther from the 6-CPU control than the 8-CPU one). `workers_token_matched` has no control (its two values are a matched pair at fixed aggregate token capacity) and compares its two values directly.
 
@@ -337,6 +341,8 @@ k6 run load-testing/warm-up.js                       # JIT warm-up
 k6 run --out json=results/results.json your-test.js  # real load test
 analysis/venv/bin/python3 analysis/analyze-results.py   # tables + figures
 ```
+
+These commands invoke `k6` directly rather than through Docker, so they need a host-installed `k6` binary; `run-suite.sh` and `run-ablation.sh` run it in its own container instead and need no such install.
 
 `warm-up.js` reads `WARMUP_TARGETS` (default `mock calibration 5 10 20 28`), `WARMUP_VUS` (5), and `BASE_URL` (falls back to `http://localhost:8080/api/v1/transactions`). By default it uses a `constant-vus` executor bounded by `WARMUP_DURATION_S` (15). Setting `WARMUP_ITERATIONS_PER_TARGET` switches it to a fixed-count `per-vu-iterations` pass bounded by `WARMUP_MAX_DURATION_S` (60) instead, which is the path the smoke test takes; that variable also bypasses `converge_warmup()`'s chunked gate entirely, so do not set it when you want the adaptive warm-up.
 
@@ -377,7 +383,7 @@ Output filenames must start with `openloop` (for example `openloop_28_rate32.jso
 
 `run-ablation.sh` writes the same shapes under `ablation_` prefixes: `ablation_<arm>_<value>_rep<N>.json.gz` plus `ablation_warmup_*`, `ablation_calib_*` (the calibration pass's measurement and warm-up per cell), `ablation_calibration_log.txt`, `ablation_run_order_log.txt`, `ablation_run_metadata.json` (including the control value of each arm), `ablation_cpu_pin_check_log.txt`, `ablation_env_trace_log.txt`, and `ablation_run_failures_log.txt`.
 
-Two details matter when reading the stored files. k6 writes its full unfiltered trail to `results/raw/` first; `finalize_result()` keeps only the metrics the analysis reads (`KEEP_METRICS`, which includes `request_http_error` and `request_timeout_error` so `crosscheck_error_counters()`'s independent error-count check has data to run against, and `java_execution_time_ms` so the Java-side total stays recoverable), gzips the result into `results/`, and deletes the raw copy, so the stored file is a filtered subset of k6's output rather than the raw stream. The filter (`lib/k6_filter.py`) reads each line's metric name from k6's fixed JSON prefix and falls back to a full parse for any line not in that shape. And at the start of a run, the previous run's JSON and logs are moved into `results/archive/<timestamp>/` rather than deleted, so only the top level is cleared.
+k6 writes its full unfiltered trail to `results/raw/` first; `finalize_result()` keeps only the metrics the analysis reads (`KEEP_METRICS`, which includes `request_http_error` and `request_timeout_error` so `crosscheck_error_counters()`'s independent error-count check has data to run against, and `java_execution_time_ms` so the Java-side total stays recoverable), gzips the result into `results/`, and deletes the raw copy, so the stored file is a filtered subset of k6's output rather than the raw stream. The filter (`lib/k6_filter.py`) reads each line's metric name from k6's fixed JSON prefix and falls back to a full parse for any line not in that shape. And at the start of a run, the previous run's JSON and logs are moved into `results/archive/<timestamp>/` rather than deleted, so only the top level is cleared.
 
 Analysis output lands in `analysis/output/tables/` and `analysis/output/figures/`, each table as `.csv`, `.md` and `.tex`:
 
@@ -415,16 +421,18 @@ A cell whose k6 run fails, or whose containers were OOM-killed, aborts the suite
 
 ## Diagnostics
 
-`load-testing/probing/` holds four standalone diagnostics. None of them are wired into `run-suite.sh` or `run-ablation.sh`, and none write into the main `results/` tree used for reported numbers. They exist to re-derive the harness's tuning constants on a new host, which is what a reproducer needs in order to justify those constants rather than inherit them. Each resolves the compose file at `../../docker-compose.yml`, so run them from inside `load-testing/probing/`.
+`load-testing/probing/` holds six standalone diagnostics, none wired into `run-suite.sh` or `run-ablation.sh`. They exist to re-derive the harness's tuning constants on a new host, which is what a reproducer needs to justify those constants rather than inherit them. `probe_warmup_joint.sh` and `probe_warmup_settle.sh` write their intermediates to `results/probes/` and clean up after themselves; `probe_ablation_taper.sh` and `calibrate_scan_iterations.sh` write straight into the main `results/` tree and leave their output there, so running either one leaves a `probe_ablation_*`/`calib_*` file behind. Each resolves the compose file at `../../docker-compose.yml`, so run them from inside `load-testing/probing/`.
 
 | Script | Question it answers |
 |---|---|
 | `probe_warmup_joint.sh LABEL VUS [...]` | Does the real gate condition, every target converging in the same chunk, actually become reachable, and which target is the laggard when it does not? Runs past `MAX_WARMUP_CHUNKS` and prints every target's verdict at every checkpoint from `lib/warmup_gate.py` itself, at the production window, minimum span, tolerance and floor unless overridden |
 | `probe_warmup_settle.sh LABEL TIER VUS [...]` | Where does a single non-converging target actually settle? Same chunks, one target, past the cap, with a thermal check after each. `WARMUP_WINDOW_OVERRIDE` / `WARMUP_MIN_SPAN_OVERRIDE` / `WARMUP_TOL_OVERRIDE` / `WARMUP_ABS_FLOOR_OVERRIDE` change the criterion to test how a target's verdict depends on the window and bounds at its own per-request variance |
 | `calibrate_scan_iterations.sh TIER [REF_VUS] [TARGET_DURATION_S] [CALIB_ITER_PER_VU]` | What `ITERATIONS_PER_VU` does each concurrency level need on this host to hit a target cell duration? The same derivation `calibrate_target()` runs, in a form you can inspect |
-| `probe_ablation_taper.sh LABEL CPUSET CPUS WORKERS TOKENS [DURATION_S]` | Does a given ablation arm's real processing capacity change what cell duration it needs? Checked per arm, because each arm changes python-service's throughput by design |
+| `probe_calibration_drift.sh TIER [N_MEASUREMENTS] [REFERENCE_VUS] [ITER_PER_VU] [COOLDOWN_S]` | Does a target's calibrated throughput actually hold constant across reps, the assumption the once-per-target calibration pass depends on? Repeats `calibrate_target()`'s own measurement back to back and reports the spread |
+| `probe_ablation_taper.sh LABEL CPUSET CPUS WORKERS TOKENS [TARGET_DURATION_S]` | Does a given ablation arm's real processing capacity change what cell duration it needs? Checked per arm, because each arm changes python-service's throughput by design |
+| `probe_telemetry_completeness.sh [N_REQUESTS] [TARGET...]` | Is every telemetry field actually present on a live response, for every target? Checks build freshness against source mtimes first, then all eight `python_*` and two `java_*` fields per response |
 
-`analysis/plot_warmup_curve.py` is a fifth diagnostic, for thermal investigation rather than warm-up tuning. It overlays rolling P50 latency against active VUs, package temperature and core frequency within a single result file (`.json` or `.json.gz`), so a throttle signature can be read against the load rather than inferred from temperature alone. It takes `--thermal-log` (a `sensors` poll) and/or `--turbostat-log`, and resolves `--results-dir` relative to its own location, so it runs from any directory. The active-VU line needs the `vus` metric, which the harness filters out of finalized files; a probe's or a manual run's raw file keeps it.
+`analysis/probing/plot_warmup_curve.py` is a seventh diagnostic, for thermal investigation rather than warm-up tuning. It overlays rolling P50 latency against active VUs, package temperature and core frequency within a single result file (`.json` or `.json.gz`), so a throttle signature can be read against the load rather than inferred from temperature alone. It takes `--thermal-log` (a `sensors` poll) and/or `--turbostat-log`, and resolves `--results-dir` relative to its own location, so it runs from any directory. The active-VU line needs the `vus` metric, which the harness filters out of finalized files. `calibrate_scan_iterations.sh` writes with a bare `--out json=` rather than through the harness's filter, so its raw file is the one that still has it.
 
 ---
 
@@ -461,8 +469,8 @@ cd services/fraud-ml-service
 cd analysis
 venv/bin/python3 -m pytest tests/ -q
 
-# Java service: bridge-overhead derivation, netStart captured at Mono
-# subscription rather than assembly, telemetry pass-through, strategy
+# Java service (34 tests): bridge-overhead derivation, netStart captured at
+# Mono subscription rather than assembly, telemetry pass-through, strategy
 # routing, request-timing filter ordering, ResponseStatusException status
 # codes preserved rather than reported as 500
 cd services/transaction-service
@@ -510,8 +518,8 @@ What they guard, and why it matters for the results:
 
 The unit tests above check each guard's logic in isolation; this checks that the guards
 actually fire against the harness's real abort path. A guard that never fires reports a
-clean run identically to a guard that cannot fail, and this is what tells the two apart.
-Each of nine cases misconfigures one pinned setting the suite claims to enforce, runs a
+clean run identically to a guard that cannot fail.
+Each of eight cases misconfigures one pinned setting the suite claims to enforce, runs a
 minimal slice of `run-suite.sh` against it, and records whether the expected guard rejected
 it. Case `00-unmodified` runs with nothing changed and must instead pass clean, so a version
 of the suite where every case aborts is itself reported as a failure, not a pass.
@@ -540,8 +548,8 @@ this repo carries a checked-in copy of.
 | `07-gc-threads-unpinned` | GC worker-thread count left to JVM ergonomics | `[jvm-pin]` |
 | `08-collector-swapped` | Collector swapped from G1 to Parallel | `[jvm-pin]` |
 
-Run `./verify-guards.sh` on the host that will produce the dataset, since the report itself is
-not committed (see above). Case 02 and case 01 need an SMT host and are reported as skipped,
+Run `./verify-guards.sh` on the host that will produce the dataset, since the report is
+host-specific and not committed. Case 02 and case 01 need an SMT host and are reported as skipped,
 not passed, on one without it. One gap is disclosed rather than covered: a configuration whose pinned options are present in the compose file but never
 reach the JVM. No compose-level fault reproduces that, so the `[jvm-pin]` guard is only
 checked through the flag origin the JVM itself reports, not against that specific failure
@@ -590,11 +598,11 @@ are covered by the unit tests above instead.
 
 ### Construct validity: does the instrumentation measure what it claims?
 
-- **Instrumentation overhead is measured, not removed.** The `calibration` target bounds it as a floor; it stays baked into the AI and mock numbers.
-- **`modelInferenceTimeMs` is the cost of obtaining a prediction, not the cost of tree traversal.** It covers the whole `predict_proba` call, and on this software stack that call is dominated by XGBoost's ingestion of the pandas DataFrame rather than by the booster. Micro-benchmarked against the committed artifacts at the pinned dependency versions, tier 28: the complete call is about 3.0 ms, of which the DataFrame to `DMatrix` conversion is about 2.9 ms (95%) and booster traversal about 0.05 ms (2%). The conversion cost is linear in column count, because XGBoost's dtype-inspection path runs per column per call, so the *tier scaling* of this field is predominantly a scaling of framework-level input marshalling. Reported as measured, because that is what a service written this way pays. Read it as such rather than as model-evaluation cost.
+- **The `calibration` target measures instrumentation overhead as a floor.** It stays baked into the AI and mock numbers rather than being subtracted out.
+- **`modelInferenceTimeMs` covers the whole cost of obtaining a prediction.** It spans the entire `predict_proba` call, and on this software stack that call is dominated by XGBoost's ingestion of the pandas DataFrame rather than by the booster. Micro-benchmarked against the committed artifacts at the pinned dependency versions, tier 28: the complete call is about 3.0 ms, of which the DataFrame to `DMatrix` conversion is about 2.9 ms (95%) and booster traversal about 0.05 ms (2%). The conversion cost is linear in column count, because XGBoost's dtype-inspection path runs per column per call, so the *tier scaling* of this field is predominantly a scaling of framework-level input marshalling. Reported as measured, because that is what a service written this way pays: service-level cost, not model-evaluation cost.
 - **The serialization figure is a self-referential estimate.** `totalPythonExecutionTimeMs` includes an EWMA estimate of the cost of serializing the very response that carries it. Table 2's `Serialization (% of total)` column bounds how much that circularity can matter.
 - **`estimatedBridgeOverheadMs` is a derived difference across two independent clocks**, so it can go negative. It is deliberately not clamped; table 2 reports the negative rate and minimum per tier. A small, tier-consistent rate is timer noise between processes; a large or tier-clustered rate would be a real measurement fault. `aiCallRoundTripTimeMs`, the clock this is derived from, is timed inside a `Mono.defer` so its own clock starts at subscription rather than at Mono assembly; the field name reflects what it actually measures (see below), not a network hop.
-- **It is named for what it is: Docker bridge-network overhead, not a real network hop.** It is the bridge and NAT path between two containers on one host, plus that serialization-estimation error. It is constant across strategies, so it cancels in differential comparisons, but should not be read as a WAN figure.
+- **It is named for what it is: Docker bridge-network overhead.** It is the bridge and NAT path between two containers on one host, plus that serialization-estimation error, and should not be read as a WAN figure. It is constant across strategies, so it cancels in differential comparisons.
 - **Requests can complete below the physical floor.** Table 1e counts model-inference requests faster than the fastest `calibration` request. Anything there is a timing artifact rather than a fast inference, and the affected tier's reported minimum should not be read as a real latency. `mock` is not checked: it adds only a random draw to calibration's path, so the two distributions coincide and about half of mock's fastest requests fall below calibration's single fastest one by sampling alone.
 - **`n_jobs=1` is verified at load and again after real inference**, and the BLAS/OpenMP caps (`OMP_NUM_THREADS` and friends) are asserted from `/health` each rep. Together that is a strong, not absolute, single-threading guarantee.
 - **The two zero-compute baselines are intrinsically noisier in relative terms.** `mock` and `calibration` cross the same wire as the AI tiers but do no model computation, so there is no compute term to dilute scheduling and queueing jitter, and their coefficient of variation and tail-to-median ratio run well above the AI tiers'. This is a property of what they measure, not a defect: it is why the warm-up gate's window is defined by time rather than by request count, and per-request variance on those two targets should not be read as instability of the harness.
@@ -635,9 +643,11 @@ are covered by the unit tests above instead.
 ├── analysis/
 │   ├── analyze-results.py        # tables, figures, significance tests
 │   ├── analyze-ablation.py       # thread-dispatch mechanism sweep
-│   ├── warmup_check.py           # table 0 for both scripts, judged by lib/warmup_gate.py
-│   ├── thermal.py                # per-cell thermal state, pauses, thermal-latency association
-│   ├── plot_warmup_curve.py      # thermal diagnostic: latency vs VUs, temp and core frequency
+│   ├── lib/
+│   │   ├── warmup_check.py       # table 0 for both scripts, judged by load-testing/lib/warmup_gate.py
+│   │   └── thermal.py            # per-cell thermal state, pauses, thermal-latency association
+│   ├── probing/
+│   │   └── plot_warmup_curve.py  # thermal diagnostic: latency vs VUs, temp and core frequency
 │   ├── tests/                    # pytest (115): analysis pipeline, warm-up gate, k6 filter, thermal
 │   ├── requirements.txt
 │   └── requirements-dev.txt      # test-only: pytest, kept off analyze-*.py's real runtime deps
@@ -661,11 +671,13 @@ are covered by the unit tests above instead.
 │   │   ├── probe_warmup_joint.sh         # all six targets, past the chunk cap, per-target tail drift
 │   │   ├── probe_warmup_settle.sh        # one target, past the cap, widenable criterion
 │   │   ├── calibrate_scan_iterations.sh  # per-host ITERATIONS_PER_VU derivation
-│   │   └── probe_ablation_taper.sh       # per-arm cell-duration check
+│   │   ├── probe_calibration_drift.sh    # checks calibrated throughput actually holds across reps
+│   │   ├── probe_ablation_taper.sh       # per-arm cell-duration check
+│   │   └── probe_telemetry_completeness.sh  # per-target telemetry field presence, build-freshness check
 │   └── tests/                    # bats-core (90): topology, JVM pins, shared helpers, warm-up gate, calibration, thermal
 ├── fault-injection/
 │   ├── verify-guards.sh          # runs each case, records whether the expected guard fired
-│   ├── cases/*.case              # 9 cases, one misconfigured pinned setting each
+│   ├── cases/*.case              # 9 cases: 00 unmodified as control, 01-08 each misconfigure one pinned setting
 │   └── results/guard_verification_report.{md,csv}
 ├── results/                       # generated: *.json.gz, run_metadata.json, logs (gitignored except .gitkeep)
 │   ├── raw/                       # k6's unfiltered output, deleted per cell after filtering

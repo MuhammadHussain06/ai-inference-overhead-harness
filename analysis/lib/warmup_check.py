@@ -13,7 +13,7 @@ import os
 import numpy as np
 
 GATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "..", "load-testing", "lib", "warmup_gate.py")
+                         "..", "..", "load-testing", "lib", "warmup_gate.py")
 
 
 def _load_gate():

@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 from scipy.stats import mannwhitneyu
 
 ANALYSIS_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, ANALYSIS_DIR)
+sys.path.insert(0, os.path.join(ANALYSIS_DIR, "lib"))
 import thermal  # noqa: E402
 import warmup_check  # noqa: E402
 

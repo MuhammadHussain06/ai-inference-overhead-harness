@@ -23,7 +23,7 @@ One log covers a whole suite run, so each file's temp/freq points are clipped
 to that file's own time window before plotting (see _clip_to_window).
 
 Usage:
-    python3 plot_warmup_curve.py [--results-dir ../results] [--output-dir .] \
+    python3 plot_warmup_curve.py [--results-dir ../../results] [--output-dir .] \
         [--window 100] [--thermal-log thermal.log] [--turbostat-log turbostat.log]
 """
 
@@ -265,7 +265,7 @@ def plot_file(fp, output_dir, window, thermal_log=None, turbostat_log=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--results-dir", default=os.path.join(os.path.dirname(__file__), "..", "results"))
+    parser.add_argument("--results-dir", default=os.path.join(os.path.dirname(__file__), "..", "..", "results"))
     parser.add_argument("--output-dir", default=".")
     parser.add_argument("--window", type=int, default=100)
     parser.add_argument("--thermal-log", default=None,
