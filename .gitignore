@@ -19,7 +19,7 @@ results/gc-logs/*
 analysis/output/
 
 # Fault-injection working copies of the compose configuration and per-case run logs.
-# guard_verification_report.{md,csv} is host- and run-specific regenerable evidence
+# guard_verification_report.{m  d,csv} is host- and run-specific regenerable evidence
 # (see README's fault-injection section), not something this repo carries a
 # checked-in copy of -- same convention as the main suite's results/ above.
 fault-injection/scratch/
@@ -31,6 +31,5 @@ fault-injection/results/
 # OS/editor noise
 .DS_Store
 .idea/
-.vscode/fault-injection/verify-guards-console.log
-fault-injection/verify-guards-rerun.log
+.vscode/
 services/fraud-ml-service/.venv/
