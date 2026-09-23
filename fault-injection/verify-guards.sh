@@ -101,6 +101,31 @@ host_has_smt() {
   [ "$(tr ',-' '\n' < "$siblings" | grep -c .)" -gt 1 ]
 }
 
+# Java's baseline cores split by hyperthread: Java keeps the lowest sibling of each core
+# and python-service takes the others. The two cpusets share no logical CPU, so only the
+# physical-core comparison can see that they share hardware. Empty on a host without SMT.
+JAVA_BASELINE_CPUSET="${JAVA_CPUSET:-$(compose_default transaction-service cpuset)}"
+FAULT_SMT_JAVA=""
+FAULT_SMT_PYTHON=""
+if host_has_smt; then
+  declare -A _split_seen=()
+  while read -r _cpu; do
+    _core=$(topo_core_id "$_cpu")
+    if [ -z "$_core" ] || [ -n "${_split_seen[$_core]:-}" ]; then
+      continue
+    fi
+    _split_seen[$_core]=1
+    _sibs=$(topo_siblings_of_cpu "$_cpu" | sort -n)
+    FAULT_SMT_JAVA="${FAULT_SMT_JAVA}${FAULT_SMT_JAVA:+,}$(head -1 <<< "$_sibs")"
+    for _sib in $(tail -n +2 <<< "$_sibs"); do
+      FAULT_SMT_PYTHON="${FAULT_SMT_PYTHON}${FAULT_SMT_PYTHON:+,}${_sib}"
+    done
+  done < <(topo_expand_cpuset "$JAVA_BASELINE_CPUSET")
+fi
+FAULT_SMT_JAVA_CPUS="$(topo_count_cpus "$FAULT_SMT_JAVA").0"
+FAULT_SMT_PYTHON_CPUS="$(topo_count_cpus "$FAULT_SMT_PYTHON").0"
+export FAULT_SMT_JAVA FAULT_SMT_PYTHON FAULT_SMT_JAVA_CPUS FAULT_SMT_PYTHON_CPUS
+
 # Writes a compose configuration for one case: the repo's own file resolved with the
 # case's environment, then the requested env value replaced, then every bind mount
 # repointed into this case's scratch directory.

@@ -4,9 +4,10 @@ VUs, package temp, and core frequency, so a throttle signature (temp at the
 ceiling, frequency dropping, latency climbing) can be read against the load
 rather than inferred from temp alone.
 
-Handles warmup_*.json (the multi-tier diagnostic probe) and baseline_*.json /
-scan_*.json (single-tier real cells) identically, so throttling at real cell
-durations is comparable with throttling in the longer probe.
+Handles warmup_*, baseline_* and scan_* result files (.json or .json.gz)
+identically, so throttling at real cell durations is comparable with
+throttling in a longer probe. The active-VU line needs the vus metric, which
+the harness filters out of finalized files; a raw or probe file keeps it.
 
 --thermal-log takes a `sensors`-polling log (package temp only).
 --turbostat-log takes a `turbostat` log (temp + Bzy_MHz frequency, direct
@@ -28,6 +29,7 @@ Usage:
 
 import argparse
 import glob
+import gzip
 import itertools
 import json
 import os
@@ -55,7 +57,8 @@ def load_file(fp):
     construction, so warmup/baseline/scan share one loader."""
     by_tier = {}
     vus_time, vus_value = [], []
-    with open(fp) as f:
+    opener = gzip.open if fp.endswith(".gz") else open
+    with opener(fp, "rt") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -254,7 +257,7 @@ def plot_file(fp, output_dir, window, thermal_log=None, turbostat_log=None):
 
     ax.set_title(f"Rolling P50 (window={window}) vs. VUs / temp / freq — {name}")
     fig.tight_layout()
-    out_path = os.path.join(output_dir, f"overlay_{name.replace('.json', '')}.png")
+    out_path = os.path.join(output_dir, f"overlay_{re.sub(r'[.]json(?:[.]gz)?$', '', name)}.png")
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
     print(f"[+] {out_path}")
@@ -272,11 +275,12 @@ def main():
     args = parser.parse_args()
 
     files = []
-    for pattern in ("warmup_*.json", "baseline_*.json", "scan_*.json"):
-        files.extend(glob.glob(os.path.join(args.results_dir, pattern)))
+    for prefix in ("warmup_", "baseline_", "scan_"):
+        for suffix in (".json", ".json.gz"):
+            files.extend(glob.glob(os.path.join(args.results_dir, f"{prefix}*{suffix}")))
     files = sorted(set(files))
     if not files:
-        print(f"[!] No warmup_*/baseline_*/scan_*.json files found in {args.results_dir}")
+        print(f"[!] No warmup_*/baseline_*/scan_* result files found in {args.results_dir}")
         return
     os.makedirs(args.output_dir, exist_ok=True)
     for fp in files:

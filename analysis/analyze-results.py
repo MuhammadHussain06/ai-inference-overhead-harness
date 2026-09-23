@@ -20,6 +20,7 @@ import os
 import random
 import re
 import sys
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -27,8 +28,15 @@ import matplotlib.pyplot as plt
 from scipy.stats import mannwhitneyu
 from statsmodels.stats.multitest import multipletests
 
-DEFAULT_RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
-DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
+ANALYSIS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ANALYSIS_DIR)
+import thermal  # noqa: E402
+import warmup_check  # noqa: E402
+
+warmup_gate = warmup_check.gate
+
+DEFAULT_RESULTS_DIR = os.path.join(ANALYSIS_DIR, "..", "results")
+DEFAULT_OUTPUT_DIR = os.path.join(ANALYSIS_DIR, "output")
 
 TIER_ORDER = ["calibration", "mock", "5", "10", "20", "28"]
 CONCURRENCY_ORDER = [1, 2, 4, 8, 16, 32, 64]
@@ -82,6 +90,11 @@ def parse_run_failures(results_dir):
 
 
 
+# Live values read from a container's cgroup, which run-suite.sh skips rather than
+# aborts on when the cgroup does not expose them.
+CGROUP_LIVE_KEYS = frozenset({"python_live", "java_live", "k6_live"})
+
+
 def check_cpu_pin_log(results_dir):
     """Re-verifies cpu_pin_check_log.txt. run-suite.sh hard-aborts on a live
     mismatch, so this should always come back clean on a completed run."""
@@ -100,7 +113,7 @@ def check_cpu_pin_log(results_dir):
     ]
     n_checks = n_mismatches = 0
     mismatch_lines = []
-    smt_unverifiable = 0
+    smt_unverifiable = n_skipped = 0
     with open(log_path) as f:
         for line in f:
             line = line.strip()
@@ -114,7 +127,14 @@ def check_cpu_pin_log(results_dir):
             if not line.startswith("cpu_pin_check"):
                 continue
             fields = kv(line)
+            if fields.get("result") == "WARN_SKIPPED":
+                n_skipped += 1
+                continue
             for expected_key, live_key in pairs:
+                # An unreadable live cgroup cpuset is a check run-suite.sh skipped
+                # (result=WARN_SKIPPED), not a mismatch.
+                if live_key in CGROUP_LIVE_KEYS and fields.get(live_key) in ("EMPTY", "UNREADABLE"):
+                    continue
                 if expected_key in fields and live_key in fields:
                     n_checks += 1
                     if fields[expected_key] != fields[live_key]:
@@ -126,6 +146,10 @@ def check_cpu_pin_log(results_dir):
                     n_mismatches += 1
                     mismatch_lines.append(line)
 
+    if n_skipped:
+        print(f"[cpu-pin] NOTE: {n_skipped} live cgroup cpuset check(s) were skipped by the harness "
+              f"(cgroup not readable, WARN_SKIPPED); live pinning is unverified there and only the "
+              f"requested cpuset is on record.")
     if smt_unverifiable:
         print(f"[cpu-pin] NOTE: {smt_unverifiable} SMT topology check(s) reported 'unverifiable' "
               f"(thread_siblings_list not exposed, common under WSL2). Physical-core isolation is "
@@ -158,17 +182,19 @@ ALWAYS_KEEP_METRICS = frozenset({"dropped_iterations", "request_http_error", "re
 def load_results(results_dir, prefixes=None):
     """
     prefixes: optional tuple of filename prefixes to restrict loading to (e.g.
-    ("scan_", "openloop_")). Used by main() to load baseline/warmup and
-    scan/openloop data in two separate passes, so the larger scan dataset is
-    never held in memory at the same time as baseline/warmup.
+    ("scan_", "openloop_")). Used by main() to load baseline and scan/openloop
+    data in two separate passes, so the larger scan dataset is never held in
+    memory at the same time as baseline. Warm-up files are streamed by
+    analyze_warmup() instead.
 
     Returns (df, true_counts). df holds one row per (possibly reservoir-
-    subsampled) point; true_counts holds the true pre-subsampling point count
-    and time span per tag combination, for summarize()/error_summary()/
-    _throughput_reqs_per_s() to report a request count or throughput that
-    subsampling did not shrink. Both are None if prefixes is given and no
-    files in results_dir match it (distinct from results_dir being empty/
-    missing entirely, which is still a hard error either way).
+    subsampled) point; true_counts holds the true pre-subsampling point count,
+    time span and value range per tag combination, for summarize()/
+    error_summary()/_throughput_reqs_per_s() to report a request count,
+    throughput or extreme that subsampling did not distort. Both are None if
+    prefixes is given and no files in results_dir match it (distinct from
+    results_dir being empty/missing entirely, which is still a hard error
+    either way).
     """
     # run-suite.sh gzips each finalized cell (*.json.gz); plain *.json covers a
     # manually produced cell. Both patterns also match non-cell JSON written into
@@ -208,21 +234,16 @@ def load_results(results_dir, prefixes=None):
     MAX_POINTS_PER_FILE = 250_000
     rng = random.Random(42)
 
-    # True (pre-subsampling) point count and time span per tag combination, built
-    # from every point seen regardless of whether the reservoir below keeps it.
-    # summarize()/error_summary()/_throughput_reqs_per_s() read this to report a
-    # request count or a throughput unaffected by subsampling; a plain int-pair
-    # count is cheap enough to keep unconditionally, unlike the points themselves.
+    # True (pre-subsampling) point count, time span and value range per tag
+    # combination, built from every point seen regardless of whether the reservoir
+    # below keeps it. summarize()/error_summary()/_throughput_reqs_per_s() read this
+    # to report a request count, throughput or extreme that subsampling did not
+    # distort; a few scalars per combination are cheap enough to keep unconditionally,
+    # unlike the points themselves.
     true_acc = {}
 
     for fp in files:
         source_file = os.path.basename(fp)
-        # Warm-up files (warmup_*.json[.gz]) are exempt from the reservoir: the tail-
-        # window convergence check assumes it is reading a genuinely contiguous,
-        # time-ordered tail, and random subsampling would break that assumption. They
-        # bundle every target into one file, so they are also the files most likely to
-        # exceed MAX_POINTS_PER_FILE.
-        is_warmup_file = source_file.startswith("warmup_")
         # Reservoir: the bounded, sampled population (high-volume per-request metrics).
         res_metric, res_value, res_strategy, res_tier, res_vus = [], [], [], [], []
         res_phase, res_rep, res_rate, res_status, res_time = [], [], [], [], []
@@ -231,75 +252,93 @@ def load_results(results_dir, prefixes=None):
         keep_metric, keep_value, keep_strategy, keep_tier, keep_vus = [], [], [], [], []
         keep_phase, keep_rep, keep_rate, keep_status, keep_time = [], [], [], [], []
         n_seen = 0
+        lines_read = 0
         opener = gzip.open if fp.endswith(".gz") else open
         with opener(fp, "rt") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if obj.get("type") != "Point":
-                    continue
-                data = obj.get("data", {}) or {}
-                tags = data.get("tags", {}) or {}
-                metric = _intern_tag(obj.get("metric"))
-                value = data.get("value")
-                strategy = _intern_tag(tags.get("strategy"))
-                tier = _intern_tag(tags.get("tier"))
-                vus = _intern_tag(tags.get("vus"))
-                phase = _intern_tag(tags.get("phase"))
-                rep = _intern_tag(tags.get("rep"))
-                rate = _intern_tag(tags.get("rate"))
-                # HTTP status code; "0" means no response was received
-                status = _intern_tag(tags.get("status"))
-                time_val = data.get("time")
+            try:
+                for line in f:
+                    lines_read += 1
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("type") != "Point":
+                        continue
+                    data = obj.get("data", {}) or {}
+                    tags = data.get("tags", {}) or {}
+                    metric = _intern_tag(obj.get("metric"))
+                    value = data.get("value")
+                    strategy = _intern_tag(tags.get("strategy"))
+                    tier = _intern_tag(tags.get("tier"))
+                    vus = _intern_tag(tags.get("vus"))
+                    phase = _intern_tag(tags.get("phase"))
+                    rep = _intern_tag(tags.get("rep"))
+                    rate = _intern_tag(tags.get("rate"))
+                    # HTTP status code; "0" means no response was received
+                    status = _intern_tag(tags.get("status"))
+                    time_val = data.get("time")
 
-                true_key = (metric, strategy, tier, phase, rep, vus, status, rate)
-                true_n, true_min, true_max = true_acc.get(true_key, (0, None, None))
-                true_n += 1
-                if time_val is not None:
-                    if true_min is None or time_val < true_min:
-                        true_min = time_val
-                    if true_max is None or time_val > true_max:
-                        true_max = time_val
-                true_acc[true_key] = (true_n, true_min, true_max)
+                    true_key = (metric, strategy, tier, phase, rep, vus, status, rate)
+                    acc = true_acc.get(true_key)
+                    if acc is None:
+                        acc = true_acc[true_key] = [0, None, None, None, None, None, None]
+                    acc[0] += 1
+                    if time_val is not None:
+                        # Compared on the padded key: Go trims trailing zeros from the
+                        # fraction, so raw strings do not order numerically.
+                        key = warmup_gate.ts_key(time_val)
+                        if acc[1] is None or key < acc[1]:
+                            acc[1], acc[3] = key, time_val
+                        if acc[2] is None or key > acc[2]:
+                            acc[2], acc[4] = key, time_val
+                    if isinstance(value, (int, float)):
+                        if acc[5] is None or value < acc[5]:
+                            acc[5] = value
+                        if acc[6] is None or value > acc[6]:
+                            acc[6] = value
 
-                # Non-200 http_req_duration points are rare and kept in full so
-                # error_summary()'s status-derived counts stay exact and remain a
-                # genuine independent cross-check against the request_http_error/
-                # request_timeout_error counters, rather than an estimate derived
-                # from a random subsample of a metric that is mostly successes.
-                if (
-                    metric in ALWAYS_KEEP_METRICS
-                    or is_warmup_file
-                    or (metric == "http_req_duration" and status != "200")
-                ):
-                    keep_metric.append(metric); keep_value.append(value); keep_strategy.append(strategy)
-                    keep_tier.append(tier); keep_vus.append(vus); keep_phase.append(phase)
-                    keep_rep.append(rep); keep_rate.append(rate); keep_status.append(status)
-                    keep_time.append(time_val)
-                    continue
+                    # Non-200 http_req_duration points are rare and kept in full so
+                    # error_summary()'s status-derived counts stay exact and remain a
+                    # genuine independent cross-check against the request_http_error/
+                    # request_timeout_error counters, rather than an estimate derived
+                    # from a random subsample of a metric that is mostly successes.
+                    if (
+                        metric in ALWAYS_KEEP_METRICS
+                        or (metric == "http_req_duration" and status != "200")
+                    ):
+                        keep_metric.append(metric); keep_value.append(value); keep_strategy.append(strategy)
+                        keep_tier.append(tier); keep_vus.append(vus); keep_phase.append(phase)
+                        keep_rep.append(rep); keep_rate.append(rate); keep_status.append(status)
+                        keep_time.append(time_val)
+                        continue
 
-                n_seen += 1
-                # Algorithm R: the first MAX_POINTS_PER_FILE points are always kept;
-                # each point after that replaces a uniformly random existing slot with
-                # probability MAX_POINTS_PER_FILE/n_seen, which keeps every point seen
-                # so far equally likely to end up in the final sample.
-                if n_seen <= MAX_POINTS_PER_FILE:
-                    res_metric.append(metric); res_value.append(value); res_strategy.append(strategy)
-                    res_tier.append(tier); res_vus.append(vus); res_phase.append(phase)
-                    res_rep.append(rep); res_rate.append(rate); res_status.append(status)
-                    res_time.append(time_val)
-                else:
-                    idx = rng.randint(0, n_seen - 1)
-                    if idx < MAX_POINTS_PER_FILE:
-                        res_metric[idx] = metric; res_value[idx] = value; res_strategy[idx] = strategy
-                        res_tier[idx] = tier; res_vus[idx] = vus; res_phase[idx] = phase
-                        res_rep[idx] = rep; res_rate[idx] = rate; res_status[idx] = status
-                        res_time[idx] = time_val
+                    n_seen += 1
+                    # Algorithm R: the first MAX_POINTS_PER_FILE points are always kept;
+                    # each point after that replaces a uniformly random existing slot with
+                    # probability MAX_POINTS_PER_FILE/n_seen, which keeps every point seen
+                    # so far equally likely to end up in the final sample.
+                    if n_seen <= MAX_POINTS_PER_FILE:
+                        res_metric.append(metric); res_value.append(value); res_strategy.append(strategy)
+                        res_tier.append(tier); res_vus.append(vus); res_phase.append(phase)
+                        res_rep.append(rep); res_rate.append(rate); res_status.append(status)
+                        res_time.append(time_val)
+                    else:
+                        idx = rng.randint(0, n_seen - 1)
+                        if idx < MAX_POINTS_PER_FILE:
+                            res_metric[idx] = metric; res_value[idx] = value; res_strategy[idx] = strategy
+                            res_tier[idx] = tier; res_vus[idx] = vus; res_phase[idx] = phase
+                            res_rep[idx] = rep; res_rate[idx] = rate; res_status[idx] = status
+                            res_time[idx] = time_val
+            except (EOFError, OSError) as e:
+                # Raised by the decompressor itself, not json.loads, so a truncated
+                # .json.gz never surfaces as a malformed line. What decompressed
+                # cleanly is still used rather than losing every other file.
+                print(f"[!] {source_file}: compressed stream ended early after {lines_read} "
+                      f"line(s) ({e}). Using what decompressed cleanly; the rest of this "
+                      f"file is lost.")
 
         if n_seen > MAX_POINTS_PER_FILE:
             print(f"[!] {source_file}: {n_seen} points subsampled to {MAX_POINTS_PER_FILE} "
@@ -343,7 +382,7 @@ def load_results(results_dir, prefixes=None):
     n_unparsed = int(df["time"].isna().sum())
     if n_unparsed:
         print(f"[!] {n_unparsed}/{len(df)} timestamps did not parse and became NaT. "
-              f"Throughput and warm-up convergence depend on them; check the k6 output format.")
+              f"Throughput and the within-cell drift check depend on them; check the k6 output format.")
 
     # A missing rep tag would merge every repetition into one cluster and silently
     # revert the whole analysis to pseudoreplication. K6_ENGINE_METRICS carry no
@@ -377,7 +416,8 @@ def load_results(results_dir, prefixes=None):
 
     true_counts = pd.DataFrame([
         {"metric": k[0], "strategy": k[1], "tier": k[2], "phase": k[3], "rep": k[4],
-         "vus": k[5], "status": k[6], "rate": k[7], "true_n": v[0], "true_min_time": v[1], "true_max_time": v[2]}
+         "vus": k[5], "status": k[6], "rate": k[7], "true_n": v[0],
+         "true_min_time": v[3], "true_max_time": v[4], "true_min_value": v[5], "true_max_value": v[6]}
         for k, v in true_acc.items()
     ])
     if not true_counts.empty:
@@ -411,6 +451,20 @@ def _true_n_and_span(true_counts, **filters):
     return int(sub["true_n"].sum()), sub["true_min_time"].min(), sub["true_max_time"].max()
 
 
+def _true_value_range(true_counts, **filters):
+    """True (pre-subsampling) minimum and maximum value for the given tag filters, or
+    (None, None) where true_counts is unavailable or nothing matches. A sample's
+    extremes shrink toward the middle as it is subsampled, unlike its percentiles."""
+    if true_counts is None or true_counts.empty or "true_min_value" not in true_counts:
+        return None, None
+    sub = true_counts
+    for col, val in filters.items():
+        sub = sub[sub[col] == val]
+    if sub.empty or sub["true_min_value"].isna().all():
+        return None, None
+    return float(sub["true_min_value"].min()), float(sub["true_max_value"].max())
+
+
 # Stats -- within-run
 
 def cluster_bootstrap_ci(sub_df, stat_fn, rep_col="rep", n_boot=2000, ci=0.95, seed=42):
@@ -434,11 +488,12 @@ def cluster_bootstrap_ci(sub_df, stat_fn, rep_col="rep", n_boot=2000, ci=0.95, s
 
 
 def summarize(sub_df, label, n_boot=2000, true_counts=None, **true_filters):
-    """true_counts/true_filters: when given, the returned "N (pooled, all reps)" is
-    the true pre-subsampling count from load_results()'s true_counts side channel
-    rather than len(sub_df). Every other figure below stays computed on sub_df
-    itself -- it remains a valid random sample of the distribution regardless of
-    what the true population size was, so only the reported count needs correcting.
+    """true_counts/true_filters: when given, the returned "N (pooled, all reps)", "Min"
+    and "Max" are the true pre-subsampling values from load_results()'s true_counts
+    side channel rather than sub_df's own. Every other figure stays computed on
+    sub_df itself: it remains a valid random sample of the distribution regardless
+    of what the true population size was, and its mean and percentiles stay
+    unbiased, unlike its extremes.
     """
 
     sub_df = sub_df[pd.to_numeric(sub_df["value"], errors="coerce").notna()].copy()
@@ -453,6 +508,7 @@ def summarize(sub_df, label, n_boot=2000, true_counts=None, **true_filters):
     # true population size.
     true_n, _, _ = _true_n_and_span(true_counts, **true_filters)
     reported_n = true_n if true_n else n
+    true_min, true_max = _true_value_range(true_counts, **true_filters) if true_n else (None, None)
 
     mean_lo, mean_hi = cluster_bootstrap_ci(sub_df, lambda s: np.mean(s), n_boot=n_boot)
     p95_lo, p95_hi = cluster_bootstrap_ci(sub_df, lambda s: np.percentile(s, 95), n_boot=n_boot)
@@ -467,8 +523,8 @@ def summarize(sub_df, label, n_boot=2000, true_counts=None, **true_filters):
         "P95 95% CI": f"[{p95_lo:.2f}, {p95_hi:.2f}]",
         "P99 (ms)": round(float(np.percentile(values, 99)), 3),
         "StdDev (ms)": round(float(values.std(ddof=1)) if n > 1 else 0.0, 3),
-        "Min (ms)": round(float(values.min()), 3),
-        "Max (ms)": round(float(values.max()), 3),
+        "Min (ms)": round(true_min if true_min is not None else float(values.min()), 3),
+        "Max (ms)": round(true_max if true_max is not None else float(values.max()), 3),
     }
 
 
@@ -792,6 +848,11 @@ def between_run_consistency(df, metric, phase, group_cols, label_fn):
 
 # Output helpers
 
+def _latex_text(text):
+    """Escapes the LaTeX specials a caption can contain, leaving already-escaped ones."""
+    return re.sub(r"(?<!\\)([%_&#])", r"\\\1", text)
+
+
 def save_table(df, name, output_dir, caption=None, label=None):
     if df is None or df.empty:
         print(f"[!] Skipping empty table: {name}")
@@ -814,7 +875,7 @@ def save_table(df, name, output_dir, caption=None, label=None):
         # Caption precedes the tabular body so it renders above the table,
         # matching Elsevier/JSS style.
         if caption:
-            f.write(f"\\caption{{{caption}}}\n")
+            f.write(f"\\caption{{{_latex_text(caption)}}}\n")
         if label:
             f.write(f"\\label{{{label}}}\n")
         f.write(df.to_latex(index=False, escape=True))
@@ -838,93 +899,75 @@ def save_figure(fig, name, output_dir):
 
 # warm-up convergence (post-hoc steady-state check)
 
-def analyze_warmup(df, output_dir, window_size=500, tail_tolerance_pct=5.0,
-                   tail_abs_floor_ms=0.25):
-    """Reports whether each warm-up window reached steady state before measurement began.
+# warmup_<pass>_rep<N>.json[.gz]; pass is baseline, scan or scan_maxvus.
+WARMUP_FILE_RE = re.compile(r"^warmup_(?P<pass>[a-z_]+?)_rep(?P<rep>\d+)\.json(?:\.gz)?$")
 
-    Convergence is judged on the tail (last window vs. the one before it), not on
-    total drift from the first window. Drift from the first window measures how
-    much work warm-up did, which is large by design and says nothing about whether
-    the stack had settled by the end.
 
-    window_size, tail_tolerance_pct and tail_abs_floor_ms mirror run-suite.sh's
-    WARMUP_WINDOW / WARMUP_TAIL_TOLERANCE_PCT / WARMUP_TAIL_ABS_FLOOR_MS so this
-    table reports the same verdict the live gate acted on. A window small relative
-    to per-request variance is dominated by sampling noise and reads as drift on an
-    already-settled target; the absolute floor keeps the percentage bound from being
-    unreachably tight for the sub-millisecond targets.
+def read_run_metadata(results_dir, name="run_metadata.json"):
+    """The run's own metadata, or {} when absent or unreadable."""
+    path = os.path.join(results_dir, name)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[!] {name} could not be read ({e}); falling back to defaults where it is consulted.")
+        return {}
+
+
+def analyze_warmup(results_dir, output_dir, metadata=None):
+    """Table 0: per warm-up pass and target, whether latency had converged when the
+    measured phase began.
+
+    Streams the warmup_* files through the gate itself rather than loading them
+    with load_results(): the verdict depends on the contiguous, time-ordered tail,
+    which reservoir subsampling would break. Every target in the run's TARGETS gets
+    a row even when it never produced three windows.
     """
-    warm_any = df[(df["phase"] == "warmup") & (df["metric"] == "http_req_duration") &
-                  df["value"].notna()]
-    warm = warm_any[warm_any["status"] == "200"].copy()
-    if warm.empty:
-        if warm_any.empty:
-            print("[!] No phase='warmup' data found (older results, or warm-up.js run without "
-                  "--out json=...); skipping warm-up convergence check.")
-        else:
-            print(f"[!] {len(warm_any)} warm-up request(s) found but none returned HTTP 200 -- the "
-                  f"warm-up phase failed rather than being absent. Skipping convergence check; "
-                  f"the measured phase that follows it should not be trusted.")
-        return
+    suite = (metadata or {}).get("suite_config", {})
+    params = warmup_check.gate_params(suite.get("warmup_gate"))
+    expect = [str(t) for t in suite.get("targets", [])]
+
+    files = []
+    for fp in glob.glob(os.path.join(results_dir, "warmup_*.json*")):
+        m = WARMUP_FILE_RE.match(os.path.basename(fp))
+        if m:
+            # Chronological: every baseline rep, then each scan rep's two passes.
+            files.append((m.group("pass") != "baseline", int(m.group("rep")), m.group("pass"), fp))
+    if not files:
+        print("[!] No warmup_* files found; skipping the warm-up convergence check.")
+        return None
 
     rows = []
-    for (tier, source_file), g in warm.groupby(["tier", "source_file"], observed=True):
-        g = g.sort_values("time")
-        if len(g) < 3 * window_size:
-            # Three windows are the minimum for a first-vs-tail comparison.
-            continue
-        p50_first = float(np.percentile(g["value"].iloc[:window_size], 50))
-        p50_penultimate = float(np.percentile(g["value"].iloc[-2 * window_size:-window_size], 50))
-        p50_last = float(np.percentile(g["value"].iloc[-window_size:], 50))
-
-        total_drift = 100 * (p50_last - p50_first) / p50_first if p50_first else np.nan
-        tail_drift = 100 * (p50_last - p50_penultimate) / p50_penultimate if p50_penultimate else np.nan
-        converged = not np.isnan(tail_drift) and (
-            abs(p50_last - p50_penultimate) < tail_abs_floor_ms or abs(tail_drift) < tail_tolerance_pct
-        )
-
-        rows.append({
-            "Tier": _tier_label(tier),
-            "Source File": source_file,
-            "N Requests": len(g),
-            f"First {window_size} P50 (ms)": round(p50_first, 3),
-            f"Prev {window_size} P50 (ms)": round(p50_penultimate, 3),
-            f"Last {window_size} P50 (ms)": round(p50_last, 3),
-            "Total drift (%)": round(total_drift, 1) if not np.isnan(total_drift) else np.nan,
-            "Tail drift (%)": round(tail_drift, 1) if not np.isnan(tail_drift) else np.nan,
-            f"Converged (tail <{tail_tolerance_pct:g}% or <{tail_abs_floor_ms:g}ms)":
-                "YES" if converged else "no",
-        })
+    for *_, fp in sorted(files):
+        name = os.path.basename(fp)
+        file_rows, truncated = warmup_check.file_rows(fp, expect, params, _tier_label)
+        if truncated:
+            print(f"[!] {name}: compressed stream ended early; judged on what decompressed cleanly.")
+        rows.extend({"Source File": name, **r} for r in file_rows)
 
     table = pd.DataFrame(rows)
     save_table(table, "table0_warmup_convergence_check", output_dir,
-               caption=f"Per-rep, per-target warm-up convergence check, reporting the same criterion "
-                       f"run-suite.sh's gate applied. 'Total drift' is the P50 change from the first to "
-                       f"the last {window_size} requests of the window -- large values are expected and "
-                       f"show warm-up doing its job. 'Tail drift' compares the last {window_size} "
-                       f"requests to the {window_size} before them; only this indicates whether the "
-                       f"stack had reached steady state before the measured phase began. A window "
-                       f"converges on whichever bound is looser for its latency scale: tail drift under "
-                       f"{tail_tolerance_pct:g}% or an absolute gap under {tail_abs_floor_ms:g} ms.",
+               caption=warmup_check.caption(params, "Per-rep, per-target"),
                label="tab:warmup-convergence")
-
-    if not table.empty:
-        converged_col = f"Converged (tail <{tail_tolerance_pct:g}% or <{tail_abs_floor_ms:g}ms)"
-        n_failed = int((table[converged_col] == "no").sum())
-        if n_failed:
-            print(f"[!] {n_failed}/{len(table)} warm-up windows had not converged at the tail. "
-                  f"Raise MAX_WARMUP_CHUNKS or WARMUP_CHUNK_DURATION_S in run-suite.sh before "
-                  f"trusting the measured phase. (Setting WARMUP_ITERATIONS_PER_TARGET instead "
-                  f"disables the adaptive gate entirely and runs one fixed-iteration pass.)")
+    if warmup_check.report(table, params, "warm-up target(s)", ["Source File"]):
+        print("    Raise MAX_WARMUP_CHUNKS or WARMUP_CHUNK_DURATION_S before trusting those "
+              "targets' measured phase.")
+    return table
 
 
-def analyze_measurement_floor(e2e, order, output_dir, floor_tier="calibration"):
-    """Counts requests that completed faster than the zero-work calibration floor.
+def analyze_measurement_floor(e2e, order, output_dir, floor_tier="calibration",
+                              exempt=("mock",)):
+    """Counts model-inference requests that completed faster than the zero-work
+    calibration floor.
 
     The calibration target does no business logic, so its fastest request bounds
-    what the transport and framework can physically achieve. Anything below that
-    bound is a measurement artifact, not a fast inference, and pollutes the
-    minimum and the lower tail of every statistic computed over it.
+    what the transport and framework can physically achieve, and a model-inference
+    request below it is a timing artifact rather than a fast inference. mock is
+    exempt: it adds only a random draw to calibration's path, so the two
+    distributions coincide and about half of mock's fastest requests fall below
+    calibration's single fastest one by sampling alone.
     """
     if floor_tier not in order:
         print(f"[!] No '{floor_tier}' target in this run; skipping measurement-floor check.")
@@ -939,6 +982,8 @@ def analyze_measurement_floor(e2e, order, output_dir, floor_tier="calibration"):
 
     rows = []
     for t in order:
+        if t == floor_tier or t in exempt:
+            continue
         vals = e2e[e2e["tier"] == t]["value"]
         if vals.empty:
             continue
@@ -951,20 +996,26 @@ def analyze_measurement_floor(e2e, order, output_dir, floor_tier="calibration"):
             "Below floor (%)": round(100 * len(below) / len(vals), 3),
             "Lowest below floor (ms)": round(float(below.min()), 3) if len(below) else np.nan,
         })
+    if not rows:
+        print("[!] No model-inference tier in the baseline data; skipping measurement-floor check.")
+        return
 
     table = pd.DataFrame(rows)
     save_table(table, "table1e_measurement_floor_violations", output_dir,
-               caption=f"Requests completing faster than the zero-work calibration floor "
-                       f"({floor:.3f} ms, the fastest observed '{floor_tier}' request). The floor is the "
-                       f"physical lower bound for the transport and framework, so any request below it "
-                       f"is a timing artifact rather than a fast inference. A non-zero count here "
-                       f"identifies which tier's reported minimum should not be read as a real latency.",
+               caption=f"Model-inference requests completing faster than the zero-work calibration "
+                       f"floor ({floor:.3f} ms, the fastest observed '{floor_tier}' request). The floor "
+                       f"is the physical lower bound for the transport and framework, so a request "
+                       f"below it is a timing artifact rather than a fast inference, and a non-zero "
+                       f"count identifies a tier whose reported minimum should not be read as a real "
+                       f"latency. mock is not listed: it adds only a random draw to the calibration "
+                       f"path, so its fastest requests fall below the floor by sampling alone.",
                label="tab:measurement-floor")
 
-    total_below = int(table["Below floor (n)"].sum()) if not table.empty else 0
+    total_below = int(table["Below floor (n)"].sum())
     if total_below:
-        print(f"[!] {total_below} request(s) completed below the {floor:.3f} ms calibration floor -- "
-              f"see table1e; treat the affected tiers' reported minima as artifacts.")
+        print(f"[!] {total_below} model-inference request(s) completed below the {floor:.3f} ms "
+              f"calibration floor -- see table1e; treat the affected tiers' reported minima as "
+              f"artifacts.")
 
 
 # baseline decomposition (VUS=1)
@@ -1270,6 +1321,19 @@ def analyze_scan(df, output_dir, true_counts=None):
                        "clean-slate repetitions of the concurrency scan.",
                label="tab:scan-between-run")
 
+    # Table 4e: latency drift inside each cell, which a cell mean would otherwise hide.
+    drift_groups = [(f"{_tier_label(t)} @ VUS={vus}", e2e[(e2e["tier"] == t) & (e2e["vus"] == vus)])
+                    for t in order for vus in levels]
+    table4e = thermal.within_cell_drift([(label, g) for label, g in drift_groups if not g.empty])
+    save_table(table4e, "table4e_scan_within_cell_drift", output_dir,
+               caption="Change in mean end-to-end latency from the first to the second half of each "
+                       "scan cell, in time, averaged over repetitions with a t-interval across them. A "
+                       "change of the same sign in every repetition is systematic -- heat soak, queue "
+                       "build-up, or the closed-loop taper as VUs finish -- and means the cell mean "
+                       "depends on the cell's duration, which calibration holds near the same target "
+                       "for every cell at the calibrated levels.",
+               label="tab:scan-within-cell-drift")
+
     # Table 6: significance between adjacent concurrency levels, per tier, on e2e
     # (status==200 only) -- a concurrency-driven failure's latency reflects the failure
     # path, not the tier's cost at that level. Holm is applied within each tier's family,
@@ -1382,7 +1446,7 @@ def analyze_scan(df, output_dir, true_counts=None):
 
 
 GC_LINE_RE = re.compile(
-    r"^\[[^\]]+\]\[(?P<uptime>[\d.]+)s\]\[(?P<level>[a-z]+)\s*\]\[(?P<tags>[^\]]+?)\s*\]\s*(?P<msg>.*)$"
+    r"^\[(?P<wall>[^\]]+)\]\[(?P<uptime>[\d.]+)s\]\[(?P<level>[a-z]+)\s*\]\[(?P<tags>[^\]]+?)\s*\]\s*(?P<msg>.*)$"
 )
 GC_DUR_RE = re.compile(r"(?P<dur_ms>[\d.]+)ms\s*$")
 # Unified Logging prefixes each pause record with its cycle number: "GC(N) Pause ...",
@@ -1392,13 +1456,28 @@ GC_PAUSE_RE = re.compile(r"^GC\(\d+\)\s+Pause")
 GC_COLLECTOR_RE = re.compile(r"^Using (?P<collector>\S.*)$")
 
 
+def _gc_wall_clock(stamp):
+    try:
+        return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S.%f%z")
+    except ValueError:
+        return None
+
+
 def parse_gc_log(path):
     """Extracts (uptime_s, pause_ms) for each pause event, plus the collector that produced them.
 
-    Returns (pauses, window_s, collector). `collector` is the name from the JVM's own one-line
-    "Using <Collector>" startup record, or None if that record was not present.
+    Returns (pauses, window_s, collector). The log holds two JVMs: every probe JVM the
+    rep's pin checks start in the same container reopens and truncates it, so it
+    begins with the last probe's own startup lines (uptime near zero) and continues
+    with the service JVM's records from that moment on (uptime since the service
+    started). window_s is therefore the wall-clock span between the first and last
+    record, not an uptime difference, which would add the service JVM's age at the
+    last probe. `collector` comes from the probe's "Using <Collector>" record: same
+    container, same JAVA_TOOL_OPTIONS, so the same collector the service JVM runs.
+    None if that record is absent.
     """
     pauses = []
+    first_wall = last_wall = None
     first_uptime = last_uptime = None
     n_lines = 0
     collector = None
@@ -1411,6 +1490,10 @@ def parse_gc_log(path):
             uptime = float(m.group("uptime"))
             first_uptime = first_uptime if first_uptime is not None else uptime
             last_uptime = uptime
+            wall = _gc_wall_clock(m.group("wall"))
+            if wall is not None:
+                first_wall = first_wall or wall
+                last_wall = wall
             if m.group("level") != "info" or m.group("tags") != "gc":
                 continue
             msg = m.group("msg")
@@ -1444,7 +1527,11 @@ def parse_gc_log(path):
                   f"pause events, and no 'Using <Collector>' startup line was found either. "
                   f"Collector identity unknown; GC overhead is unmeasured for this rep, not zero.")
 
-    window_s = (last_uptime - first_uptime) if first_uptime is not None else None
+    if first_wall is not None:
+        window_s = (last_wall - first_wall).total_seconds()
+    else:
+        # A log without the time decorator can only be spanned by uptime.
+        window_s = (last_uptime - first_uptime) if first_uptime is not None else None
     return pauses, window_s, collector
 
 
@@ -1511,6 +1598,121 @@ def analyze_gc_logs(results_dir, output_dir):
     ax.legend()
     plt.xticks(rotation=45, ha="right")
     save_figure(fig, "fig_gc_overhead", output_dir)
+
+
+# thermal state per cell
+
+# Each measured cell's name in the env trace: its result file's stem.
+CELL_NAME_RE = re.compile(r"^(?P<phase>baseline|scan)_(?P<tier>[a-z0-9]+?)(?:_vus(?P<vus>\d+))?_rep(?P<rep>\d+)$")
+# (service, run_metadata.json cores_used_by_suite key) for the throttle attribution.
+SUITE_SERVICES = (("python", "python_service_cpuset"), ("java", "transaction_service_cpuset"),
+                  ("k6", "k6_cpuset"))
+
+
+def _suite_phase(name):
+    """Run phase of a trace line's name: an env-sample label, a cell or a thermal-check label."""
+    name = str(name or "")
+    if name.startswith(("calib_warmup", "scan calibration", "scan_calibration")):
+        return "scan calibration pass"
+    if name.startswith("warmup_baseline"):
+        return "baseline warm-up"
+    if name.startswith("warmup_scan"):
+        return "scan warm-up"
+    if name.startswith(("baseline ", "baseline_")):
+        return "baseline cells"
+    if name.startswith(("scan ", "scan_")):
+        return "scan cells"
+    return "other"
+
+
+def _cell_tier_group(cell):
+    """(phase, tier) of a measured cell's trace name, or None for anything else."""
+    m = CELL_NAME_RE.match(str(cell))
+    return (m.group("phase"), m.group("tier")) if m else None
+
+
+def _tier_group_label(group):
+    return f"{group[0]} {_tier_label(group[1])}"
+
+
+def _tier_group_order(group):
+    phase, tier = group
+    return (phase != "baseline", TIER_ORDER.index(tier) if tier in TIER_ORDER else len(TIER_ORDER), tier)
+
+
+def cell_mean_latency(df, phase):
+    """Mean HTTP 200 latency per measured cell, keyed by the cell's trace name, with
+    the design cell (tier, plus VUS for the scan) it repeats as its group."""
+    e2e = df[(df["phase"] == phase) & (df["metric"] == "http_req_duration") & (df["status"] == "200")]
+    rows = []
+    for source, mean in e2e.groupby("source_file", observed=True)["value"].mean().items():
+        cell = re.sub(r"\.json(?:\.gz)?$", "", str(source))
+        m = CELL_NAME_RE.match(cell)
+        if m and m.group("phase") == phase and pd.notna(mean):
+            group = m.group("tier") + (f"@{m.group('vus')}" if m.group("vus") else "")
+            rows.append({"cell": cell, "group": group, "mean_ms": float(mean)})
+    return pd.DataFrame(rows)
+
+
+def analyze_thermal(results_dir, output_dir, metadata, latency):
+    """Tables 8a-8c and figure 8: host temperature and thermal throttling per measured
+    cell, the time thermal pauses cost, and whether either tracks a cell's latency."""
+    path = os.path.join(results_dir, "env_trace_log.txt")
+    if not os.path.isfile(path):
+        print("[thermal] No env_trace_log.txt found -- skipping thermal analysis.")
+        return
+    trace = thermal.parse_env_trace(path)
+    cores = (metadata or {}).get("cores_used_by_suite", {})
+    cpusets = {svc: cores[key] for svc, key in SUITE_SERVICES if cores.get(key) not in (None, "", "unknown")}
+    cells = thermal.cell_thermal(trace, lambda cell: cpusets)
+    if cells.empty:
+        print("[thermal] env_trace_log.txt has no per-cell samples -- skipping thermal analysis.")
+        return
+
+    save_table(thermal.thermal_by_group(cells, _cell_tier_group, list(cpusets),
+                                        label_of=_tier_group_label, sort_key=_tier_group_order),
+               "table8a_thermal_by_group", output_dir,
+               caption="Highest thermal-zone temperature at the start and end of each measured cell, "
+                       "and the thermal throttling accrued during it (Intel therm_throt counters, "
+                       "differenced across the cell), per phase and tier. A service's core throttle is "
+                       "the most-throttled CPU in its cpuset; 'not exposed' means the host does not "
+                       "publish the counters, so throttling is unmeasured rather than absent.",
+               label="tab:thermal-by-group")
+    save_table(thermal.thermal_pauses(trace, _suite_phase), "table8b_thermal_pauses", output_dir,
+               caption="Thermal safety checks per run phase: how many paused the run to let the host "
+                       "cool, and the wall-clock time those pauses cost.",
+               label="tab:thermal-pauses")
+
+    parts = []
+    for phase in ("baseline", "scan"):
+        lat = latency[latency["cell"].str.startswith(f"{phase}_")] if latency is not None and not latency.empty \
+            else pd.DataFrame()
+        part = thermal.thermal_latency_association(cells, lat)
+        if not part.empty:
+            part.insert(0, "Phase", phase)
+            parts.append(part)
+    save_table(pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(),
+               "table8c_thermal_latency_association", output_dir,
+               caption="Spearman correlation between a cell's thermal state and its mean latency, "
+                       "taken as its percent deviation from its design cell's mean across "
+                       "repetitions, so the latency differences the design manipulates do not "
+                       "register as a thermal effect. A near-zero correlation means temperature and "
+                       "throttling do not explain the between-repetition spread.",
+               label="tab:thermal-latency")
+
+    throttle_cols = [c for c in cells.columns if c.endswith("_throttle_ms") and c != "pkg_throttle_ms"]
+    throttled = cells[cells[throttle_cols].fillna(0).gt(0).any(axis=1)] if throttle_cols else cells.iloc[0:0]
+    if not throttled.empty:
+        print(f"[thermal] WARNING: {len(throttled)}/{len(cells)} measured cell(s) were thermally throttled "
+              f"on a service's cores -- see table8a/table8c before attributing their latency to the "
+              f"condition under test: {', '.join(throttled['cell'].head(10))}"
+              f"{' ...' if len(throttled) > 10 else ''}")
+    elif throttle_cols and cells[throttle_cols].notna().any().any():
+        print(f"[thermal] No measured cell was throttled on a service's cores ({len(cells)} cells).")
+
+    fig = thermal.timeline_figure(trace, _suite_phase, "Host temperature across the run")
+    if fig is not None:
+        save_figure(fig, "figure8_thermal_timeline", output_dir)
 
 
 def analyze_openloop_check(df, output_dir, true_counts=None):
@@ -1655,16 +1857,20 @@ def main():
         print("[!] Exiting -- fix the cause and re-run the suite for a clean dataset.")
         sys.exit(1)
 
-    # Two passes, not one combined load: no analysis below needs baseline/warmup and
+    metadata = read_run_metadata(args.results_dir)
+    warmup_table = analyze_warmup(args.results_dir, args.output_dir, metadata)
+
+    # Two passes, not one combined load: no analysis below needs baseline and
     # scan/openloop data at the same time, so only one of the two is ever resident.
-    df1, true1 = load_results(args.results_dir, prefixes=("warmup_", "baseline_"))
+    latency_parts = []
+    df1, true1 = load_results(args.results_dir, prefixes=("baseline_",))
     df1_loaded = df1 is not None
     if df1 is None:
-        print("[!] No warmup_*/baseline_* files found; skipping warm-up check and baseline analysis.")
+        print("[!] No baseline_* files found; skipping baseline analysis.")
     else:
-        print(f"[*] Loaded {len(df1)} metric points (warmup+baseline) from {df1['source_file'].nunique()} file(s).")
-        analyze_warmup(df1, args.output_dir)
+        print(f"[*] Loaded {len(df1)} metric points (baseline) from {df1['source_file'].nunique()} file(s).")
         analyze_baseline(df1, args.output_dir, true_counts=true1)
+        latency_parts.append(cell_mean_latency(df1, "baseline"))
     del df1, true1
     gc.collect()
 
@@ -1676,12 +1882,15 @@ def main():
         print(f"[*] Loaded {len(df2)} metric points (scan+openloop) from {df2['source_file'].nunique()} file(s).")
         analyze_scan(df2, args.output_dir, true_counts=true2)
         analyze_openloop_check(df2, args.output_dir, true_counts=true2)
+        latency_parts.append(cell_mean_latency(df2, "scan"))
     del df2, true2
     gc.collect()
 
     analyze_gc_logs(args.results_dir, args.output_dir)
+    analyze_thermal(args.results_dir, args.output_dir, metadata,
+                    pd.concat(latency_parts, ignore_index=True) if latency_parts else None)
 
-    if not df1_loaded and not df2_loaded:
+    if not df1_loaded and not df2_loaded and warmup_table is None:
         print(f"[!] No warmup_*/baseline_*/scan_*/openloop_* files found in "
               f"{args.results_dir} -- nothing was analyzed.")
         sys.exit(1)

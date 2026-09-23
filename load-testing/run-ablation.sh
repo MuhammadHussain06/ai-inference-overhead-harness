@@ -6,6 +6,7 @@ set -euo pipefail
 # python-service takes interleaved even physical cores so it stays SMT-disjoint from Java and k6.
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+LIB_DIR="${PWD}/lib"
 
 for _req_cmd in docker curl shuf python3; do
   if ! command -v "$_req_cmd" >/dev/null 2>&1; then
@@ -14,26 +15,30 @@ for _req_cmd in docker curl shuf python3; do
   fi
 done
 
-for _req_lib in lib/host-provenance.sh lib/jvm-pins.sh lib/topology.sh; do
+for _req_lib in lib/host-provenance.sh lib/jvm-pins.sh lib/topology.sh lib/thermal.sh \
+  lib/warmup_gate.py lib/k6_filter.py; do
   if [ ! -r "$_req_lib" ]; then
     echo "[!] Required helper not found: ${_req_lib}. Aborting before touching any containers." >&2
     exit 1
   fi
 done
 
-# Host-state provenance for ablation_run_metadata.json, plus the CPU-topology and JVM
-# collector/thread-pool guards every cell is gated on.
+# Host-state provenance for ablation_run_metadata.json, the CPU-topology and JVM
+# collector/thread-pool guards every cell is gated on, and the thermal guard and telemetry.
 . lib/host-provenance.sh
 . lib/jvm-pins.sh
 . lib/topology.sh
+. lib/thermal.sh
 
-# Reading topology from anywhere but the live tree would verify core placement against a
-# host that is not the one running the containers.
-if [ "${TOPO_SYSFS_ROOT:-/sys}" != "/sys" ]; then
-  echo "[!] TOPO_SYSFS_ROOT is set to '${TOPO_SYSFS_ROOT}'. The suite reads CPU topology from" >&2
-  echo "    the live host only; unset it before running." >&2
-  exit 1
-fi
+# Reading topology or temperatures from anywhere but the live tree would verify core
+# placement, or guard heat, on a host that is not the one running the containers.
+for _sysfs_var in TOPO_SYSFS_ROOT THERMAL_SYSFS_ROOT; do
+  if [ "${!_sysfs_var:-/sys}" != "/sys" ]; then
+    echo "[!] ${_sysfs_var} is set to '${!_sysfs_var}'. The ablation reads the live host only;" >&2
+    echo "    unset it before running." >&2
+    exit 1
+  fi
+done
 
 IS_WSL2="false"
 if grep -qi microsoft /proc/version 2>/dev/null; then
@@ -66,10 +71,10 @@ if compgen -G "${RESULTS_DIR}/ablation_*.json" > /dev/null 2>&1 || compgen -G "$
   echo "[*] Archives previous ablation run's results to ${ABLATION_ARCHIVE_DIR}"
 fi
 
-# The three metrics in analyze-ablation.py's METRICS dict, plus http_req_duration,
-# which calibrate_ablation_cell() and analyze-ablation.py's table0 both read back out
-# of the finalized files. Dropping it breaks calibration, not just a taper check.
-ABLATION_KEEP_METRICS="python_thread_dispatch_time_ms,python_model_inference_time_ms,python_total_time_ms,http_req_duration"
+# The three metrics in analyze-ablation.py's METRICS dict; http_req_duration, which
+# calibration, the warm-up gate and the error table all read back; and the counters
+# that tell a truncated or failing cell from a clean one.
+ABLATION_KEEP_METRICS="python_thread_dispatch_time_ms,python_model_inference_time_ms,python_total_time_ms,http_req_duration,dropped_iterations,request_http_error,request_timeout_error"
 
 # Separate log files from run-suite.sh's, so an ablation run never trips
 # analyze-results.py's hard-fail-on-any-failures-log-entry check for the main
@@ -101,9 +106,10 @@ ABLATION_VUS="${ABLATION_VUS_OVERRIDE:-64}"
 ITERATIONS_PER_VU="${ABLATION_ITERATIONS_PER_VU_OVERRIDE:-100}"
 
 # Every ablation cell runs this same TARGET/VUS, so per-vu-iterations' tail
-# taper (see run-suite.sh's calibration comment) applies here too. Throughput
-# is the arm's own manipulated variable, unlike the main scan, so calibration
-# reruns per (arm, value, rep) cell, not once per rep.
+# taper (see run-suite.sh's calibration comment) applies here too. Throughput is
+# each arm's own manipulated variable, so every (arm, value) cell is calibrated
+# separately, once, in a pass before the reps (see calibrate_ablation_cells()),
+# and every rep of the cell runs that count.
 ABLATION_CALIB_ITER_PER_VU="${ABLATION_CALIB_ITER_PER_VU_OVERRIDE:-500}"
 ABLATION_CALIB_TARGET_DURATION_S="${ABLATION_CALIB_TARGET_DURATION_S_OVERRIDE:-60}"
 # Replicates per arm value; n=7 is what analyze-ablation.py's Mann-Whitney tests and
@@ -152,11 +158,10 @@ export PYTHON_SERVICE_MAX_CONNECTIONS=$((ABLATION_VUS * 2))
 
 ENV_TRACE_LOG="${RESULTS_DIR}/ablation_env_trace_log.txt"
 : > "$ENV_TRACE_LOG"
-
-# Both read the same environment variables docker-compose.yml does, so the cpusets checked
-# here are the ones the containers are started with.
-JAVA_CPUSET="${JAVA_CPUSET:-2-3,6-7}"
-K6_CPUSET="${K6_CPUSET:-10-11,14-15}"
+CALIB_LOG="${RESULTS_DIR}/ablation_calibration_log.txt"
+: > "$CALIB_LOG"
+# "<arm>:<value>" -> iterations per VU, filled by calibrate_ablation_cells().
+declare -A ABLATION_CALIB_CACHE
 
 # arm:value:cpuset:cpus:workers:tokens
 # Each arm holds the other mechanisms at the control values above and sweeps one.
@@ -210,31 +215,17 @@ capture_run_metadata() {
 
   # Records each service's cpuset as the resolved compose config declares it;
   # python-service's is the control value, since the cpuset arm sweeps others at runtime.
-  # --profile loadgen is required: k6 is profile-gated, so plain `config` omits it and
-  # extract_cpuset "k6" would always return empty, silently dropping k6 from the counts.
-  local resolved_config
-  resolved_config=$(docker compose -f "$COMPOSE_FILE" --profile loadgen config 2>/dev/null || echo "")
-
-  extract_cpuset() {
-    printf '%s\n' "$resolved_config" | awk -v svc="  ${1}:" '
-      $0 == svc { in_svc=1; next }
-      in_svc && /^  [a-zA-Z0-9_-]+:$/ { in_svc=0 }
-      in_svc && /^ +cpuset:/ { sub(/^ +cpuset: */, ""); gsub(/"/, ""); print; exit }
-    '
-  }
-
   local py_cpuset java_cpuset k6_cpuset
-  py_cpuset=$(extract_cpuset "python-service")
-  java_cpuset=$(extract_cpuset "transaction-service")
-  k6_cpuset=$(extract_cpuset "k6")
+  py_cpuset=$(compose_service_value "python-service" cpuset)
+  java_cpuset="$JAVA_CPUSET"
+  k6_cpuset="$K6_CPUSET"
 
-  # extract_cpuset resolves empty if a service is missing from resolved_config, its
-  # cpuset key was renamed, or the compose file failed to resolve -- left unchecked,
-  # the metadata below would silently record "unknown" for a real, running service
-  # instead of surfacing the resolution failure.
-  [ -z "$py_cpuset" ] && abort_suite "[metadata]" "extract_cpuset resolved no cpuset for python-service."
-  [ -z "$java_cpuset" ] && abort_suite "[metadata]" "extract_cpuset resolved no cpuset for transaction-service."
-  [ -z "$k6_cpuset" ] && abort_suite "[metadata]" "extract_cpuset resolved no cpuset for k6."
+  # Empty when a service is missing from the resolved config, its cpuset key was renamed,
+  # or the compose file failed to resolve; recording "unknown" for a running service
+  # would hide that.
+  [ -z "$py_cpuset" ] && abort_suite "[metadata]" "the compose config resolved no cpuset for python-service."
+  [ -z "$java_cpuset" ] && abort_suite "[metadata]" "the compose config resolved no cpuset for transaction-service."
+  [ -z "$k6_cpuset" ] && abort_suite "[metadata]" "the compose config resolved no cpuset for k6."
 
   local py_cores java_cores k6_cores total_pinned_cores
   py_cores=$(count_cpuset_cores "${py_cpuset:-}")
@@ -244,8 +235,8 @@ capture_run_metadata() {
 
   # The Java and k6 cpusets are fixed for the whole ablation, so they are checked once
   # here; python-service's varies per cell and is checked alongside each cell's restart.
-  verify_service_cpuset "startup" "transaction-service" "$JAVA_CPUSET" "$(topo_count_cpus "$JAVA_CPUSET")"
-  verify_service_cpuset "startup" "k6" "$K6_CPUSET" "$(topo_count_cpus "$K6_CPUSET")"
+  verify_service_cpuset "startup" "transaction-service" "$JAVA_CPUSET" "$JAVA_QUOTA"
+  verify_service_cpuset "startup" "k6" "$K6_CPUSET" "$K6_QUOTA"
 
   cat > "$METADATA_FILE" <<EOF
 {
@@ -276,14 +267,45 @@ capture_run_metadata() {
     "iterations_per_vu_note": "fallback only -- actual value is calibrated per cell against calib_target_duration_s, see ablation_calib_* files",
     "calib_iter_per_vu": ${ABLATION_CALIB_ITER_PER_VU},
     "calib_target_duration_s": ${ABLATION_CALIB_TARGET_DURATION_S},
+    "calib_scope": "measured once per (arm, value) in a dedicated pass before the reps; every rep runs that count",
     "reps": ${REPS_ABLATION},
     "anyio_default_tokens": ${ANYIO_DEFAULT_TOKENS},
-    "cells": [$(printf '"%s",' "${CELLS[@]}" | sed 's/,$//')]
+    "control_values": {
+      "thread_limiter": "${ANYIO_DEFAULT_TOKENS}",
+      "cpuset": "${CONTROL_CPUSET}",
+      "workers": "${CONTROL_WORKERS}"
+    },
+    "cells": [$(printf '"%s",' "${CELLS[@]}" | sed 's/,$//')],
+    "warmup_gate": {
+      "chunk_duration_s": ${WARMUP_CHUNK_DURATION_S},
+      "max_chunks": ${MAX_WARMUP_CHUNKS},
+      "base_window": ${WARMUP_WINDOW},
+      "min_window_span_s": ${WARMUP_WINDOW_MIN_S},
+      "tail_tolerance_pct": ${WARMUP_TAIL_TOLERANCE_PCT},
+      "tail_abs_floor_ms": ${WARMUP_TAIL_ABS_FLOOR_MS}
+    },
+    "thermal": {
+      "warn_c": ${THERMAL_WARN_C},
+      "crit_c": ${THERMAL_CRIT_C},
+      "cooldown_s": ${THERMAL_COOLDOWN_S},
+      "max_cooldowns": ${MAX_THERMAL_COOLDOWNS}
+    }
   }
 }
 EOF
   echo "  [metadata] host=${cpu_model:-unknown} cores=${cpu_count} (pinned: ${total_pinned_cores}) git=${git_commit:0:12} wsl2=${IS_WSL2}"
   echo "  [metadata] $(host_provenance_line)"
+}
+
+# Reads one scalar field of a service out of the resolved compose configuration, so every
+# check compares against the same source the containers are started from.
+compose_service_value() {
+  docker compose -f "$COMPOSE_FILE" --profile loadgen config 2>/dev/null \
+    | awk -v svc="  ${1}:" -v key="${2}:" '
+        $0 == svc { in_svc = 1; next }
+        in_svc && /^  [a-zA-Z0-9_-]+:$/ { in_svc = 0 }
+        in_svc && $1 == key { sub(/^ +[a-zA-Z0-9_-]+: */, ""); gsub(/"/, ""); print; exit }
+      '
 }
 
 abort_suite() {
@@ -409,26 +431,6 @@ verify_smt_isolation() {
   fi
 }
 
-record_env_sample() {
-  local governor freqs
-  governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")
-  # cpu* globs in lexicographic order (cpu0, cpu1, cpu10, cpu11, cpu2, ...), not core
-  # index order, and a bare comma list gave no way to tell which value was which core.
-  # Sorted numerically by core index and labeled "cpuN=khz" so each value attributes
-  # to a specific core -- matches run-suite.sh's env_trace_log.txt format.
-  freqs=$(
-    local f core
-    for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do
-      [ -r "$f" ] || continue
-      core="${f#/sys/devices/system/cpu/cpu}"
-      core="${core%%/*}"
-      echo "${core} cpu${core}=$(cat "$f" 2>/dev/null)"
-    done | sort -n -k1,1 | cut -d' ' -f2- | paste -sd, -
-  )
-  echo "env_sample label=${1} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) governor=${governor} freqs_khz=${freqs:-unavailable}" \
-    >> "$ENV_TRACE_LOG"
-}
-
 # python-service's cpuset varies per cell, so this compares live against requested
 # only: whether the cgroup driver honored what this cell asked for.
 verify_cpu_pinning() {
@@ -484,8 +486,8 @@ verify_cpu_pinning() {
       "and the JIT compiler threads -- all of them would be sized off the wrong core count for this cell."
   fi
 
-  # K6_CPUSET is fixed for the whole ablation (unlike python-service's), so it is
-  # this check's own expected value rather than a compose-config re-parse.
+  # K6_CPUSET is resolved once from the compose config and fixed for the whole
+  # ablation (unlike python-service's), so it is this check's expected value.
   local k6_live
   k6_live=$(docker compose -f "$COMPOSE_FILE" --profile loadgen run --rm -T --entrypoint sh k6 \
     -c 'cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || cat /sys/fs/cgroup/cpuset/cpuset.cpus 2>/dev/null' \
@@ -588,17 +590,23 @@ except Exception:
     print("unreadable ")
 else:
     # Requires an explicit key: an absent key, empty mapping, or null would read as success.
+    # A null tier has not served inference on this worker yet, so a worker with no true
+    # tier has verified nothing and is not counted.
     if not isinstance(verified, dict) or not verified:
         print("unreadable", d.get("workerPid", ""))
     else:
         failed = [tier for tier, ok in verified.items() if ok is not True and ok is not None]
-        print(("failed:" + ",".join(failed) if failed else "ok"), d.get("workerPid", ""))
+        exercised = any(ok is True for ok in verified.values())
+        state = "failed:" + ",".join(failed) if failed else ("ok" if exercised else "unexercised")
+        print(state, d.get("workerPid", ""))
 ') || sample="unreadable "
     runtime_state="${sample%% *}"
     pid="${sample##* }"
 
     if [ "$runtime_state" = "unreadable" ]; then
       abort_suite "[health] ${label}" "could not read nJobsRuntimeVerified from python-service's /health."
+    elif [ "$runtime_state" = "unexercised" ]; then
+      continue
     elif [ "$runtime_state" != "ok" ]; then
       abort_suite "[health] ${label}" "nJobsRuntimeVerified reports ${runtime_state} after serving inference" \
         "on worker ${pid:-unknown}."
@@ -618,8 +626,8 @@ else:
     >> "$CPU_PIN_LOG"
 
   if [ "$n_seen" -lt "$expected_workers" ]; then
-    echo "  [health] ${label}: WARN -- only ${n_seen} of ${expected_workers} workers answered /health" \
-         "across ${attempts} polls; the others are unverified for this cell." >&2
+    echo "  [health] ${label}: WARN -- only ${n_seen} of ${expected_workers} workers reported a tier" \
+         "verified after serving inference across ${attempts} polls; the others are unverified for this cell." >&2
   fi
 }
 
@@ -663,44 +671,6 @@ check_oom_killed() {
   fi
 }
 
-# Highest reading across all thermal zones, whole degrees C. Empty output means no zone
-# was readable; callers skip the check rather than abort, since this is a safety net on
-# the run, not a precondition for it.
-read_max_cpu_temp_c() {
-  local max="" raw t zone
-  for zone in /sys/class/thermal/thermal_zone*/temp; do
-    [ -r "$zone" ] || continue
-    raw=$(cat "$zone" 2>/dev/null) || continue
-    [[ "$raw" =~ ^[0-9]+$ ]] || continue
-    t=$((raw / 1000))
-    if [ -z "$max" ] || [ "$t" -gt "$max" ]; then
-      max="$t"
-    fi
-  done
-  echo "$max"
-  return 0
-}
-
-# Pauses while at/above THERMAL_WARN_C, aborting only if still at/above THERMAL_CRIT_C
-# after MAX_THERMAL_COOLDOWNS pauses: a thermal hang loses the whole run, a pause costs
-# only wall-clock time.
-check_thermal_safety() {
-  local label="$1"
-  local temp cooldowns=0
-  temp=$(read_max_cpu_temp_c)
-  [ -z "$temp" ] && return 0
-  while [ "$temp" -ge "$THERMAL_WARN_C" ] && [ "$cooldowns" -lt "$MAX_THERMAL_COOLDOWNS" ]; do
-    echo "  [thermal] ${label}: ${temp}C >= warn ${THERMAL_WARN_C}C -- cooling ${THERMAL_COOLDOWN_S}s ($((cooldowns + 1))/${MAX_THERMAL_COOLDOWNS})"
-    sleep "$THERMAL_COOLDOWN_S"
-    cooldowns=$((cooldowns + 1))
-    temp=$(read_max_cpu_temp_c)
-    [ -z "$temp" ] && return 0
-  done
-  if [ "$temp" -ge "$THERMAL_CRIT_C" ]; then
-    abort_suite "[thermal] ${label}" "${temp}C still >= critical ${THERMAL_CRIT_C}C after ${cooldowns} cooldown(s)."
-  fi
-}
-
 k6_run() {
   local script="$1"; shift
   local env_flags=()
@@ -717,93 +687,48 @@ k6_run() {
 # pointed at under /results/raw/ (container path) / RAW_RESULTS_DIR (host path).
 finalize_result() {
   local name="$1"
-  local raw="${RAW_RESULTS_DIR}/${name}"
-  local final="${RESULTS_DIR}/${name}.gz"
-  python3 -c "
-import gzip, json, sys
-
-keep = set('${ABLATION_KEEP_METRICS}'.split(','))
-raw_path, final_path = sys.argv[1], sys.argv[2]
-with open(raw_path) as fin, gzip.open(final_path, 'wt') as fout:
-    for line in fin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if obj.get('type') != 'Point' or obj.get('metric') not in keep:
-            continue
-        fout.write(line + '\n')
-" "$raw" "$final"
-  rm -f "$raw"
+  python3 "${LIB_DIR}/k6_filter.py" finalize "${RAW_RESULTS_DIR}/${name}" "${RESULTS_DIR}/${name}.gz" "$ABLATION_KEEP_METRICS"
+  rm -f "${RAW_RESULTS_DIR}/${name}"
 }
 
-# Filters a raw k6 JSON chunk down to ABLATION_KEEP_METRICS and appends it to
-# a plain (uncompressed) file. Used by converge_warmup to filter each chunk
-# on arrival instead of accumulating raw chunks.
+# Filters a raw k6 JSON chunk down to ABLATION_KEEP_METRICS and appends it to a
+# plain (uncompressed) file, so converge_warmup never accumulates raw chunks.
 filter_chunk() {
-  local raw="$1" out="$2"
-  python3 -c "
-import json, sys
-
-keep = set('${ABLATION_KEEP_METRICS}'.split(','))
-raw_path, out_path = sys.argv[1], sys.argv[2]
-with open(raw_path) as fin, open(out_path, 'a') as fout:
-    for line in fin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if obj.get('type') != 'Point' or obj.get('metric') not in keep:
-            continue
-        fout.write(line + '\n')
-" "$raw" "$out"
+  python3 "${LIB_DIR}/k6_filter.py" append "$1" "$2" "$ABLATION_KEEP_METRICS"
 }
 
-# Gzips a file that is already filtered. Streams the copy; no JSON parsing.
+# Gzips an already-filtered file and deletes the plain copy.
 gzip_only() {
-  local plain="$1" final="$2"
-  python3 -c "
-import gzip, sys
-
-plain_path, final_path = sys.argv[1], sys.argv[2]
-with open(plain_path, 'rb') as fin, gzip.open(final_path, 'wb') as fout:
-    for block in iter(lambda: fin.read(1 << 20), b''):
-        fout.write(block)
-" "$plain" "$final"
-  rm -f "$plain"
+  python3 "${LIB_DIR}/k6_filter.py" gzip "$1" "$2"
+  rm -f "$1"
 }
 
-# Same convergence gate as run-suite.sh's converge_warmup(), reused verbatim
-# -- see that function's comment for the full rationale, including why
-# WARMUP_TAIL_ABS_FLOOR_MS gives the tail-drift criterion an absolute floor
-# alongside its percentage one. Runs warm-up.js in duration-bounded chunks
-# (WARMUP_CHUNK_DURATION_S), checks table0's own tail-drift criterion after
-# each chunk but the last (whose result cannot change the loop's exit),
-# stops once ABLATION_TARGET has converged or after MAX_WARMUP_CHUNKS
-# chunks. An explicit WARMUP_ITERATIONS_PER_TARGET override skips gating
-# and runs a single fixed-iteration pass instead.
+# Same convergence gate as run-suite.sh's converge_warmup(), kept identical to it
+# (see that function's comment for the rationale): warm-up.js in duration-bounded
+# chunks, lib/warmup_gate.py's criterion after each, stopping once ABLATION_TARGET
+# has converged or after MAX_WARMUP_CHUNKS chunks.
 WARMUP_CHUNK_DURATION_S=15
 MAX_WARMUP_CHUNKS=4
 WARMUP_WINDOW=500
+WARMUP_WINDOW_MIN_S=3
 WARMUP_TAIL_TOLERANCE_PCT=5.0
 WARMUP_TAIL_ABS_FLOOR_MS=0.25
+WARMUP_TABLE="table0_ablation_warmup_convergence_check"
 
 converge_warmup() {
   local out_prefix="$1"; shift
   local -a base_args=("$@")
 
-  local arg
+  # warm-up.js's own default when no WARMUP_TARGETS is passed.
+  local arg expect="mock calibration 5 10 20 28"
   for arg in "${base_args[@]}"; do
     if [[ "$arg" == WARMUP_ITERATIONS_PER_TARGET=* ]]; then
       k6_run warm-up.js "${base_args[@]}" -- --out "json=/results/raw/${out_prefix}.json"
       finalize_result "${out_prefix}.json"
       return
+    fi
+    if [[ "$arg" == WARMUP_TARGETS=* ]]; then
+      expect="${arg#WARMUP_TARGETS=}"
     fi
   done
 
@@ -819,61 +744,11 @@ converge_warmup() {
     rm -f "${RAW_RESULTS_DIR}/${chunk_name}"
     check_thermal_safety "${out_prefix} chunk${chunk}"
 
-    # Last chunk: the loop exits regardless of the result, so skip the check.
-    [ "$chunk" -eq "$MAX_WARMUP_CHUNKS" ] && break
-
-    converged=$(python3 - "$combined" "$WARMUP_WINDOW" "$WARMUP_TAIL_TOLERANCE_PCT" "$WARMUP_TAIL_ABS_FLOOR_MS" <<'PYEOF'
-import json, sys
-from collections import defaultdict
-
-fp, window, tol, abs_floor = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
-
-def ts_key(t):
-    # Go trims trailing zero fractional digits. Zero-pad the fractional part
-    # to a fixed width so comparison sorts numerically, not lexically.
-    body = t[:-1] if t.endswith("Z") else t
-    whole, _, frac = body.partition(".")
-    return whole, frac.ljust(9, "0")
-
-by_tier = defaultdict(list)
-with open(fp) as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if obj.get("type") != "Point" or obj.get("metric") != "http_req_duration":
-            continue
-        data = obj.get("data", {}) or {}
-        tags = data.get("tags", {}) or {}
-        if tags.get("status") != "200":
-            continue
-        tier, t, v = tags.get("tier"), data.get("time"), data.get("value")
-        if tier is not None and t is not None and v is not None:
-            by_tier[tier].append((t, v))
-
-if not by_tier:
-    print("false")
-    sys.exit()
-
-all_converged = True
-for pts in by_tier.values():
-    if len(pts) < 3 * window:
-        all_converged = False
-        continue
-    pts.sort(key=lambda p: ts_key(p[0]))
-    prev = sorted(v for _, v in pts[-2 * window:-window])[window // 2]
-    last = sorted(v for _, v in pts[-window:])[window // 2]
-    drift = 100 * (last - prev) / prev if prev else float("inf")
-    if abs(last - prev) >= abs_floor and abs(drift) >= tol:
-        all_converged = False
-
-print("true" if all_converged else "false")
-PYEOF
-    )
+    # Checked after the last chunk too: that verdict is the state the measured
+    # phase starts from, and the one table0 reports.
+    converged=$(python3 "${LIB_DIR}/warmup_gate.py" "$combined" --expect "$expect" \
+      --label "${out_prefix} chunk${chunk}" --window "$WARMUP_WINDOW" --min-span-s "$WARMUP_WINDOW_MIN_S" \
+      --tol "$WARMUP_TAIL_TOLERANCE_PCT" --floor "$WARMUP_TAIL_ABS_FLOOR_MS")
     [ "$converged" = "true" ] && break
   done
 
@@ -882,7 +757,7 @@ PYEOF
   else
     echo "  [warmup] ${out_prefix}: did not converge within ${MAX_WARMUP_CHUNKS} chunk(s) " \
          "(~$((MAX_WARMUP_CHUNKS * WARMUP_CHUNK_DURATION_S))s/target) -- proceeding with " \
-         "what was collected. Check table0_ablation_warmup_convergence_check for this cell's actual tail drift."
+         "what was collected. ${WARMUP_TABLE} reports each target's verdict."
   fi
   check_thermal_safety "${out_prefix} pre-finalize"
   gzip_only "$combined" "${RESULTS_DIR}/${out_prefix}.json.gz"
@@ -890,17 +765,17 @@ PYEOF
 
 # Measures this cell's real throughput at ABLATION_CALIB_ITER_PER_VU, then sets
 # the global ABLATION_ITER_PER_VU to whatever hits ABLATION_CALIB_TARGET_DURATION_S
-# at ABLATION_VUS. Call once per cell, after warm-up so the measurement isn't
-# contaminated by cold start. phase=ablation-calib keeps this run out of
-# analyze-ablation.py's phase=ablation filter, and the ablation_calib_ filename
-# prefix keeps it out of CELL_FILE_RE's known-arm match.
+# at ABLATION_VUS. Runs after warm-up so the measurement isn't contaminated by cold
+# start. phase=ablation-calib keeps this run out of analyze-ablation.py's
+# phase=ablation filter, and the ablation_calib_ filename prefix keeps it out of
+# CELL_FILE_RE's known-arm match.
 calibrate_ablation_cell() {
-  local arm="$1" value="$2" rep="$3"
-  local raw_name="ablation_calib_${arm}_${value}_rep${rep}.json"
-  echo "  [calibrate] arm=${arm} value=${value} rep=${rep}: measuring throughput at VUS=${ABLATION_VUS}..."
+  local arm="$1" value="$2"
+  local raw_name="ablation_calib_${arm}_${value}.json"
+  echo "  [calibrate] arm=${arm} value=${value}: measuring throughput at VUS=${ABLATION_VUS}..."
   k6_run run-target.js \
     TARGET="$ABLATION_TARGET" VUS="$ABLATION_VUS" ITERATIONS_PER_VU="$ABLATION_CALIB_ITER_PER_VU" \
-    PHASE=ablation-calib REP="$rep" -- \
+    PHASE=ablation-calib REP=calib -- \
     --out "json=/results/raw/${raw_name}"
   finalize_result "$raw_name"
 
@@ -929,9 +804,8 @@ with gzip.open(fp, "rt") as f:
         tags = obj["data"].get("tags") or {}
         if tags.get("phase") != "ablation-calib":
             continue
-        # Same fix as calibrate_target() in run-suite.sh: a failed request still
-        # emits a phase=ablation-calib point, and counting it in would derive the
-        # cell's iteration count from traffic that never reached the service.
+        # A failed request still emits a phase=ablation-calib point; counting it would
+        # derive the cell's iteration count from traffic that never reached the service.
         if tags.get("status") != "200":
             continue
         times.append(parse_iso(obj["data"]["time"]))
@@ -950,12 +824,54 @@ target_total_requests = throughput * target_s
 print(max(1, round(target_total_requests / vus)))
 PYEOF
   )
-  echo "  [calibrate] arm=${arm} value=${value} rep=${rep}: ITERATIONS_PER_VU=${ABLATION_ITER_PER_VU}"
+  echo "  [calibrate] arm=${arm} value=${value}: ITERATIONS_PER_VU=${ABLATION_ITER_PER_VU}"
+}
+
+# Calibrates every cell once, on a stack prepared exactly like that cell's reps (restart
+# at its configuration, pin checks, gated warm-up) that then runs no measured cell.
+# Calibrating inside a rep would give that rep a load history the others lack, and
+# calibrating in every rep would let each rep of a cell run a different workload.
+calibrate_ablation_cells() {
+  local cell arm value cpuset cpus workers tokens label
+  echo "[*] Ablation calibration: each cell's throughput at VUS=${ABLATION_VUS}, measured once for every rep"
+  for cell in "${CELLS[@]}"; do
+    IFS=':' read -r arm value cpuset cpus workers tokens <<< "$cell"
+    label="calibration arm=${arm} value=${value}"
+    echo "  -> ${label}"
+    record_env_sample "calibration_${arm}_${value}_start"
+    verify_smt_isolation "$label" "$cpuset"
+    verify_service_cpuset "$label" "python-service" "$cpuset" "$cpus"
+    restart_stack "$cpuset" "$cpus" "$workers" "$tokens"
+    wait_for_ready
+    verify_cpu_pinning "$label"
+    verify_jvm_flag_pins "$label"
+    verify_tiers_and_limiter "$label" "$tokens"
+    converge_warmup "ablation_calib_warmup_${arm}_${value}" "${WARMUP_ENV_ARGS[@]}" "REP=calib"
+    verify_tiers_runtime "$label"
+    verify_jvm_thread_pins "$label"
+    sleep "$COOLDOWN_S"
+
+    calibrate_ablation_cell "$arm" "$value"
+    ABLATION_CALIB_CACHE[${arm}:${value}]="$ABLATION_ITER_PER_VU"
+    echo "calibration arm=${arm} value=${value} iterations_per_vu=${ABLATION_ITER_PER_VU}" >> "$CALIB_LOG"
+    check_thermal_safety "$label"
+    record_env_sample "calibration_${arm}_${value}_end"
+    sleep "$COOLDOWN_S"
+  done
 }
 
 shuffled() { printf '%s\n' "$@" | shuf | tr '\n' ' '; }
 
+# Java's and k6's placement never changes during the ablation. Read from the resolved
+# compose configuration the containers start from, the same source run-suite.sh checks,
+# so a .env override is verified rather than assumed.
+JAVA_CPUSET=$(compose_service_value "transaction-service" cpuset)
+JAVA_QUOTA=$(compose_service_value "transaction-service" cpus)
+K6_CPUSET=$(compose_service_value "k6" cpuset)
+K6_QUOTA=$(compose_service_value "k6" cpus)
+
 capture_run_metadata
+calibrate_ablation_cells
 
 echo "[*] Ablation: ${#CELLS[@]} cells x ${REPS_ABLATION} reps, target=${ABLATION_TARGET} vus=${ABLATION_VUS}"
 for rep in $(seq 1 "$REPS_ABLATION"); do
@@ -984,10 +900,10 @@ for rep in $(seq 1 "$REPS_ABLATION"); do
     verify_jvm_thread_pins "$label"
     sleep "$COOLDOWN_S"
 
-    calibrate_ablation_cell "$arm" "$value" "$rep"
-    sleep "$COOLDOWN_S"
+    ABLATION_ITER_PER_VU="${ABLATION_CALIB_CACHE[${arm}:${value}]}"
 
     cell_name="ablation_${arm}_${value}_rep${rep}.json"
+    record_cell_thermal start "${cell_name%.json}"
     if ! k6_run run-target.js \
       TARGET="$ABLATION_TARGET" VUS="$ABLATION_VUS" ITERATIONS_PER_VU="$ABLATION_ITER_PER_VU" \
       PHASE=ablation REP="$rep" ARM="$arm" ARM_VALUE="$value" -- \
@@ -995,9 +911,10 @@ for rep in $(seq 1 "$REPS_ABLATION"); do
     then
       abort_suite "[cell] ${label}" "k6 exited non-zero."
     fi
-    finalize_result "$cell_name"
+    record_cell_thermal end "${cell_name%.json}"
     check_oom_killed "$label"
     check_thermal_safety "$label"
+    finalize_result "$cell_name"
     record_env_sample "${arm}_${value}_rep${rep}_end"
     sleep "$COOLDOWN_S"
   done
@@ -1005,9 +922,8 @@ done
 
 docker compose -f "$COMPOSE_FILE" down
 # Guards against an empty run: the completion banner would otherwise report success after
-# executing no cells at all. Excludes ablation_calib_* and ablation_warmup_* explicitly --
-# both also match 'ablation_*_rep*.json.gz', so without the exclusion this counted
-# calibration/warm-up files as cells and could never actually reach zero.
+# executing no cells at all. ablation_calib_* and ablation_warmup_* also match the cell
+# pattern, so they are excluded to count measured cells only.
 _n_cells=$(find "$RESULTS_DIR" -maxdepth 1 -name 'ablation_*_rep*.json.gz' \
   ! -name 'ablation_calib_*' ! -name 'ablation_warmup_*' 2>/dev/null | wc -l)
 if [ "$_n_cells" -eq 0 ]; then
@@ -1017,5 +933,6 @@ fi
 
 echo "[+] Ablation complete. Raw results in ${RESULTS_DIR}/ablation_*.json.gz"
 echo "    SMT topology and pinning checks logged to ${CPU_PIN_LOG}"
-echo "    Per-cell governor/frequency samples logged to ${ENV_TRACE_LOG}"
+echo "    Per-cell governor/frequency/temperature and thermal samples logged to ${ENV_TRACE_LOG}"
+echo "    The iteration count every cell ran with logged to ${CALIB_LOG}"
 echo "    Run: ../analysis/venv/bin/python3 ../analysis/analyze-ablation.py"

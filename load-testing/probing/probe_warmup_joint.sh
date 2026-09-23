@@ -13,19 +13,21 @@ set -euo pipefail
 # pass/fail at each checkpoint.
 #
 # Usage:
-#   ./probe_warmup_joint.sh LABEL VUS [CPUSET CPUS WORKERS TOKENS] [MAX_CHUNKS] [CHUNK_DURATION_S] [WINDOW] [TOL] [ABS_FLOOR_MS]
+#   ./probe_warmup_joint.sh LABEL VUS [CPUSET CPUS WORKERS TOKENS] [MAX_CHUNKS] [CHUNK_DURATION_S] [WINDOW] [TOL] [ABS_FLOOR_MS] [MIN_SPAN_S]
 #
 # VUS=5 reproduces the baseline/default-VUS-scan warm-up call; VUS=64 (this
 # suite's MAX_VUS) reproduces the scan_maxvus call. CPUSET/CPUS/WORKERS/TOKENS
 # default to docker-compose.yml's own defaults, matching both real call sites.
-# WINDOW/TOL/ABS_FLOOR_MS default to converge_warmup()'s own production
-# values, so this reproduces the real gate unless overridden.
+# WINDOW/TOL/ABS_FLOOR_MS/MIN_SPAN_S default to converge_warmup()'s own
+# production values, and every checkpoint runs the gate itself
+# (lib/warmup_gate.py), so this reproduces the real gate unless overridden.
 #
 # Examples:
 #   ./probe_warmup_joint.sh joint_baseline 5
 #   ./probe_warmup_joint.sh joint_maxvus 64
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+LIB_DIR="$(cd ../lib && pwd)"
 
 for _req_cmd in docker curl python3; do
   if ! command -v "$_req_cmd" >/dev/null 2>&1; then
@@ -34,7 +36,7 @@ for _req_cmd in docker curl python3; do
   fi
 done
 
-LABEL="${1:?usage: probe_warmup_joint.sh LABEL VUS [CPUSET CPUS WORKERS TOKENS] [MAX_CHUNKS] [CHUNK_DURATION_S] [WINDOW] [TOL] [ABS_FLOOR_MS]}"
+LABEL="${1:?usage: probe_warmup_joint.sh LABEL VUS [CPUSET CPUS WORKERS TOKENS] [MAX_CHUNKS] [CHUNK_DURATION_S] [WINDOW] [TOL] [ABS_FLOOR_MS] [MIN_SPAN_S]}"
 VUS="${2:?vus required}"
 CPUSET="${3:-0-1,4-5,8-9}"
 CPUS="${4:-6.0}"
@@ -45,6 +47,7 @@ CHUNK_DURATION_S="${8:-15}"
 WINDOW="${9:-500}"
 TOL="${10:-5.0}"
 ABS_FLOOR_MS="${11:-0.25}"
+MIN_SPAN_S="${12:-3}"
 
 # Matches run-suite.sh's TARGETS default and warm-up.js's own default ORDER.
 TARGETS="mock calibration 5 10 20 28"
@@ -53,57 +56,26 @@ COMPOSE_FILE="../../docker-compose.yml"
 RESULTS_DIR="../../results/probes"
 RAW_RESULTS_DIR="${RESULTS_DIR}/raw"
 mkdir -p "$RESULTS_DIR" "$RAW_RESULTS_DIR"
+ENV_TRACE_LOG="${RESULTS_DIR}/${LABEL}_thermal_log.txt"
+: > "$ENV_TRACE_LOG"
 
-THERMAL_WARN_C="${THERMAL_WARN_C_OVERRIDE:-90}"
-THERMAL_CRIT_C="${THERMAL_CRIT_C_OVERRIDE:-95}"
-THERMAL_COOLDOWN_S="${THERMAL_COOLDOWN_S_OVERRIDE:-60}"
-MAX_THERMAL_COOLDOWNS="${MAX_THERMAL_COOLDOWNS_OVERRIDE:-2}"
+# shellcheck disable=SC2034  # read by lib/thermal.sh
+{
+  THERMAL_WARN_C="${THERMAL_WARN_C_OVERRIDE:-90}"
+  THERMAL_CRIT_C="${THERMAL_CRIT_C_OVERRIDE:-95}"
+  THERMAL_COOLDOWN_S="${THERMAL_COOLDOWN_S_OVERRIDE:-60}"
+  MAX_THERMAL_COOLDOWNS="${MAX_THERMAL_COOLDOWNS_OVERRIDE:-2}"
+}
 
-abort_probe() {
-  echo "  [FATAL] $*" >&2
+abort_suite() {
+  local label="$1"; shift
+  echo "  [FATAL] ${label}: $*" >&2
   docker compose -f "$COMPOSE_FILE" down || true
   exit 1
 }
 
-# Highest reading across all thermal zones, whole degrees C. Empty output
-# means no zone was readable -- callers treat that as "skip the check", not
-# as an abort, since this is a safety net on top of the real run, not a
-# requirement for it.
-read_max_cpu_temp_c() {
-  local max="" raw t zone
-  for zone in /sys/class/thermal/thermal_zone*/temp; do
-    [ -r "$zone" ] || continue
-    raw=$(cat "$zone" 2>/dev/null) || continue
-    [[ "$raw" =~ ^[0-9]+$ ]] || continue
-    t=$((raw / 1000))
-    if [ -z "$max" ] || [ "$t" -gt "$max" ]; then
-      max="$t"
-    fi
-  done
-  echo "$max"
-  return 0
-}
-
-# Pauses if temps are at/above THERMAL_WARN_C, giving the system a chance to
-# cool; aborts if still at/above THERMAL_CRIT_C after MAX_THERMAL_COOLDOWNS
-# pauses. Errs toward pausing over aborting on the first warning -- a hard
-# hang loses the whole run, a paused one only costs wall-clock time.
-check_thermal_safety() {
-  local label="$1"
-  local temp cooldowns=0
-  temp=$(read_max_cpu_temp_c)
-  [ -z "$temp" ] && return 0
-  while [ "$temp" -ge "$THERMAL_WARN_C" ] && [ "$cooldowns" -lt "$MAX_THERMAL_COOLDOWNS" ]; do
-    echo "  [thermal] ${label}: ${temp}C >= warn ${THERMAL_WARN_C}C -- cooling ${THERMAL_COOLDOWN_S}s ($((cooldowns + 1))/${MAX_THERMAL_COOLDOWNS})"
-    sleep "$THERMAL_COOLDOWN_S"
-    cooldowns=$((cooldowns + 1))
-    temp=$(read_max_cpu_temp_c)
-    [ -z "$temp" ] && return 0
-  done
-  if [ "$temp" -ge "$THERMAL_CRIT_C" ]; then
-    abort_probe "[thermal] ${label}: ${temp}C still >= critical ${THERMAL_CRIT_C}C after ${cooldowns} cooldown(s)."
-  fi
-}
+# shellcheck source=../lib/thermal.sh
+. "${LIB_DIR}/thermal.sh"
 
 restart_stack() {
   echo "  [restart] cpuset=${CPUSET} cpus=${CPUS} workers=${WORKERS} thread_limiter_tokens=${TOKENS}"
@@ -123,7 +95,7 @@ wait_for_ready() {
     [ "$status" = "200" ] && { echo "  [ready] after ${i} attempt(s)."; return 0; }
     sleep 2
   done
-  abort_probe "[ready] transaction-service did not respond 200 within 60 attempts (last status ${status})."
+  abort_suite "[ready]" "transaction-service did not respond 200 within 60 attempts (last status ${status})."
 }
 
 k6_run() {
@@ -135,92 +107,18 @@ k6_run() {
     "${env_flags[@]}" k6 run "/scripts/${script}" "$@"
 }
 
-# k6's raw --out json dump writes a line per metric per request -- roughly
-# 15-20 lines for every one that report_checkpoint actually reads
-# (http_req_duration). combined accumulates for the whole probe, uncompressed,
-# across every chunk, so appending the unfiltered dump can exhaust disk well
-# before a long run finishes. Keeps only the metric report_checkpoint reads,
-# same idea as finalize_result()'s KEEP_METRICS filtering in run-suite.sh.
-filter_and_append() {
-  local raw="$1" dest="$2"
-  python3 -c "
-import json, sys
-with open(sys.argv[1]) as fin, open(sys.argv[2], 'a') as fout:
-    for line in fin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if obj.get('type') == 'Point' and obj.get('metric') == 'http_req_duration':
-            fout.write(line + '\n')
-" "$raw" "$dest"
-}
-
-# Prints every target's tail drift and whether ALL of them converge in this
-# SAME chunk -- reproduces converge_warmup()'s by-tier AND check in run-suite.sh
-# exactly (same window/median/drift math), plus which target(s) are still
-# moving when the joint check fails, which converge_warmup() itself doesn't
-# report.
+# Every target's gate verdict and whether ALL of them converged in this SAME chunk
+# -- the gate itself, run the way converge_warmup() runs it, plus the joint result
+# converge_warmup() acts on but does not print.
 report_checkpoint() {
-  local combined="$1" chunk="$2"
-  python3 - "$combined" "$WINDOW" "$TOL" "$ABS_FLOOR_MS" "$chunk" "$TARGETS" <<'PYEOF'
-import json, sys
-from collections import defaultdict
-
-fp, window, tol, abs_floor, chunk, targets = (
-    sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), sys.argv[5], sys.argv[6].split()
-)
-
-by_tier = defaultdict(list)
-with open(fp) as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if obj.get("type") != "Point" or obj.get("metric") != "http_req_duration":
-            continue
-        data = obj.get("data", {}) or {}
-        tags = data.get("tags", {}) or {}
-        if tags.get("status") != "200":
-            continue
-        tier, t, v = tags.get("tier"), data.get("time"), data.get("value")
-        if tier is not None and t is not None and v is not None:
-            by_tier[tier].append((t, v))
-
-all_converged = True
-blocking = []
-for tier in targets:
-    pts = by_tier.get(tier, [])
-    n = len(pts)
-    if n < 3 * window:
-        print(f"  [checkpoint {chunk}] tier={tier} n={n} -- not enough data yet for a {window}-window read")
-        all_converged = False
-        blocking.append(tier)
-        continue
-    pts.sort(key=lambda p: p[0])
-    prev = sorted(v for _, v in pts[-2 * window:-window])[window // 2]
-    last = sorted(v for _, v in pts[-window:])[window // 2]
-    drift = 100 * (last - prev) / prev if prev else float("inf")
-    converged = abs(last - prev) < abs_floor or abs(drift) < tol
-    tag = "CONVERGED" if converged else "still moving"
-    print(f"  [checkpoint {chunk}] tier={tier} n={n} prev{window}={prev:.3f}ms last{window}={last:.3f}ms "
-          f"drift={drift:+.1f}% (abs_diff={abs(last - prev):.3f}ms) ({tag})")
-    if not converged:
-        all_converged = False
-        blocking.append(tier)
-
-if all_converged:
-    print(f"  [checkpoint {chunk}] [joint] ALL SIX CONVERGED")
-else:
-    print(f"  [checkpoint {chunk}] [joint] NOT ALL CONVERGED -- blocking: {','.join(blocking)}")
-PYEOF
+  local combined="$1" chunk="$2" joint
+  joint=$(python3 "${LIB_DIR}/warmup_gate.py" "$combined" --expect "$TARGETS" --label "checkpoint ${chunk}" \
+    --window "$WINDOW" --min-span-s "$MIN_SPAN_S" --tol "$TOL" --floor "$ABS_FLOOR_MS")
+  if [ "$joint" = "true" ]; then
+    echo "  [checkpoint ${chunk}] [joint] ALL TARGETS CONVERGED"
+  else
+    echo "  [checkpoint ${chunk}] [joint] NOT ALL CONVERGED -- see the per-target lines above"
+  fi
 }
 
 restart_stack
@@ -229,7 +127,7 @@ wait_for_ready
 combined="${RAW_RESULTS_DIR}/${LABEL}_combined.json"
 : > "$combined"
 
-echo "[*] ${LABEL}: targets=(${TARGETS}) vus=${VUS} cpuset=${CPUSET} cpus=${CPUS} workers=${WORKERS} tokens=${TOKENS} window=${WINDOW} tol=${TOL} abs_floor_ms=${ABS_FLOOR_MS}"
+echo "[*] ${LABEL}: targets=(${TARGETS}) vus=${VUS} cpuset=${CPUSET} cpus=${CPUS} workers=${WORKERS} tokens=${TOKENS} window=${WINDOW} min_span_s=${MIN_SPAN_S} tol=${TOL} abs_floor_ms=${ABS_FLOOR_MS}"
 echo "[*] running up to ${MAX_CHUNKS} chunks of ${CHUNK_DURATION_S}s/target, 6 targets/chunk as 6 separate calls" \
      "(~$((MAX_CHUNKS * CHUNK_DURATION_S * 6))s of load plus per-call container overhead) -- not stopping early, we want the full curve"
 
@@ -242,14 +140,16 @@ for chunk in $(seq 1 "$MAX_CHUNKS"); do
     target_name="${LABEL}_chunk${chunk}_${tier}.json"
     k6_run warm-up.js WARMUP_TARGETS="$tier" WARMUP_VUS="$VUS" WARMUP_DURATION_S="$CHUNK_DURATION_S" -- \
       --out "json=/results/probes/raw/${target_name}"
-    filter_and_append "${RAW_RESULTS_DIR}/${target_name}" "$combined"
+    # Only the metric the gate reads: the combined file grows for the whole probe,
+    # uncompressed, and k6 writes a line per metric per request.
+    python3 "${LIB_DIR}/k6_filter.py" append "${RAW_RESULTS_DIR}/${target_name}" "$combined" http_req_duration
     rm -f "${RAW_RESULTS_DIR}/${target_name}"
     check_thermal_safety "${LABEL} chunk${chunk} tier=${tier}"
   done
   report_checkpoint "$combined" "$chunk"
 done
 
-gzip -c "$combined" > "${RESULTS_DIR}/${LABEL}.json.gz"
+python3 "${LIB_DIR}/k6_filter.py" gzip "$combined" "${RESULTS_DIR}/${LABEL}.json.gz"
 rm -f "$combined"
 
 docker compose -f "$COMPOSE_FILE" down

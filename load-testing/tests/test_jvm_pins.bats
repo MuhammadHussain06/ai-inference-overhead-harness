@@ -18,8 +18,8 @@ services:
       JAVA_TOOL_OPTIONS: -Xms1536m -Xmx1536m -XX:+UseG1GC -XX:ParallelGCThreads=4 -XX:ConcGCThreads=1 -Dreactor.netty.ioWorkerCount=4 -Xlog:gc*:file=/gc-logs/gc.log
 EOF
 
-  # The fault-injection case that broke jvm_option_value: -XX:ParallelGCThreads
-  # dropped entirely, everything else intact.
+  # -XX:ParallelGCThreads dropped entirely, everything else intact: the shape
+  # fault-injection case 07 produces.
   cat > "${STUB_DATA}/compose_config_missing_flag.txt" <<'EOF'
 services:
   transaction-service:
@@ -94,15 +94,15 @@ setup() {
   source "$LIB"
 }
 
-# --- jvm_option_value: the function the fault-injection suite's case 07 broke ---
+# --- jvm_option_value: reads one option out of JAVA_TOOL_OPTIONS ---
 
 @test "jvm_option_value reads a present flag" {
   [ "$(jvm_option_value "-XX:ParallelGCThreads" "-XX:+UseG1GC -XX:ParallelGCThreads=4")" = "4" ]
 }
 
 @test "jvm_option_value returns empty, not a crash, when the flag is absent" {
-  # Reproduces the exact regression: a no-match grep must not take set -e down
-  # with it before the caller's own empty-value check runs.
+  # A no-match grep must not take set -e down with it before the caller's own
+  # empty-value check runs.
   run bash -c "set -euo pipefail; source '${LIB}'; v=\$(jvm_option_value '-XX:ParallelGCThreads' '-XX:+UseG1GC -XX:ConcGCThreads=1'); echo \"[\${v}]\""
   [ "$status" -eq 0 ]
   [ "$output" = "[]" ]

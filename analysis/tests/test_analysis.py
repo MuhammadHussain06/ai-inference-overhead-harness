@@ -1,8 +1,9 @@
 """Guards the analysis helpers that shape every reported table and figure."""
 
+import gzip
 import importlib.util
-import inspect
 import json
+import subprocess
 import re
 import sys
 from pathlib import Path
@@ -26,6 +27,8 @@ def _load(module_name, filename):
 
 results = _load("analyze_results", "analyze-results.py")
 ablation = _load("analyze_ablation", "analyze-ablation.py")
+warmup_check = sys.modules["warmup_check"]
+thermal = sys.modules["thermal"]
 
 
 # run-ablation.sh cell values
@@ -130,12 +133,21 @@ def test_throughput_is_nan_when_no_rep_has_two_timestamps():
 
 # scan level selection
 
-def test_scan_levels_keep_non_default_concurrency_values():
+def test_scan_tables_keep_non_default_concurrency_values(tmp_path):
     """A CONCURRENCY_OVERRIDE outside CONCURRENCY_ORDER must not drop those cells."""
-    seen = [2, 6, 12]
-    levels = ([v for v in results.CONCURRENCY_ORDER if v in seen]
-              + [v for v in seen if v not in results.CONCURRENCY_ORDER])
-    assert sorted(levels) == sorted(seen)
+    rows = []
+    for vus in (2, 6, 12):
+        for rep in ("1", "2"):
+            for i in range(30):
+                rows.append({"metric": "http_req_duration", "value": 5.0 + i % 3, "status": "200",
+                             "phase": "scan", "tier": "28", "vus": float(vus), "rep": rep,
+                             "source_file": f"scan_28_vus{vus}_rep{rep}.json.gz",
+                             "time": pd.Timestamp("2026-01-01T00:00:00Z") + pd.Timedelta(milliseconds=10 * i)})
+    results.analyze_scan(pd.DataFrame(rows), str(tmp_path))
+    table4 = pd.read_csv(tmp_path / "tables" / "table4_concurrency_scan_summary_pooled.csv")
+    assert table4["Concurrency (VUS)"].tolist() == [2, 6, 12]
+    drift = pd.read_csv(tmp_path / "tables" / "table4e_scan_within_cell_drift.csv")
+    assert drift["Group"].tolist() == ["v28 @ VUS=2", "v28 @ VUS=6", "v28 @ VUS=12"]
 
 
 # GC log parsing
@@ -153,7 +165,23 @@ def test_parse_gc_log_extracts_only_bare_gc_pause_lines(tmp_path):
     log.write_text(GC_LOG)
     pauses, window_s, _ = results.parse_gc_log(str(log))
     assert [d for _, d in pauses] == [2.5, 3.75]
-    assert window_s == pytest.approx(59.488)
+    assert window_s == pytest.approx(60.0)
+
+
+def test_parse_gc_log_spans_the_window_by_wall_clock_across_the_two_jvms(tmp_path):
+    """The archived log opens with the last pin-check probe JVM's own lines (uptime
+    near zero), then continues with the service JVM's (uptime since it started, 3.4s
+    earlier). An uptime difference would add those 3.4s to the window."""
+    log = tmp_path / "gc_baseline_rep1.log"
+    log.write_text(
+        "[2026-01-01T12:00:00.000+0000][0.001s][info][gc     ] Using G1\n"
+        "[2026-01-01T12:00:00.020+0000][0.020s][info][gc,heap,exit] Heap\n"
+        "[2026-01-01T12:00:10.000+0000][13.400s][info][gc] GC(7) Pause Young (Normal) "
+        "(G1 Evacuation Pause) 128M->40M(1536M) 2.000ms\n"
+        "[2026-01-01T12:03:00.000+0000][183.400s][info][gc,heap,exit] Heap\n")
+    pauses, window_s, collector = results.parse_gc_log(str(log))
+    assert collector == "G1" and [d for _, d in pauses] == [2.0]
+    assert window_s == pytest.approx(180.0)
 
 
 def test_parse_gc_log_confirmed_g1_zero_pauses_is_informational_not_a_warning(tmp_path, capsys):
@@ -292,11 +320,8 @@ SERIAL_PAUSE_LOG = (
 
 
 def test_parse_gc_log_warns_when_a_non_g1_collector_produced_parsable_pauses(tmp_path, capsys):
-    """Serial/Parallel/Shenandoah emit the same generic "GC(N) Pause ..." record as G1.
-
-    Verified on JDK 21.0.10: their pauses parse cleanly, so checking the collector only in
-    the zero-pause branch reported them as G1's with no warning at all.
-    """
+    """Serial/Parallel/Shenandoah emit the same generic "GC(N) Pause ..." record as G1,
+    so a log whose pauses parse is not by itself evidence that G1 produced them."""
     log = tmp_path / "gc_scan_rep1.log"
     log.write_text(SERIAL_PAUSE_LOG)
     pauses, _, collector = results.parse_gc_log(str(log))
@@ -405,18 +430,9 @@ def test_between_run_sd_is_not_estimable_from_one_rep():
     assert np.isnan(out["StdDev Across Reps (ms)"].iloc[0])
 
 
-def test_warmup_skip_distinguishes_absent_data_from_a_failed_warmup(tmp_path, capsys):
-    df = pd.DataFrame([{"phase": "warmup", "metric": "http_req_duration", "value": 5.0,
-                        "status": "500", "tier": "v28", "source_file": "warmup_baseline_rep1",
-                        "time": pd.Timestamp("2026-01-01T00:00:00Z"), "rep": "1"}])
-    results.analyze_warmup(df, str(tmp_path))
-    out = capsys.readouterr().out
-    assert "none returned HTTP 200" in out and "run without" not in out
+# --- warm-up convergence (table0) ---
 
-# --- warm-up convergence criterion (table0) ---
-
-# The criterion is the looser of two bounds, so the column header has to name both --
-# a reader cannot otherwise tell which one admitted a given window.
+# Both bounds are in the header, so a reader can tell which one admitted a target.
 CONVERGED_COL = "Converged (tail <5% or <0.25ms)"
 WINDOW = 500
 
@@ -427,123 +443,160 @@ def _shell_const(script, name):
     return re.search(rf"^{name}=(\S+)$", text, re.M).group(1)
 
 
-def _warmup_frame(segments, tier="28", source_file="warmup_scan_rep1"):
-    """A phase='warmup' frame whose HTTP 200 latencies run through `segments`
-    ((value, count) pairs) in time order."""
-    values, times = [], []
-    base = pd.Timestamp("2026-01-01T00:00:00Z")
-    for value, count in segments:
-        for _ in range(count):
-            times.append(base + pd.Timedelta(milliseconds=len(times)))
-            values.append(value)
-    return pd.DataFrame({"phase": "warmup", "metric": "http_req_duration",
-                         "value": values, "status": "200", "tier": tier,
-                         "source_file": source_file, "time": times})
-
-
-def _warmup_table(df, tmp_path):
-    results.analyze_warmup(df, str(tmp_path))
-    return pd.read_csv(tmp_path / "tables" / "table0_warmup_convergence_check.csv")
-
-
-def test_warmup_criterion_matches_the_live_shell_gate():
-    """table0 claims to report the verdict run-suite.sh's gate acted on. If the two
-    drift apart, the table says a window converged that warm-up never stopped for."""
-    for script in ("run-suite.sh", "run-ablation.sh"):
-        assert int(_shell_const(script, "WARMUP_WINDOW")) == WINDOW
-        assert float(_shell_const(script, "WARMUP_TAIL_TOLERANCE_PCT")) == 5.0
-        assert float(_shell_const(script, "WARMUP_TAIL_ABS_FLOOR_MS")) == 0.25
-
-    for fn in (results.analyze_warmup, ablation.build_ablation_warmup_table):
-        params = inspect.signature(fn).parameters
-        assert params["window_size"].default == WINDOW
-        assert params["tail_tolerance_pct"].default == 5.0
-        assert params["tail_abs_floor_ms"].default == 0.25
-
-
-def test_warmup_converges_within_the_percentage_tolerance(tmp_path):
-    table = _warmup_table(_warmup_frame([(100.0, 2 * WINDOW), (102.0, WINDOW)]), tmp_path)
-    assert table[CONVERGED_COL].tolist() == ["YES"]
-    assert table["Tail drift (%)"].iloc[0] == pytest.approx(2.0)
-
-
-def test_warmup_converges_on_the_absolute_floor_the_percentage_bound_rejects(tmp_path):
-    """5% of a sub-millisecond round trip is a few dozen microseconds -- inside
-    ordinary timer jitter, so a percentage-only bound never clears the fast tiers."""
-    table = _warmup_table(_warmup_frame([(0.20, 2 * WINDOW), (0.40, WINDOW)]), tmp_path)
-    assert table[CONVERGED_COL].tolist() == ["YES"]
-    # 100% tail drift: only the 0.20 ms absolute gap could have admitted this window.
-    assert table["Tail drift (%)"].iloc[0] == pytest.approx(100.0)
-
-
-def test_warmup_reports_no_when_both_bounds_are_exceeded(tmp_path, capsys):
-    table = _warmup_table(_warmup_frame([(10.0, 2 * WINDOW), (20.0, WINDOW)]), tmp_path)
-    assert table[CONVERGED_COL].tolist() == ["no"]
-    assert table["Tail drift (%)"].iloc[0] == pytest.approx(100.0)
-    out = capsys.readouterr().out
-    assert "1/1 warm-up windows had not converged" in out
-
-
-def test_warmup_reports_a_lagging_target_separately_from_a_settled_one(tmp_path):
-    """Per-target rows, not one pooled verdict: a tier still moving must stay visible
-    next to the tiers that settled, which is the same grouping the live gate applies."""
-    df = pd.concat([_warmup_frame([(0.50, 3 * WINDOW)], tier="mock"),
-                    _warmup_frame([(10.0, 2 * WINDOW), (20.0, WINDOW)], tier="28")])
-    table = _warmup_table(df, tmp_path).set_index("Tier")
-    assert table.loc["mock", CONVERGED_COL] == "YES"
-    assert table.loc["v28", CONVERGED_COL] == "no"
-
-
-def test_warmup_needs_three_full_windows_before_reporting(tmp_path, capsys):
-    """One point short of 3 * window_size leaves no penultimate window to compare
-    against; reporting that as converged would read "not measured" as "no drift"."""
-    results.analyze_warmup(_warmup_frame([(10.0, 3 * WINDOW - 1)]), str(tmp_path))
-    assert "Skipping empty table" in capsys.readouterr().out
-    assert not (tmp_path / "tables" / "table0_warmup_convergence_check.csv").exists()
-
-    table = _warmup_table(_warmup_frame([(10.0, 3 * WINDOW)]), tmp_path)
-    assert table["N Requests"].tolist() == [3 * WINDOW]
-
-
-def test_warmup_table_names_the_criterion_it_applied(tmp_path):
-    table = _warmup_table(_warmup_frame([(10.0, 3 * WINDOW)]), tmp_path)
-    assert CONVERGED_COL in table.columns
-    assert f"Prev {WINDOW} P50 (ms)" in table.columns
-    caption = (tmp_path / "tables" / "table0_warmup_convergence_check.tex").read_text()
-    assert "whichever bound is looser" in caption
-    assert "under 5% or an absolute gap under 0.25 ms" in caption
-
-
-def _ablation_warmup_file(path, segments):
-    """ablation_warmup_<arm>_<value>_rep<N>.json, as run-ablation.sh names it."""
+def _warmup_file(path, segments, step_ms=10, gz=True):
+    """A k6 warm-up result file whose HTTP 200 latencies run through `segments`
+    ((tier, value, count[, status]) tuples) in time order, one point every step_ms,
+    written the way converge_warmup() leaves it."""
     lines, i = [], 0
-    for value, count in segments:
+    base = pd.Timestamp("2026-01-01T00:00:00Z")
+    for seg in segments:
+        tier, value, count = seg[:3]
+        status = seg[3] if len(seg) > 3 else "200"
         for _ in range(count):
-            lines.append(json.dumps({"type": "Point", "metric": "http_req_duration", "data": {
-                "time": f"2026-01-01T00:00:00.{i:06d}Z", "value": value,
-                "tags": {"tier": "28", "status": "200"}}}))
+            t = (base + pd.Timedelta(milliseconds=i * step_ms)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            lines.append(json.dumps({"metric": "http_req_duration", "type": "Point", "data": {
+                "time": t, "value": value, "tags": {"tier": tier, "status": status, "phase": "warmup"}}}))
             i += 1
-    path.write_text("\n".join(lines) + "\n")
+    text = "\n".join(lines) + "\n"
+    if gz:
+        with gzip.open(path, "wt") as f:
+            f.write(text)
+    else:
+        path.write_text(text)
 
 
-def test_ablation_warmup_table_applies_the_same_two_bound_criterion(tmp_path):
-    """run-ablation.sh keeps its own copy of the gate, so this table has to agree with
-    analyze-results.py's on both bounds and on the column that names them."""
-    _ablation_warmup_file(tmp_path / "ablation_warmup_cpuset_0-1_rep1.json",
-                          [(0.20, 2 * WINDOW), (0.40, WINDOW)])
-    _ablation_warmup_file(tmp_path / "ablation_warmup_cpuset_2-3_rep1.json",
-                          [(10.0, 2 * WINDOW), (20.0, WINDOW)])
-    table = ablation.build_ablation_warmup_table(str(tmp_path)).set_index("Value")
-    assert CONVERGED_COL in table.columns
+def _metadata(tmp_path, targets, **gate):
+    (tmp_path / "run_metadata.json").write_text(json.dumps(
+        {"suite_config": {"targets": targets, **({"warmup_gate": gate} if gate else {})}}))
+    return results.read_run_metadata(str(tmp_path))
+
+
+def _table0(tmp_path, targets=("28",)):
+    return results.analyze_warmup(str(tmp_path), str(tmp_path / "out"), _metadata(tmp_path, list(targets)))
+
+
+def test_warmup_criterion_defaults_match_the_live_shell_gate():
+    """A run without recorded parameters is judged at the module's defaults, which
+    must be the constants both scripts run the gate at."""
+    params = warmup_check.gate_params()
+    for script in ("run-suite.sh", "run-ablation.sh"):
+        assert int(_shell_const(script, "WARMUP_WINDOW")) == params["base_window"] == WINDOW
+        assert float(_shell_const(script, "WARMUP_WINDOW_MIN_S")) == params["min_span_s"]
+        assert float(_shell_const(script, "WARMUP_TAIL_TOLERANCE_PCT")) == params["tol_pct"] == 5.0
+        assert float(_shell_const(script, "WARMUP_TAIL_ABS_FLOOR_MS")) == params["floor_ms"] == 0.25
+
+
+def test_both_analysis_scripts_judge_warmup_with_the_live_gate_module():
+    assert warmup_check.gate.evaluate is results.warmup_gate.evaluate
+    assert Path(warmup_check.GATE_PATH).resolve() == (LOAD_TESTING_DIR / "lib" / "warmup_gate.py").resolve()
+
+
+def test_table0_reports_the_gates_verdict_per_target(tmp_path):
+    _warmup_file(tmp_path / "warmup_scan_rep1.json.gz",
+                 [("mock", 0.20, 2 * WINDOW), ("mock", 0.40, WINDOW),
+                  ("28", 100.0, 2 * WINDOW), ("28", 102.0, WINDOW),
+                  ("5", 10.0, 2 * WINDOW), ("5", 20.0, WINDOW)])
+    table = _table0(tmp_path, ["mock", "5", "28"]).set_index("Tier")
+    # The absolute floor admits mock's 0.2 ms gap despite 100% drift; the percentage
+    # bound admits v28's 2%; v5 fails both.
+    assert table.loc["mock", CONVERGED_COL] == "YES"
+    assert table.loc["v28", CONVERGED_COL] == "YES"
+    assert table.loc["v5", CONVERGED_COL] == "no"
+    assert table.loc["v5", "Status"] == "drifting"
+    assert table.loc["v5", "Tail drift (%)"] == pytest.approx(100.0)
+
+
+def test_table0_keeps_every_expected_target_including_the_ones_that_failed(tmp_path, capsys):
+    """A target that never reached three windows or never returned 200 is the finding;
+    dropping its row would make a partially warmed stack read as fully converged."""
+    _warmup_file(tmp_path / "warmup_baseline_rep1.json.gz",
+                 [("28", 10.0, 3 * WINDOW), ("5", 10.0, 3 * WINDOW - 1), ("10", 900.0, 50, "503")])
+    table = _table0(tmp_path, ["28", "5", "10", "20"]).set_index("Tier")
+    assert table.loc["v28", "Status"] == "converged"
+    assert table.loc["v5", "Status"] == "fewer than three windows"
+    assert table.loc["v10", "Status"] == "no HTTP 200 responses"
+    assert table.loc["v10", "Failed Requests"] == 50
+    assert table.loc["v20", "Status"] == "no requests"
+    assert (table.loc[["v5", "v10", "v20"], CONVERGED_COL] == "no").all()
+    assert "3/4 warm-up target(s) had not converged" in capsys.readouterr().out
+
+
+def test_table0_window_spans_the_recorded_minimum_at_a_high_request_rate(tmp_path):
+    """At 1 ms per request a 500-request window covers half a second, so a blip in
+    the last half second would read as drift; the window is widened to the recorded
+    minimum span instead."""
+    _warmup_file(tmp_path / "warmup_scan_rep1.json.gz",
+                 [("mock", 10.0, 11500), ("mock", 20.0, 500)], step_ms=1)
+    table = _table0(tmp_path, ["mock"])
+    assert table["Window (requests)"].tolist() == [3500]
+    assert table[CONVERGED_COL].tolist() == ["YES"]
+
+    (tmp_path / "out").mkdir(exist_ok=True)
+    table = results.analyze_warmup(str(tmp_path), str(tmp_path / "out"),
+                                   _metadata(tmp_path, ["mock"], base_window=500, min_window_span_s=0,
+                                             tail_tolerance_pct=5.0, tail_abs_floor_ms=0.25))
+    assert table["Window (requests)"].tolist() == [500]
+    assert table[CONVERGED_COL].tolist() == ["no"]
+
+
+def test_table0_orders_passes_chronologically_and_reads_plain_and_gzip(tmp_path):
+    for name in ("warmup_scan_maxvus_rep1.json.gz", "warmup_scan_rep1.json.gz",
+                 "warmup_baseline_rep2.json.gz", "warmup_baseline_rep10.json.gz"):
+        _warmup_file(tmp_path / name, [("28", 5.0, 3 * WINDOW)])
+    _warmup_file(tmp_path / "warmup_baseline_rep1.json", [("28", 5.0, 3 * WINDOW)], gz=False)
+    table = _table0(tmp_path)
+    assert table["Source File"].tolist() == [
+        "warmup_baseline_rep1.json", "warmup_baseline_rep2.json.gz", "warmup_baseline_rep10.json.gz",
+        "warmup_scan_rep1.json.gz", "warmup_scan_maxvus_rep1.json.gz"]
+
+
+def test_table0_says_when_a_file_was_truncated(tmp_path, capsys):
+    whole = tmp_path / "whole.json.gz"
+    _warmup_file(whole, [("28", 5.0, 20000)])
+    (tmp_path / "warmup_baseline_rep1.json.gz").write_bytes(whole.read_bytes()[: whole.stat().st_size // 2])
+    whole.unlink()
+    table = _table0(tmp_path)
+    assert table["Status"].iloc[0].endswith("(file truncated)")
+    assert "compressed stream ended early" in capsys.readouterr().out
+
+
+def test_table0_caption_names_the_criterion_it_applied(tmp_path):
+    _warmup_file(tmp_path / "warmup_baseline_rep1.json.gz", [("28", 5.0, 3 * WINDOW)])
+    _table0(tmp_path)
+    caption = (tmp_path / "out" / "tables" / "table0_warmup_convergence_check.tex").read_text()
+    assert "at least 500 HTTP 200 requests spanning at least 3 s" in caption
+    assert "under 5\\% or an absolute gap under 0.25 ms" in caption
+
+
+def test_table0_without_warmup_files_is_skipped_not_raised(tmp_path, capsys):
+    assert results.analyze_warmup(str(tmp_path), str(tmp_path), {}) is None
+    assert "No warmup_* files found" in capsys.readouterr().out
+
+
+def _ablation_metadata(tmp_path, **extra):
+    config = {"target": "28", **extra}
+    (tmp_path / "ablation_run_metadata.json").write_text(json.dumps({"ablation_config": config}))
+    return ablation.read_metadata(str(tmp_path))
+
+
+def test_ablation_table0_applies_the_same_gate_per_cell(tmp_path):
+    _warmup_file(tmp_path / "ablation_warmup_cpuset_0-1_rep1.json.gz",
+                 [("28", 0.20, 2 * WINDOW), ("28", 0.40, WINDOW)])
+    _warmup_file(tmp_path / "ablation_warmup_cpuset_2-3_rep1.json.gz",
+                 [("28", 10.0, 2 * WINDOW), ("28", 20.0, WINDOW)])
+    _warmup_file(tmp_path / "ablation_warmup_thread_limiter_128_rep1.json.gz", [("28", 10.0, 100)])
+    table, params = ablation.build_ablation_warmup_table(str(tmp_path), _ablation_metadata(tmp_path))
+    table = table.set_index("Value")
+    assert warmup_check.converged_column(params) == CONVERGED_COL
     assert table.loc["0-1", CONVERGED_COL] == "YES"
     assert table.loc["2-3", CONVERGED_COL] == "no"
+    assert table.loc["128", "Status"] == "fewer than three windows"
 
 
-def test_ablation_warmup_table_needs_three_full_windows(tmp_path, capsys):
-    _ablation_warmup_file(tmp_path / "ablation_warmup_cpuset_0-1_rep1.json",
-                          [(10.0, 3 * WINDOW - 1)])
-    assert ablation.build_ablation_warmup_table(str(tmp_path)).empty
-    assert f"none had >= {3 * WINDOW} HTTP 200 requests" in capsys.readouterr().out
+def test_ablation_table0_reports_the_target_even_when_it_sent_nothing(tmp_path):
+    _warmup_file(tmp_path / "ablation_warmup_workers_1_rep1.json.gz", [("5", 10.0, 3 * WINDOW)])
+    table, _ = ablation.build_ablation_warmup_table(str(tmp_path), _ablation_metadata(tmp_path))
+    assert table.set_index("Tier").loc["28", "Status"] == "no requests"
 
 
 # --- reservoir sampling in load_results ---
@@ -592,13 +645,10 @@ def oversized_results_dir(tmp_path_factory):
 @pytest.fixture(scope="module")
 def oversized_results_dir_exemptions(tmp_path_factory):
     """A second oversized directory, separate from oversized_results_dir so its extra
-    files cannot shift that fixture's already-asserted point counts. Carries an
-    oversized scan_ file with 50 non-200 points mixed into the sampled ones, and an
-    equally oversized warmup_-prefixed file, for the two subsampling exemptions that
-    fixture doesn't cover."""
+    points cannot shift that fixture's already-asserted counts: an oversized scan_
+    file with 50 non-200 points mixed into the sampled ones."""
     d = tmp_path_factory.mktemp("oversized_exemptions")
     _sampled_file(d / "scan_28_vus64_rep1.json", MAX_POINTS_PER_FILE + 1000, n_errors=50)
-    _sampled_file(d / "warmup_baseline_rep1.json", MAX_POINTS_PER_FILE + 1000)
     return d
 
 
@@ -646,13 +696,15 @@ def test_load_results_keeps_every_non_200_point_regardless_of_the_cap(oversized_
     assert sorted(non200["value"].tolist()) == sorted([-1.0 - i for i in range(50)])
 
 
-def test_load_results_keeps_every_warmup_point_regardless_of_the_cap(oversized_results_dir_exemptions, capsys):
-    """converge_warmup()'s tail-window check needs a genuinely contiguous, time-ordered
-    tail; random subsampling would break that, so warmup_* files are exempt from the
-    reservoir entirely, no matter how large."""
-    df, _ = results.load_results(str(oversized_results_dir_exemptions), prefixes=("warmup_",))
-    assert int((df["metric"] == "http_req_duration").sum()) == MAX_POINTS_PER_FILE + 1000
-    assert "subsampled" not in capsys.readouterr().out
+def test_load_results_reports_true_extremes_despite_subsampling(oversized_results_dir):
+    """A uniform sample almost never keeps a file's single smallest and largest point,
+    so Min/Max over the sample would understate the range the cell really had."""
+    df, true_counts = results.load_results(str(oversized_results_dir), prefixes=("scan_",))
+    filters = dict(metric="http_req_duration", tier="28", phase="scan", status="200")
+    assert results._true_value_range(true_counts, **filters) == (0.0, float(MAX_POINTS_PER_FILE + 999))
+    cell = df[(df["metric"] == "http_req_duration") & (df["status"] == "200")]
+    stats = results.summarize(cell, "v28", true_counts=true_counts, **filters)
+    assert (stats["Min (ms)"], stats["Max (ms)"]) == (0.0, float(MAX_POINTS_PER_FILE + 999))
 
 
 def test_load_results_true_counts_track_the_full_count_despite_subsampling(oversized_results_dir):
@@ -686,9 +738,8 @@ def test_true_counts_keeps_different_rate_cells_of_the_same_tier_separate(tmp_pa
 def _sampled_file_over_time(path, n_points, duration_s, extra_metrics=()):
     """n_points status=200 http_req_duration points spread evenly over duration_s
     (so true throughput is exactly (n_points - 1) / duration_s), plus, at each of
-    those same timestamps, one point for each of extra_metrics -- reproducing the
-    real shape that under-filled the reservoir: several metrics sharing one point
-    budget per file, none of them individually near the cap."""
+    those same timestamps, one point for each of extra_metrics: several metrics
+    sharing one point budget per file, none of them individually near the cap."""
     step = duration_s / (n_points - 1) if n_points > 1 else 0.0
     with open(path, "w") as f:
         for i in range(n_points):
@@ -704,11 +755,10 @@ def _sampled_file_over_time(path, n_points, duration_s, extra_metrics=()):
 
 
 def test_throughput_is_not_deflated_by_cross_metric_reservoir_sharing(tmp_path):
-    """Reproduces the actual bug: one metric's own point count stays under
-    MAX_POINTS_PER_FILE, but several metrics sharing that file's single reservoir
-    push the combined total over it, so http_req_duration itself gets subsampled
-    and _throughput_reqs_per_s()'s (n-1)/span reads out at roughly the subsampling
-    ratio instead of the metric's own true rate."""
+    """One metric's own point count stays under MAX_POINTS_PER_FILE, but several
+    metrics sharing that file's single reservoir push the combined total over it, so
+    http_req_duration itself is subsampled and (n-1)/span over the sample would read
+    at roughly the subsampling ratio instead of the metric's true rate."""
     n_points = MAX_POINTS_PER_FILE // 3
     duration_s = 60.0
     true_throughput = (n_points - 1) / duration_s
@@ -800,8 +850,7 @@ def test_openloop_check_reports_a_totally_overloaded_cell_instead_of_dropping_it
 
 def test_crosscheck_error_counters_warns_when_no_duration_table_to_check_against(capsys):
     """No http_req_duration-derived table (e.g. that phase's load pass was skipped)
-    previously returned with no message at all -- indistinguishable from a real,
-    passing cross-check."""
+    must be reported, not read as a passing cross-check."""
     df = pd.DataFrame({"phase": [], "metric": [], "value": []})
     results.crosscheck_error_counters(df, "scan", ["tier"], lambda k: str(k[0]), None)
     assert "did not run for this phase" in capsys.readouterr().out
@@ -809,17 +858,15 @@ def test_crosscheck_error_counters_warns_when_no_duration_table_to_check_against
 
 def test_analyze_measurement_floor_warns_when_the_floor_tier_has_no_rows(tmp_path, capsys):
     """floor_tier listed in the run's order but producing zero rows (e.g. a failed
-    calibration cell) previously returned silently instead of explaining why
-    table1e is absent."""
+    calibration cell) must explain why table1e is absent."""
     e2e = pd.DataFrame({"tier": ["5", "5"], "value": [10.0, 12.0]})
     results.analyze_measurement_floor(e2e, ["calibration", "5"], str(tmp_path))
     assert "no valid values" in capsys.readouterr().out
 
 
 def test_analyze_gc_logs_warns_when_a_rep_has_no_parsable_records(tmp_path, capsys):
-    """A gc log with zero parsable lines produces a NaN gc_overhead_pct that fails the
-    ">1.0" comparison silently -- previously indistinguishable from a rep that was
-    fully parsed and genuinely under 1%."""
+    """A gc log with zero parsable lines produces a NaN gc_overhead_pct, which fails the
+    ">1.0" comparison silently and would read as a rep genuinely under 1%."""
     gc_dir = tmp_path / "gc-logs"
     gc_dir.mkdir()
     (gc_dir / "gc_baseline_rep1.log").write_text("")
@@ -827,3 +874,304 @@ def test_analyze_gc_logs_warns_when_a_rep_has_no_parsable_records(tmp_path, caps
     out = capsys.readouterr().out
     assert "no measurable GC overhead" in out
     assert "<=1% of wall-clock time in all reps" not in out
+
+
+# --- load_results edge cases ---
+
+def test_load_results_keeps_what_a_truncated_gzip_decompressed(tmp_path, capsys):
+    tags = {"tier": "28", "phase": "scan", "rep": "1", "status": "200", "vus": "8"}
+    whole = tmp_path / "whole.gz"
+    with gzip.open(whole, "wt") as f:
+        for i in range(20000):
+            f.write(_point("http_req_duration", float(i), tags) + "\n")
+    (tmp_path / "scan_28_vus8_rep1.json.gz").write_bytes(whole.read_bytes()[: whole.stat().st_size // 2])
+    whole.unlink()
+    df, _ = results.load_results(str(tmp_path), prefixes=("scan_",))
+    assert 0 < len(df) < 20000
+    assert "compressed stream ended early" in capsys.readouterr().out
+
+
+def test_true_time_span_orders_go_trimmed_timestamps_numerically(tmp_path):
+    """Go trims trailing zeros, so '...:07Z' sorts after '...:07.5Z' as a string."""
+    tags = {"tier": "28", "phase": "scan", "rep": "1", "status": "200", "vus": "8"}
+    stamps = ["2026-01-01T00:00:07.5Z", "2026-01-01T00:00:07Z", "2026-01-01T00:00:08.25Z"]
+    (tmp_path / "scan_28_vus8_rep1.json").write_text(
+        "\n".join(_point("http_req_duration", 1.0, tags, ts=t) for t in stamps) + "\n")
+    _, true_counts = results.load_results(str(tmp_path), prefixes=("scan_",))
+    n, t_min, t_max = results._true_n_and_span(true_counts, metric="http_req_duration")
+    assert n == 3
+    assert (t_max - t_min).total_seconds() == pytest.approx(1.25)
+
+
+# --- cpu-pin log re-verification ---
+
+def test_cpu_pin_log_treats_an_unreadable_cgroup_as_skipped_not_mismatched(tmp_path, capsys):
+    (tmp_path / "cpu_pin_check_log.txt").write_text(
+        "cpu_pin_check label=scan rep=1 python_requested=0-1 python_live=EMPTY java_requested=2-3 java_live=EMPTY\n"
+        "cpu_pin_check label=scan rep=1 python_live=UNREADABLE java_live=UNREADABLE result=WARN_SKIPPED\n"
+        "cpu_pin_check label=scan rep=1 k6_live=10-11 k6_expected=10-11\n")
+    results.check_cpu_pin_log(str(tmp_path))
+    out = capsys.readouterr().out
+    assert "1 live cgroup cpuset check(s) were skipped" in out
+    assert "1 checks verified, all matched" in out
+    assert "WARNING" not in out
+
+
+def test_cpu_pin_log_still_flags_a_real_mismatch(tmp_path, capsys):
+    (tmp_path / "cpu_pin_check_log.txt").write_text(
+        "cpu_pin_check label=scan rep=1 jvm_effective_cpu_count=EMPTY expected_from_cpuset=4\n"
+        "cpu_pin_check label=scan rep=1 k6_live=10-12 k6_expected=10-11\n")
+    results.check_cpu_pin_log(str(tmp_path))
+    assert "2/2 checks mismatched" in capsys.readouterr().out
+
+
+# --- table1e ---
+
+def test_measurement_floor_covers_model_tiers_and_exempts_mock(tmp_path):
+    """mock adds only a random draw to calibration's path, so its fastest requests fall
+    below calibration's single fastest one by sampling alone."""
+    e2e = pd.DataFrame({"tier": ["calibration"] * 3 + ["mock"] * 3 + ["28"] * 3,
+                        "value": [1.0, 1.2, 1.4, 0.9, 1.1, 1.3, 0.8, 6.0, 7.0]})
+    results.analyze_measurement_floor(e2e, ["calibration", "mock", "28"], str(tmp_path))
+    table = pd.read_csv(tmp_path / "tables" / "table1e_measurement_floor_violations.csv")
+    assert table["Group"].tolist() == ["v28"]
+    assert table["Below floor (n)"].tolist() == [1]
+
+
+def test_latex_captions_escape_what_latex_would_misread(tmp_path):
+    results.save_table(pd.DataFrame({"a": [1]}), "t", str(tmp_path),
+                       caption="under 5% of therm_throt a&b #1, already 95\\% escaped")
+    tex = (tmp_path / "tables" / "t.tex").read_text()
+    assert "under 5\\% of therm\\_throt a\\&b \\#1, already 95\\% escaped" in tex
+
+
+# --- thermal telemetry ---
+
+def _shell_trace(tmp_path):
+    """A trace written by lib/thermal.sh itself against a synthetic sysfs tree, so the
+    parser is held to the format the harness actually emits."""
+    sysfs = tmp_path / "sys"
+    (sysfs / "class/thermal/thermal_zone0").mkdir(parents=True)
+    for cpu in range(4):
+        (sysfs / f"devices/system/cpu/cpu{cpu}/thermal_throttle").mkdir(parents=True)
+    trace = tmp_path / "env_trace_log.txt"
+    script = f"""
+set -euo pipefail
+THERMAL_SYSFS_ROOT={sysfs}; ENV_TRACE_LOG={trace}
+THERMAL_WARN_C=90; THERMAL_CRIT_C=95; THERMAL_COOLDOWN_S=60; MAX_THERMAL_COOLDOWNS=2
+abort_suite() {{ exit 1; }}
+sleep() {{ echo 80000 > {sysfs}/class/thermal/thermal_zone0/temp; }}
+. {LOAD_TESTING_DIR}/lib/thermal.sh
+set_state() {{
+  echo "$1" > {sysfs}/class/thermal/thermal_zone0/temp
+  for c in 0 1 2 3; do echo "$2" > {sysfs}/devices/system/cpu/cpu$c/thermal_throttle/core_throttle_total_time_ms; done
+  echo "$3" > {sysfs}/devices/system/cpu/cpu2/thermal_throttle/core_throttle_total_time_ms
+}}
+set_state 60000 100 100; record_env_sample baseline_rep1_start
+set_state 70000 100 100; record_cell_thermal start baseline_28_rep1
+set_state 75000 100 140; record_cell_thermal end baseline_28_rep1
+check_thermal_safety "baseline target=28 rep=1"
+set_state 91000 100 140; record_cell_thermal start scan_28_vus64_rep1
+set_state 93000 100 140; record_cell_thermal end scan_28_vus64_rep1
+check_thermal_safety "scan target=28 vus=64 rep=1"
+"""
+    subprocess.run(["bash", "-c", script], check=True)
+    return trace
+
+
+def test_the_parser_reads_the_trace_the_shell_writes(tmp_path):
+    trace = thermal.parse_env_trace(str(_shell_trace(tmp_path)))
+    assert trace["kind"].tolist() == ["env_sample", "cell_start", "cell_end", "thermal_check",
+                                      "cell_start", "cell_end", "thermal_check"]
+    checks = trace[trace["kind"] == "thermal_check"]
+    assert checks["name"].tolist() == ["baseline target=28 rep=1", "scan target=28 vus=64 rep=1"]
+    assert checks["paused_s"].tolist() == [0, 60]
+    assert trace.loc[trace["kind"] == "cell_end", "core_throttle"].iloc[0] == {0: 100, 1: 100, 2: 140, 3: 100}
+    assert trace["ts"].notna().all()
+
+
+def test_cell_throttle_is_the_most_throttled_cpu_of_each_service(tmp_path):
+    trace = thermal.parse_env_trace(str(_shell_trace(tmp_path)))
+    cells = thermal.cell_thermal(trace, lambda cell: {"python": "0-1", "java": "2-3"}).set_index("cell")
+    assert cells.loc["baseline_28_rep1", "python_throttle_ms"] == 0
+    assert cells.loc["baseline_28_rep1", "java_throttle_ms"] == 40
+    assert cells.loc["scan_28_vus64_rep1", "temp_start_c"] == 91
+    assert np.isnan(cells.loc["baseline_28_rep1", "pkg_throttle_ms"])
+
+
+def test_thermal_tables_by_group_and_phase(tmp_path):
+    trace = thermal.parse_env_trace(str(_shell_trace(tmp_path)))
+    cells = thermal.cell_thermal(trace, lambda cell: {"python": "0-1", "java": "2-3"})
+    by_group = thermal.thermal_by_group(cells, results._cell_tier_group, ["python", "java"],
+                                        label_of=results._tier_group_label).set_index("Group")
+    assert by_group.loc["baseline v28", "Cells throttled on service cores"] == "1/1"
+    assert by_group.loc["scan v28", "Max end temp (C)"] == 93
+    pauses = thermal.thermal_pauses(trace, results._suite_phase).set_index("Phase")
+    assert pauses.loc["scan cells", "Checks that paused"] == 1
+    assert pauses.loc["scan cells", "Total paused (min)"] == 1.0
+    assert pauses.loc["baseline cells", "Checks that paused"] == 0
+
+
+def test_thermal_by_group_says_when_counters_are_not_exposed():
+    cells = pd.DataFrame({"cell": ["baseline_28_rep1"], "temp_start_c": [60.0], "temp_end_c": [61.0],
+                          "pkg_throttle_ms": [np.nan], "python_throttle_ms": [np.nan]})
+    table = thermal.thermal_by_group(cells, results._cell_tier_group, ["python"])
+    assert table["Cells throttled on service cores"].tolist() == ["not exposed"]
+
+
+def test_thermal_groups_follow_the_design_order_not_the_run_order():
+    cells = pd.DataFrame({"cell": ["scan_mock_vus8_rep1", "baseline_28_rep1", "baseline_mock_rep1",
+                                   "scan_calibration_vus8_rep1"],
+                          "temp_start_c": [60.0] * 4, "temp_end_c": [61.0] * 4, "pkg_throttle_ms": [0.0] * 4})
+    table = thermal.thermal_by_group(cells, results._cell_tier_group, [], label_of=results._tier_group_label,
+                                     sort_key=results._tier_group_order)
+    assert table["Group"].tolist() == ["baseline mock", "baseline v28", "scan calibration", "scan mock"]
+
+
+def test_thermal_association_is_taken_within_each_design_cell():
+    """Two groups at very different latency with temperatures that track the group,
+    not the within-group spread: the design effect must not read as a thermal one."""
+    cells = pd.DataFrame({"cell": [f"c{i}" for i in range(8)],
+                          "temp_start_c": [60, 61, 62, 63, 80, 81, 82, 83],
+                          "temp_end_c": [60, 61, 62, 63, 80, 81, 82, 83],
+                          "pkg_throttle_ms": [0.0] * 8})
+    latency = pd.DataFrame({"cell": [f"c{i}" for i in range(8)], "group": ["a"] * 4 + ["b"] * 4,
+                            "mean_ms": [10.0, 10.1, 9.9, 10.0, 100.0, 99.0, 101.0, 100.0]})
+    table = thermal.thermal_latency_association(cells, latency).set_index("Thermal variable")
+    assert abs(table.loc["Temperature at cell start (C)", "Spearman rho"]) < 0.5
+    assert table.loc["Package throttle during cell (ms)", "p-value"] == "constant"
+
+
+def test_within_cell_drift_reports_a_consistent_rise():
+    rows = []
+    for rep in ("1", "2", "3"):
+        for i in range(100):
+            rows.append({"rep": rep, "time": pd.Timestamp("2026-01-01") + pd.Timedelta(seconds=i),
+                         "value": 10.0 if i < 50 else 10.2})
+    table = thermal.within_cell_drift([("v28 @ VUS=64", pd.DataFrame(rows))])
+    row = table.iloc[0]
+    assert row["Mean 2nd-half vs 1st-half change (%)"] == pytest.approx(2.0)
+    assert row["Same sign in every cell"] == "yes"
+
+
+def test_cell_names_and_phases_match_what_the_harness_writes():
+    assert results._cell_tier_group("scan_calibration_vus64_rep3") == ("scan", "calibration")
+    assert results._cell_tier_group("baseline_28_rep1") == ("baseline", "28")
+    assert results._cell_tier_group("calib_28_vus16") is None
+    for name, phase in [("warmup_scan_maxvus_rep1 chunk2", "scan warm-up"),
+                        ("calib_warmup_scan chunk1", "scan calibration pass"),
+                        ("scan calibration target=28", "scan calibration pass"),
+                        ("scan_calibration_start", "scan calibration pass"),
+                        ("baseline target=mock rep=2", "baseline cells"),
+                        ("scan_mock_vus8_rep1", "scan cells")]:
+        assert results._suite_phase(name) == phase
+
+
+def test_analyze_thermal_writes_its_tables_and_warns_on_throttling(tmp_path, capsys):
+    _shell_trace(tmp_path)
+    metadata = {"cores_used_by_suite": {"python_service_cpuset": "0-1", "transaction_service_cpuset": "2-3",
+                                        "k6_cpuset": "unknown"}}
+    latency = pd.DataFrame({"cell": ["baseline_28_rep1", "scan_28_vus64_rep1"],
+                            "group": ["28", "28@64"], "mean_ms": [5.0, 50.0]})
+    results.analyze_thermal(str(tmp_path), str(tmp_path / "out"), metadata, latency)
+    tables = tmp_path / "out" / "tables"
+    for name in ("table8a_thermal_by_group", "table8b_thermal_pauses", "table8c_thermal_latency_association"):
+        assert (tables / f"{name}.csv").exists()
+    assert (tmp_path / "out" / "figures" / "figure8_thermal_timeline.png").exists()
+    assert "Max k6 core throttle (ms)" not in pd.read_csv(tables / "table8a_thermal_by_group.csv").columns
+    assert "1/2 measured cell(s) were thermally throttled" in capsys.readouterr().out
+
+
+def test_analyze_thermal_skips_a_trace_without_cell_samples(tmp_path, capsys):
+    (tmp_path / "env_trace_log.txt").write_text(
+        "env_sample label=baseline_rep1_start ts=2026-09-21T09:53:39Z governor=performance freqs_khz=cpu0=1\n")
+    results.analyze_thermal(str(tmp_path), str(tmp_path), {}, None)
+    assert "no per-cell samples" in capsys.readouterr().out
+
+
+# --- the ablation's outcome tally, control and planned comparison ---
+
+def _ablation_cell(path, n_ok, n_failed=0, n_timeout=0, dropped=0, dispatch=5.0, gz=True):
+    m = ablation.CELL_FILE_RE.match(path.name)
+    tags = {"phase": "ablation", "arm": m.group("arm"), "arm_value": m.group("value"), "rep": m.group("rep")}
+    lines = []
+    for status, n in (("200", n_ok), ("502", n_failed), ("0", n_timeout)):
+        for _ in range(n):
+            lines.append(_point("http_req_duration", 50.0, dict(tags, status=status)))
+    for _ in range(n_ok):
+        lines.append(_point("python_thread_dispatch_time_ms", dispatch, dict(tags, status="200")))
+        lines.append(_point("python_total_time_ms", dispatch + 3, dict(tags, status="200")))
+    lines += [_point("dropped_iterations", 1.0, {"scenario": "run"})] * dropped
+    text = "\n".join(lines) + "\n"
+    if gz:
+        with gzip.open(path, "wt") as f:
+            f.write(text)
+    else:
+        path.write_text(text)
+
+
+def test_ablation_tally_counts_every_outcome_before_sampling(tmp_path):
+    _ablation_cell(tmp_path / "ablation_cpuset_0-1_rep1.json.gz", n_ok=40, n_failed=3, n_timeout=2, dropped=5)
+    _ablation_cell(tmp_path / "ablation_cpuset_0-1_rep2.json", n_ok=10, gz=False)
+    df, counts = ablation.load_ablation_cells(str(tmp_path))
+    table = ablation.build_error_table(counts)
+    row = table.iloc[0]
+    assert (row["N reps"], row["Total Requests"], row["Successful (200)"]) == (2, 55, 50)
+    assert (row["HTTP Errors (non-200 response)"], row["Timeouts / Network Errors (no response)"]) == (3, 2)
+    assert row["Dropped iterations"] == 5
+    assert row["Error Rate (%)"] == pytest.approx(round(100 * 5 / 55, 2))
+    decomposition = ablation.build_decomposition_table(df, counts)
+    assert decomposition["N requests (HTTP 200, pooled)"].tolist() == [50]
+
+
+def test_ablation_loader_keeps_what_a_truncated_gzip_decompressed(tmp_path, capsys):
+    whole = tmp_path / "ablation_workers_1_rep1.json.gz"
+    _ablation_cell(whole, n_ok=20000)
+    whole.write_bytes(whole.read_bytes()[: whole.stat().st_size // 2])
+    df, _ = ablation.load_ablation_cells(str(tmp_path))
+    assert 0 < int((df["metric"] == "python_thread_dispatch_time_ms").sum()) < 20000
+    assert "compressed stream ended early" in capsys.readouterr().out
+
+
+def test_ablation_controls_come_from_the_run_metadata():
+    recorded = {"ablation_config": {"control_values": {"thread_limiter": "32", "cpuset": "0-3", "workers": "2"}}}
+    assert ablation.control_cells(recorded) == {"thread_limiter": "32", "cpuset": "0-3", "workers": "2"}
+    assert ablation.control_cells({}) == ablation.CONTROL_CELL
+
+
+@pytest.mark.parametrize("values,control,extreme", [
+    (["0-1", "0-1,4-5,8-9", "0-1,4-5,8-9,12-13"], "0-1,4-5,8-9", "0-1"),
+    (["40", "64", "128"], "40", "128"),
+    (["1", "2", "3"], "3", "1"),
+    (["2", "4", "6"], "4", "6"),
+])
+def test_the_extreme_is_the_value_farthest_from_control(values, control, extreme):
+    """For a mid-sweep control the farther value is the arm's largest manipulation
+    (2 of 6 CPUs, not 8); an exact tie goes to the later sweep value."""
+    assert ablation._extreme_value(values, control) == extreme
+
+
+def test_control_vs_extreme_uses_the_recorded_control(tmp_path):
+    for value, dispatch in (("1", 9.0), ("2", 6.0), ("3", 5.0)):
+        for rep in range(1, 5):
+            _ablation_cell(tmp_path / f"ablation_workers_{value}_rep{rep}.json.gz", n_ok=20,
+                           dispatch=dispatch + rep * 0.01)
+    df, _ = ablation.load_ablation_cells(str(tmp_path))
+    row = ablation.control_vs_extreme_test(df, controls={"workers": "2"}).iloc[0]
+    assert (row["Control"], row["Extreme"]) == ("2", "3")
+
+
+def _run_ablation_main(results_dir, output_dir):
+    return subprocess.run([sys.executable, str(ANALYSIS_DIR / "analyze-ablation.py"),
+                           "--results-dir", str(results_dir), "--output-dir", str(output_dir)],
+                          capture_output=True, text=True)
+
+
+def test_analyze_ablation_exits_non_zero_on_a_failed_run_or_no_data(tmp_path):
+    empty = _run_ablation_main(tmp_path, tmp_path / "out")
+    assert empty.returncode == 1 and "No usable ablation" in empty.stdout
+
+    _ablation_cell(tmp_path / "ablation_workers_1_rep1.json.gz", n_ok=20)
+    (tmp_path / "ablation_run_failures_log.txt").write_text("[FATAL] [smt] overlap\n")
+    failed = _run_ablation_main(tmp_path, tmp_path / "out")
+    assert failed.returncode == 1 and "has entries" in failed.stdout

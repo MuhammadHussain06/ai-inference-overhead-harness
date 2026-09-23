@@ -5,9 +5,9 @@ contention via process count) drives Thread Dispatch time at VUS=64.
 
 Each arm holds the other mechanisms at their control value and sweeps one.
 Rep-level stats use the same cluster-bootstrap and Mann-Whitney approach
-as analyze-results.py, applied to one pairwise comparison per arm (the
-sweep's two endpoints) rather than a full pairwise grid, since each arm
-has an a priori ordered sweep.
+as analyze-results.py, applied to one planned comparison per arm (its
+control value against the sweep value farthest from it) rather than a full
+pairwise grid, since each arm has an a priori ordered sweep.
 
 Usage:
     python3 analyze-ablation.py [--results-dir ../results] [--output-dir ./output]
@@ -27,8 +27,13 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.stats import mannwhitneyu
 
-DEFAULT_RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
-DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
+ANALYSIS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ANALYSIS_DIR)
+import thermal  # noqa: E402
+import warmup_check  # noqa: E402
+
+DEFAULT_RESULTS_DIR = os.path.join(ANALYSIS_DIR, "..", "results")
+DEFAULT_OUTPUT_DIR = os.path.join(ANALYSIS_DIR, "output")
 
 ARM_LABELS = {
     "thread_limiter": "Thread-Limiter Tokens",
@@ -52,10 +57,11 @@ CELL_FILE_RE = re.compile(r"^ablation_(?P<arm>[a-z_]+)_(?P<value>[^_]+)_rep(?P<r
 # cell a warm-up file belongs to comes from its filename, same as CELL_FILE_RE.
 WARMUP_FILE_RE = re.compile(r"^ablation_warmup_(?P<arm>[a-z_]+)_(?P<value>[^_]+)_rep(?P<rep>\d+)\.json(\.gz)?$")
 
-# The shared control configuration, keyed by the arm_value whose cell realizes
-# it, so those cells can be cross-checked against each other. workers_token_matched
-# has no entry: its 3-worker cell rescales tokens to 13, so it is a different
-# configuration.
+# The shared control configuration, keyed by the arm_value whose cell realizes it,
+# so those cells can be cross-checked against each other. run-ablation.sh records
+# the values it ran in ablation_run_metadata.json (control_cells() reads them);
+# these are its defaults. workers_token_matched has no entry: its 3-worker cell
+# rescales tokens to 13, so it is a different configuration.
 CONTROL_CELL = {"thread_limiter": "40", "cpuset": "0-1,4-5,8-9", "workers": "3"}
 
 # Same per-file cap as analyze-results.py's load_results(), sized identically so
@@ -63,6 +69,25 @@ CONTROL_CELL = {"thread_limiter": "40", "cpuset": "0-1,4-5,8-9", "workers": "3"}
 # keep 3 metrics, so the cap is normally slack; it bounds memory if an arm/value
 # combination ever raises throughput enough to reach it.
 MAX_POINTS_PER_FILE = 250_000
+
+
+def read_metadata(results_dir):
+    """ablation_run_metadata.json, or {} when absent or unreadable."""
+    path = os.path.join(results_dir, "ablation_run_metadata.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[!] ablation_run_metadata.json could not be read ({e}); using defaults.")
+        return {}
+
+
+def control_cells(metadata):
+    """The control value each arm ran with, as recorded by run-ablation.sh."""
+    recorded = (metadata or {}).get("ablation_config", {}).get("control_values", {})
+    return {arm: str(recorded.get(arm, default)) for arm, default in CONTROL_CELL.items()}
 
 
 def _cpu_count_of(cpuset):
@@ -100,13 +125,18 @@ def _is_cell_file(path):
 
 
 def load_ablation_cells(results_dir):
-    """Loads ablation_<arm>_<value>_rep<N>.json[.gz] cell files."""
+    """Loads ablation_<arm>_<value>_rep<N>.json[.gz] cell files.
+
+    Returns (df, counts): df holds the METRICS points (reservoir-sampled per file);
+    counts holds each cell's full request outcome tally, counted before sampling --
+    HTTP 200s, other responses, requests with no response, and dropped iterations.
+    Both are None when no cell file exists."""
     files = [f for f in sorted(
                 glob.glob(os.path.join(results_dir, "ablation_*.json"))
                 + glob.glob(os.path.join(results_dir, "ablation_*.json.gz"))
              ) if _is_cell_file(f)]
     if not files:
-        return None
+        return None, None
 
     # json.loads() doesn't intern strings, so each tag repeats as a new object
     # per row instead of one shared object per distinct value.
@@ -114,56 +144,82 @@ def load_ablation_cells(results_dir):
         return sys.intern(v) if type(v) is str else v
 
     rng = random.Random(42)
-    rows = []
+    rows, count_rows = [], []
     for fp in files:
+        m = CELL_FILE_RE.match(os.path.basename(fp))
+        tally = {"arm": m.group("arm"), "arm_value": m.group("value"), "rep": m.group("rep"),
+                 "ok": 0, "http_error": 0, "no_response": 0, "dropped": 0}
         file_rows = []
         n_seen = 0
+        lines_read = 0
         opener = gzip.open if fp.endswith(".gz") else open
         with opener(fp, "rt") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if obj.get("type") != "Point" or obj.get("metric") not in METRICS:
-                    continue
-                tags = (obj.get("data", {}) or {}).get("tags", {}) or {}
-                if tags.get("phase") != "ablation":
-                    continue
-                row = {
-                    "metric": _intern_tag(obj["metric"]),
-                    "value": pd.to_numeric(obj["data"].get("value"), errors="coerce"),
-                    "arm": _intern_tag(tags.get("arm")),
-                    "arm_value": _intern_tag(tags.get("arm_value")),
-                    "rep": _intern_tag(tags.get("rep", "1")),
-                }
-                # Algorithm R: the first MAX_POINTS_PER_FILE rows are always kept; each
-                # later row replaces a uniformly random slot with probability
-                # MAX_POINTS_PER_FILE/n_seen, leaving every row seen equally likely to
-                # survive. No counter metric is in METRICS, so no row needs an
-                # always-keep exemption.
-                n_seen += 1
-                if n_seen <= MAX_POINTS_PER_FILE:
-                    file_rows.append(row)
-                else:
-                    idx = rng.randint(0, n_seen - 1)
-                    if idx < MAX_POINTS_PER_FILE:
-                        file_rows[idx] = row
+            try:
+                for line in f:
+                    lines_read += 1
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("type") != "Point":
+                        continue
+                    metric = obj.get("metric")
+                    data = obj.get("data", {}) or {}
+                    tags = data.get("tags", {}) or {}
+                    if metric == "dropped_iterations":
+                        # An engine metric: it carries no phase tag, and the file is the cell.
+                        tally["dropped"] += int(data.get("value") or 0)
+                        continue
+                    if tags.get("phase") != "ablation":
+                        continue
+                    if metric == "http_req_duration":
+                        status = tags.get("status")
+                        key = ("ok" if status == "200"
+                               else "no_response" if status in (None, "0") else "http_error")
+                        tally[key] += 1
+                        continue
+                    if metric not in METRICS:
+                        continue
+                    row = {
+                        "metric": _intern_tag(metric),
+                        "value": pd.to_numeric(data.get("value"), errors="coerce"),
+                        "arm": _intern_tag(tags.get("arm")),
+                        "arm_value": _intern_tag(tags.get("arm_value")),
+                        "rep": _intern_tag(tags.get("rep", "1")),
+                    }
+                    # Algorithm R: the first MAX_POINTS_PER_FILE rows are always kept; each
+                    # later row replaces a uniformly random slot with probability
+                    # MAX_POINTS_PER_FILE/n_seen, leaving every row seen equally likely to
+                    # survive. The outcome tally above is counted before this, so it is exact.
+                    n_seen += 1
+                    if n_seen <= MAX_POINTS_PER_FILE:
+                        file_rows.append(row)
+                    else:
+                        idx = rng.randint(0, n_seen - 1)
+                        if idx < MAX_POINTS_PER_FILE:
+                            file_rows[idx] = row
+            except (EOFError, OSError) as e:
+                # Raised by the decompressor, not json.loads: what decompressed
+                # cleanly is kept rather than losing the whole run.
+                print(f"[!] {os.path.basename(fp)}: compressed stream ended early after "
+                      f"{lines_read} line(s) ({e}). Using what decompressed cleanly.")
         if n_seen > MAX_POINTS_PER_FILE:
             print(f"[!] {os.path.basename(fp)}: {n_seen} points subsampled to "
                   f"{MAX_POINTS_PER_FILE} (uniform random sample) to bound memory.")
         rows.extend(file_rows)
+        count_rows.append(tally)
+    counts = pd.DataFrame(count_rows)
     if not rows:
-        return None
+        return None, counts
     df = pd.DataFrame(rows)
     df = df.dropna(subset=["value", "arm", "arm_value"])
     # float32 halves this column's memory versus float64; ablation latencies
     # don't need more precision than that.
     df["value"] = df["value"].astype(np.float32)
-    return df
+    return df, counts
 
 
 def cluster_bootstrap_ci(sub_df, n_boot=2000, ci=0.95, seed=42):
@@ -202,16 +258,19 @@ def _effect_magnitude(delta):
     return "large"
 
 
-def build_decomposition_table(df):
+def build_decomposition_table(df, counts=None):
+    """counts: load_ablation_cells()'s outcome tally, for an N that sampling did not reduce."""
     rows = []
     for arm in sorted(df["arm"].unique()):
         arm_df = df[df["arm"] == arm]
         values = sorted(arm_df["arm_value"].unique(), key=_value_sort_key)
         for value in values:
             cell = arm_df[arm_df["arm_value"] == value]
+            n_ok = (int(counts.loc[(counts["arm"] == arm) & (counts["arm_value"] == value), "ok"].sum())
+                    if counts is not None and not counts.empty else 0)
             row = {"Arm": ARM_LABELS.get(arm, arm), "Value": value,
                    "N reps": int(cell["rep"].nunique()),
-                   "N (pooled)": int((cell["metric"] == "python_total_time_ms").sum())}
+                   "N requests (HTTP 200, pooled)": n_ok or int((cell["metric"] == "python_total_time_ms").sum())}
             for metric, label in METRICS.items():
                 sub = cell[cell["metric"] == metric]
                 if sub.empty:
@@ -233,7 +292,7 @@ def build_decomposition_table(df):
     return pd.DataFrame(rows)
 
 
-def build_control_agreement_table(df, metric="python_thread_dispatch_time_ms"):
+def build_control_agreement_table(df, metric="python_thread_dispatch_time_ms", controls=None):
     """Compares the cells that realize the shared control configuration.
 
     The arms named in CONTROL_CELL each hold the other mechanisms at that
@@ -242,7 +301,7 @@ def build_control_agreement_table(df, metric="python_thread_dispatch_time_ms"):
     manipulated factor.
     """
     rows = []
-    for arm, value in CONTROL_CELL.items():
+    for arm, value in (controls or CONTROL_CELL).items():
         cell = df[(df["arm"] == arm) & (df["arm_value"] == value) & (df["metric"] == metric)]
         if cell.empty:
             continue
@@ -262,28 +321,39 @@ def build_control_agreement_table(df, metric="python_thread_dispatch_time_ms"):
     return table
 
 
-def control_vs_extreme_test(df, metric="python_thread_dispatch_time_ms"):
-    """Rep-level Mann-Whitney between each arm's CONTROL_CELL value and the sweep
-    point farthest from it in sorted order. thread_limiter's control already sits
-    at a sweep endpoint, so its comparison is unchanged by this; cpuset's control
-    is mid-sweep, and workers' control (3) is the high end, not the low one -- for
-    both, keying off the sweep endpoints directly previously paired the wrong two
-    cells and, for workers, swapped which one was even labelled Control.
-    workers_token_matched has no CONTROL_CELL entry (its two values are a matched
-    pair at fixed token capacity, not a control-anchored sweep), so it falls back
-    to comparing its two values directly.
+def _extreme_value(values, control):
+    """The sweep value farthest from control: by numeric distance on _value_sort_key
+    (logical CPUs for a cpuset), falling back to sweep position for values without a
+    numeric key. A tie goes to the value later in sweep order."""
+    keys = [_value_sort_key(v) for v in values]
+    c = _value_sort_key(control)
+    if all(isinstance(k, (int, float)) for k in keys + [c]):
+        distance = [abs(k - c) for k in keys]
+    else:
+        idx = values.index(control)
+        distance = [abs(i - idx) for i in range(len(values))]
+    best = max(distance)
+    return [v for v, d in zip(values, distance) if d == best][-1]
+
+
+def control_vs_extreme_test(df, metric="python_thread_dispatch_time_ms", controls=None):
+    """Rep-level Mann-Whitney between each arm's control value and the sweep value
+    farthest from it (_extreme_value), so the comparison is the arm's largest
+    manipulation whether the control sits at an end of the sweep (thread_limiter,
+    workers) or inside it (cpuset). workers_token_matched has no control entry: its
+    two values are a matched pair at fixed token capacity, compared directly.
     One planned comparison per arm, so no multiple-comparison correction applies."""
+    controls = controls or CONTROL_CELL
     rows = []
     for arm in sorted(df["arm"].unique()):
         arm_df = df[(df["arm"] == arm) & (df["metric"] == metric)]
         values = sorted(arm_df["arm_value"].unique(), key=_value_sort_key)
         if len(values) < 2:
             continue
-        control_value = CONTROL_CELL.get(arm)
+        control_value = controls.get(arm)
         if control_value is not None and control_value in values:
             control = control_value
-            idx = values.index(control)
-            extreme = values[-1] if idx <= (len(values) - 1 - idx) else values[0]
+            extreme = _extreme_value(values, control)
         else:
             control, extreme = values[0], values[-1]
         control_means = arm_df[arm_df["arm_value"] == control].groupby("rep")["value"].mean()
@@ -307,6 +377,35 @@ def control_vs_extreme_test(df, metric="python_thread_dispatch_time_ms"):
     return pd.DataFrame(rows)
 
 
+def build_error_table(counts):
+    """Per (arm, value): every request's outcome and the iterations k6 dropped, from
+    the exact tally. Latency tables cover HTTP 200 requests only, so a cell that
+    shed load through errors or dropped iterations reads faster than it ran."""
+    if counts is None or counts.empty:
+        return pd.DataFrame()
+    rows = []
+    for arm in sorted(counts["arm"].unique()):
+        arm_counts = counts[counts["arm"] == arm]
+        for value in sorted(arm_counts["arm_value"].unique(), key=_value_sort_key):
+            g = arm_counts[arm_counts["arm_value"] == value]
+            total = int(g[["ok", "http_error", "no_response"]].to_numpy().sum())
+            rows.append({
+                "Arm": ARM_LABELS.get(arm, arm), "Value": value, "N reps": len(g),
+                "Total Requests": total,
+                "Successful (200)": int(g["ok"].sum()),
+                "HTTP Errors (non-200 response)": int(g["http_error"].sum()),
+                "Timeouts / Network Errors (no response)": int(g["no_response"].sum()),
+                "Error Rate (%)": round(100 * (1 - g["ok"].sum() / total), 2) if total else np.nan,
+                "Dropped iterations": int(g["dropped"].sum()),
+            })
+    return pd.DataFrame(rows)
+
+
+def _latex_text(text):
+    """Escapes the LaTeX specials a caption can contain, leaving already-escaped ones."""
+    return re.sub(r"(?<!\\)([%_&#])", r"\\\1", text)
+
+
 def save_table(df, name, output_dir, caption=None, label=None):
     """Emits csv/md/tex, matching analyze-results.py so both sets drop into the same paper."""
     if df is None or df.empty:
@@ -322,7 +421,7 @@ def save_table(df, name, output_dir, caption=None, label=None):
         # Caption precedes the tabular body so it renders above the table,
         # matching Elsevier/JSS style.
         if caption:
-            f.write(f"\\caption{{{caption}}}\n")
+            f.write(f"\\caption{{{_latex_text(caption)}}}\n")
         if label:
             f.write(f"\\label{{{label}}}\n")
         f.write(df.to_latex(index=False, escape=True))
@@ -377,91 +476,111 @@ def plot_ablation(df, output_dir):
     print(f"[+] Figure -> {figures_dir}/figure_ablation_mechanisms.png / .pdf")
 
 
-def _ts_sort_key(t):
-    """Sort key for an RFC3339Nano timestamp string. Go trims trailing zero
-    fractional digits (and the '.' entirely for a whole-second value), so plain
-    string comparison would sort '...07Z' after '...07.5Z'. Splitting off the
-    fractional part and zero-padding it to a fixed width restores numeric order
-    without needing full datetime parsing (which caps at microsecond precision)."""
-    body = t[:-1] if t.endswith("Z") else t
-    whole, _, frac = body.partition(".")
-    return whole, frac.ljust(9, "0")
-
-
-def build_ablation_warmup_table(results_dir, window_size=500, tail_tolerance_pct=5.0,
-                                tail_abs_floor_ms=0.25):
-    """Per-cell warm-up convergence check -- same criterion as analyze-results.py's
-    table0 (last window vs. the one before it, converged if the absolute gap is under
-    tail_abs_floor_ms or the drift is under tail_tolerance_pct).
-    Reads ablation_warmup_* files, which load_ablation_cells() never touches.
-    The three parameters mirror run-ablation.sh's WARMUP_WINDOW /
-    WARMUP_TAIL_TOLERANCE_PCT / WARMUP_TAIL_ABS_FLOOR_MS so this table reports the
-    same verdict the live gate acted on.
-    """
-    files = sorted(
-        glob.glob(os.path.join(results_dir, "ablation_warmup_*.json"))
-        + glob.glob(os.path.join(results_dir, "ablation_warmup_*.json.gz"))
-    )
-    rows = []
-    for fp in files:
+def build_ablation_warmup_table(results_dir, metadata=None):
+    """Per-cell warm-up convergence, judged by the live gate (lib/warmup_gate.py) at
+    the parameters run-ablation.sh recorded. Reads ablation_warmup_* files, which
+    load_ablation_cells() never touches. Returns (table, gate parameters)."""
+    config = (metadata or {}).get("ablation_config", {})
+    params = warmup_check.gate_params(config.get("warmup_gate"))
+    expect = [str(config["target"])] if config.get("target") else []
+    entries = []
+    for fp in glob.glob(os.path.join(results_dir, "ablation_warmup_*.json*")):
         m = WARMUP_FILE_RE.match(os.path.basename(fp))
-        if not m:
-            continue
-        arm, value, rep = m.group("arm"), m.group("value"), m.group("rep")
-        opener = gzip.open if fp.endswith(".gz") else open
-        points = []
-        with opener(fp, "rt") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if obj.get("type") != "Point" or obj.get("metric") != "http_req_duration":
-                    continue
-                data = obj.get("data", {}) or {}
-                tags = data.get("tags", {}) or {}
-                if tags.get("status") != "200":
-                    continue
-                t, v = data.get("time"), data.get("value")
-                if t is not None and v is not None:
-                    points.append((t, v))
-        if len(points) < 3 * window_size:
-            continue
-        points.sort(key=lambda p: _ts_sort_key(p[0]))
-        values = [v for _, v in points]
-        p50_first = float(np.percentile(values[:window_size], 50))
-        p50_prev = float(np.percentile(values[-2 * window_size:-window_size], 50))
-        p50_last = float(np.percentile(values[-window_size:], 50))
-        total_drift = 100 * (p50_last - p50_first) / p50_first if p50_first else np.nan
-        tail_drift = 100 * (p50_last - p50_prev) / p50_prev if p50_prev else np.nan
-        converged = not np.isnan(tail_drift) and (
-            abs(p50_last - p50_prev) < tail_abs_floor_ms or abs(tail_drift) < tail_tolerance_pct
-        )
-        rows.append({
-            "Arm": ARM_LABELS.get(arm, arm), "Value": value, "Rep": rep,
-            "N Requests": len(points),
-            f"First {window_size} P50 (ms)": round(p50_first, 3),
-            f"Prev {window_size} P50 (ms)": round(p50_prev, 3),
-            f"Last {window_size} P50 (ms)": round(p50_last, 3),
-            "Total drift (%)": round(total_drift, 1) if not np.isnan(total_drift) else np.nan,
-            "Tail drift (%)": round(tail_drift, 1) if not np.isnan(tail_drift) else np.nan,
-            f"Converged (tail <{tail_tolerance_pct:g}% or <{tail_abs_floor_ms:g}ms)":
-                "YES" if converged else "no",
-        })
-    table = pd.DataFrame(rows)
-    if not table.empty:
-        converged_col = f"Converged (tail <{tail_tolerance_pct:g}% or <{tail_abs_floor_ms:g}ms)"
-        n_failed = int((table[converged_col] == "no").sum())
-        if n_failed:
-            print(f"[!] {n_failed}/{len(table)} ablation warm-up windows had not converged at "
-                  f"the tail. The cell measurement that follows it may not reflect steady state.")
-    elif files:
-        print(f"[!] {len(files)} ablation_warmup_* file(s) found but none had >= {3 * window_size} "
-              f"HTTP 200 requests -- skipping convergence check.")
-    return table
+        if m:
+            key = _value_sort_key(m.group("value"))
+            order = (0, key, "") if isinstance(key, int) else (1, 0, str(key))
+            entries.append((m.group("arm"), order, int(m.group("rep")), m, fp))
+    rows = []
+    for arm, _, _, m, fp in sorted(entries, key=lambda e: e[:3]):
+        file_rows, truncated = warmup_check.file_rows(fp, expect, params, str)
+        if truncated:
+            print(f"[!] {os.path.basename(fp)}: compressed stream ended early; judged on what "
+                  f"decompressed cleanly.")
+        rows.extend({"Arm": ARM_LABELS.get(arm, arm), "Value": m.group("value"), "Rep": m.group("rep"), **r}
+                    for r in file_rows)
+    return pd.DataFrame(rows), params
+
+
+# thermal state per cell
+
+def _ablation_phase(name):
+    """Run phase of a trace line's name: an env-sample label, a cell or a thermal-check label."""
+    name = str(name or "")
+    if name.startswith(("ablation_calib_warmup", "calibration")):
+        return "calibration pass"
+    if name.startswith("ablation_warmup_"):
+        return "warm-up"
+    if name.startswith(("arm=", "ablation_")) or re.search(r"_rep\d+_(start|end)$", name):
+        return "measured cells"
+    return "other"
+
+
+def _cell_key(cell):
+    m = CELL_FILE_RE.match(f"{cell}.json")
+    return (m.group("arm"), m.group("value")) if m else None
+
+
+def analyze_thermal(results_dir, output_dir, metadata, df):
+    """Temperature and throttling per ablation cell, the time thermal pauses cost,
+    and whether either tracks a cell's thread-dispatch time."""
+    path = os.path.join(results_dir, "ablation_env_trace_log.txt")
+    if not os.path.isfile(path):
+        print("[thermal] No ablation_env_trace_log.txt found -- skipping thermal analysis.")
+        return
+    trace = thermal.parse_env_trace(path)
+    cores = (metadata or {}).get("cores_used_by_suite", {})
+    controls = control_cells(metadata)
+    fixed = {svc: cores.get(key) for svc, key in (("java", "transaction_service_cpuset"), ("k6", "k6_cpuset"))
+             if cores.get(key) not in (None, "", "unknown")}
+
+    def cpusets(cell):
+        key = _cell_key(cell)
+        python = key[1] if key and key[0] == "cpuset" else controls["cpuset"]
+        return {"python": python, **fixed}
+
+    cells = thermal.cell_thermal(trace, cpusets)
+    if cells.empty:
+        print("[thermal] ablation_env_trace_log.txt has no per-cell samples -- skipping thermal analysis.")
+        return
+
+    def order(key):
+        value = _value_sort_key(key[1])
+        return (key[0], (0, value, "") if isinstance(value, int) else (1, 0, str(value)))
+
+    save_table(thermal.thermal_by_group(cells, _cell_key, ["python", *fixed],
+                                        label_of=lambda key: f"{ARM_LABELS.get(key[0], key[0])} = {key[1]}",
+                                        sort_key=order),
+               "table_ablation_thermal_by_cell", output_dir,
+               caption="Highest thermal-zone temperature at the start and end of each measured ablation "
+                       "cell, and the thermal throttling accrued during it (Intel therm_throt counters, "
+                       "differenced across the cell), per arm value. python's core throttle is read on "
+                       "the cpuset that cell ran python-service on.",
+               label="tab:ablation-thermal")
+    save_table(thermal.thermal_pauses(trace, _ablation_phase), "table_ablation_thermal_pauses", output_dir,
+               caption="Thermal safety checks per phase of the ablation run: how many paused it to let "
+                       "the host cool, and the wall-clock time those pauses cost.",
+               label="tab:ablation-thermal-pauses")
+
+    dispatch = df[df["metric"] == "python_thread_dispatch_time_ms"]
+    latency = (dispatch.groupby(["arm", "arm_value", "rep"], observed=True)["value"].mean()
+               .reset_index(name="mean_ms"))
+    latency["cell"] = "ablation_" + latency["arm"] + "_" + latency["arm_value"] + "_rep" + latency["rep"].astype(str)
+    latency["group"] = latency["arm"] + ":" + latency["arm_value"]
+    save_table(thermal.thermal_latency_association(cells, latency[["cell", "group", "mean_ms"]]),
+               "table_ablation_thermal_association", output_dir,
+               caption="Spearman correlation between a cell's thermal state and its mean thread-dispatch "
+                       "time, taken as its percent deviation from the same arm value's mean across "
+                       "repetitions, so the manipulated factor does not register as a thermal effect.",
+               label="tab:ablation-thermal-association")
+
+    fig = thermal.timeline_figure(trace, _ablation_phase, "Host temperature across the ablation run")
+    if fig is not None:
+        figures_dir = os.path.join(output_dir, "figures")
+        os.makedirs(figures_dir, exist_ok=True)
+        fig.savefig(os.path.join(figures_dir, "figure_ablation_thermal_timeline.png"), dpi=300, bbox_inches="tight")
+        fig.savefig(os.path.join(figures_dir, "figure_ablation_thermal_timeline.pdf"), bbox_inches="tight")
+        plt.close(fig)
+        print(f"[+] Figure -> {figures_dir}/figure_ablation_thermal_timeline.png / .pdf")
 
 
 def main():
@@ -473,23 +592,24 @@ def main():
     failures_log = os.path.join(args.results_dir, "ablation_run_failures_log.txt")
     if os.path.isfile(failures_log) and os.path.getsize(failures_log) > 0:
         print(f"[!] {failures_log} has entries -- fix the cause and re-run run-ablation.sh.")
-        return
+        sys.exit(1)
 
-    save_table(build_ablation_warmup_table(args.results_dir), "table0_ablation_warmup_convergence_check",
-               args.output_dir,
-               caption="Per-cell warm-up convergence check, same criterion as the main suite's "
-                       "table0. 'Tail drift' compares the last window to the one before it; only "
-                       "this indicates whether the stack reached steady state before the measured "
-                       "cell began.",
+    metadata = read_metadata(args.results_dir)
+    controls = control_cells(metadata)
+
+    warmup_table, params = build_ablation_warmup_table(args.results_dir, metadata)
+    save_table(warmup_table, "table0_ablation_warmup_convergence_check", args.output_dir,
+               caption=warmup_check.caption(params, "Per-cell"),
                label="tab:ablation-warmup-convergence")
+    warmup_check.report(warmup_table, params, "ablation warm-up(s)", ["Arm", "Value", "Rep"])
 
-    df = load_ablation_cells(args.results_dir)
+    df, counts = load_ablation_cells(args.results_dir)
     # An all-dropped frame reaches plot_ablation() as zero arms, which plt.subplots()
-    # rejects; bail here so a file set with no usable points reports rather than raises.
+    # rejects; stop here so a file set with no usable points reports rather than raises.
     if df is None or df.empty:
         print(f"[!] No usable ablation_*.json cell points found in {args.results_dir}. "
               f"Run run-ablation.sh first.")
-        return
+        sys.exit(1)
 
     n_reps = df["rep"].nunique()
     print(f"[*] Loaded {len(df)} metric points across {df['arm'].nunique()} arm(s), {n_reps} rep(s).")
@@ -505,26 +625,41 @@ def main():
               f"p<0.05 under a two-sided Mann-Whitney, so the control-vs-extreme test cannot "
               f"be significant regardless of effect size. Re-run with REPS_ABLATION_OVERRIDE>=7.")
 
-    save_table(build_decomposition_table(df), "table_ablation_decomposition", args.output_dir,
+    errors = build_error_table(counts)
+    save_table(errors, "table_ablation_error_rates", args.output_dir,
+               caption="Request outcomes per arm value, pooled across repetitions and counted before "
+                       "any sampling, with the iterations k6 dropped. The latency tables cover HTTP 200 "
+                       "requests only, so a value with errors or dropped iterations ran fewer requests "
+                       "than the others and reads faster than it served.",
+               label="tab:ablation-error-rates")
+    if not errors.empty and (errors["Error Rate (%)"].fillna(0).gt(0).any()
+                             or errors["Dropped iterations"].gt(0).any()):
+        print("[!] Some ablation cells had failed requests or dropped iterations -- see "
+              "table_ablation_error_rates before comparing their latency.")
+
+    save_table(build_decomposition_table(df, counts), "table_ablation_decomposition", args.output_dir,
                caption="Per-arm latency decomposition at VUS=64. Each arm holds the other "
                        "mechanisms at their control value and sweeps one. CIs are 95\\% cluster "
                        "bootstraps resampling whole repetitions, so they reflect between-run "
                        "variation rather than within-run request spread.",
                label="tab:ablation-decomposition")
-    save_table(build_control_agreement_table(df), "table_ablation_control_agreement", args.output_dir,
+    save_table(build_control_agreement_table(df, controls=controls), "table_ablation_control_agreement",
+               args.output_dir,
                caption="Agreement between the cells that realize the shared control configuration. "
                        "Each arm holds the other two mechanisms at this configuration, so these "
                        "cells are repeated measurements of one setup; the spread between them "
                        "bounds how much of any arm's effect could be drift or order rather than "
                        "the manipulated factor.",
                label="tab:ablation-control-agreement")
-    save_table(control_vs_extreme_test(df), "table_ablation_control_vs_extreme", args.output_dir,
-               caption="Rep-level two-sided Mann-Whitney comparing each arm's control value to its "
-                       "most extreme value, on mean thread-dispatch time. One planned comparison per "
-                       "arm, so no multiple-comparison correction is applied. Rank-biserial effect "
-                       "size reported alongside significance.",
+    save_table(control_vs_extreme_test(df, controls=controls), "table_ablation_control_vs_extreme",
+               args.output_dir,
+               caption="Rep-level two-sided Mann-Whitney comparing each arm's control value to the "
+                       "sweep value farthest from it, on mean thread-dispatch time. One planned "
+                       "comparison per arm, so no multiple-comparison correction is applied. "
+                       "Rank-biserial effect size reported alongside significance.",
                label="tab:ablation-significance")
     plot_ablation(df, args.output_dir)
+    analyze_thermal(args.results_dir, args.output_dir, metadata, df)
 
     print(f"\n[+] Done. Tables -> {os.path.join(args.output_dir, 'tables')}")
     print(f"[+] Done. Figures -> {os.path.join(args.output_dir, 'figures')}")

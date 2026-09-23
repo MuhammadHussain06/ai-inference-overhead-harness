@@ -28,9 +28,9 @@ CALIBRATION_ITER_PER_VU="${4:-2000}"
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 COMPOSE_FILE="../../docker-compose.yml"
-# No override: RESULTS_DIR_OVERRIDE used to redirect only this host-side path,
-# not CONTAINER_OUT below, so any non-default value made the python step read
-# a file k6 never wrote. Nothing in the tree ever set it.
+# Fixed rather than overridable: CONTAINER_OUT below is tied to the compose mount of
+# ../../results, so any other host path would point the python step at a file k6
+# never wrote.
 RESULTS_DIR="../../results"
 # Path as the k6 container sees it (docker-compose.yml mounts ./results -> /results).
 CONTAINER_OUT="/results/calib_${TIER}_vus${REFERENCE_VUS}.json"

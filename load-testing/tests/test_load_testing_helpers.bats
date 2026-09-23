@@ -95,7 +95,14 @@ setup() {
   [ "$sorted" = "a b c d " ]
 }
 
-# --- compose_service_value: run-suite.sh only, docker stubbed ---
+# --- compose_service_value: identical in both scripts, docker stubbed ---
+
+@test "run-ablation.sh compose_service_value matches run-suite.sh's" {
+  # Both scripts check their placement against this reader, so a divergence would
+  # let the ablation verify a different configuration from the one it starts.
+  [ "$(extract_function "$SUITE_SH" compose_service_value)" \
+    = "$(extract_function "$ABLATION_SH" compose_service_value)" ]
+}
 
 @test "compose_service_value reads a service's cpuset from resolved compose config" {
   extract_function "$SUITE_SH" compose_service_value > "${WORKDIR}/f.sh"
