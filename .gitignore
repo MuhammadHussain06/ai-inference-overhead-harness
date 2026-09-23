@@ -33,3 +33,4 @@ fault-injection/results/
 .idea/
 .vscode/
 services/fraud-ml-service/.venv/
+**/__pycache__/
