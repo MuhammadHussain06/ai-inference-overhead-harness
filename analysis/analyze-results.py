@@ -1033,6 +1033,10 @@ def analyze_baseline(df, output_dir, true_counts=None):
 
     n_reps = base["rep"].nunique()
     print(f"[*] E1 baseline: {n_reps} independent repetition(s) detected.")
+    if n_reps < 2:
+        print(f"[!] Only {n_reps} repetition detected. Table 1's Mean/P95 95% CI columns read as "
+              f"'[nan, nan]', Table 1b's between-run consistency is not estimable, and Table 5's "
+              f"significance test is skipped entirely (both sides need >=2 reps).")
 
     # Latency computed on successful (200) requests only; see Table 1c for error rates
     e2e = base[(base["metric"] == "http_req_duration") & base["value"].notna() & (base["status"] == "200")]
@@ -1228,7 +1232,24 @@ def analyze_baseline(df, output_dir, true_counts=None):
 
 # concurrency scan
 
-def analyze_scan(df, output_dir, true_counts=None):
+def _scan_sampling_regime(vus, calib_cfg):
+    """'Iteration-based' vs. 'Duration-calibrated' label for one scan VUS level, read from
+    the run's own suite_config.calibration (run_metadata.json) rather than a hardcoded
+    level list that could drift from what run-suite.sh actually used. The two regimes are
+    why Table 4's N differs by orders of magnitude between rows instead of scaling with
+    VUS: affected levels run to a fixed wall-clock target instead of a fixed per-VU
+    iteration count.
+    """
+    affected = calib_cfg.get("affected_levels")
+    if affected is None:
+        return "unknown (run_metadata.json not available)"
+    if int(vus) in {int(v) for v in affected}:
+        duration = calib_cfg.get("target_duration_s")
+        return f"Duration-calibrated (~{int(duration)}s)" if duration else "Duration-calibrated"
+    return "Iteration-based"
+
+
+def analyze_scan(df, output_dir, true_counts=None, metadata=None):
     scan = df[df["phase"] == "scan"]
     if scan.empty:
         print("[!] No phase='scan' data found; skipping E2 analysis.")
@@ -1246,6 +1267,12 @@ def analyze_scan(df, output_dir, true_counts=None):
 
     n_reps = scan["rep"].nunique()
     print(f"[*] E2 scan: {n_reps} independent repetition(s) detected.")
+    if n_reps < 2:
+        print(f"[!] Only {n_reps} repetition detected. Table 4's Mean/P95 95% CI columns read as "
+              f"'[nan, nan]', Table 4b's between-run consistency is not estimable, and Table 6's "
+              f"significance test is skipped entirely (both sides need >=2 reps).")
+
+    calib_cfg = (metadata or {}).get("suite_config", {}).get("calibration", {})
 
     # Latency computed on successful (200) requests only; see Table 4c for error rates
     e2e = scan[(scan["metric"] == "http_req_duration") & scan["value"].notna() & (scan["status"] == "200")]
@@ -1297,6 +1324,7 @@ def analyze_scan(df, output_dir, true_counts=None):
             rows.append({
                 "Tier": _tier_label(t),
                 "Concurrency (VUS)": vus,
+                "Sampling": _scan_sampling_regime(vus, calib_cfg),
                 **s,
                 "Throughput (req/s)": round(throughput, 2) if not np.isnan(throughput) else np.nan,
                 "Throughput SD across reps (req/s)": round(throughput_sd, 2),
@@ -1308,8 +1336,13 @@ def analyze_scan(df, output_dir, true_counts=None):
                        "concurrency sweep, by tier. Latency percentiles pool all repetitions; "
                        "throughput is measured within each repetition and then averaged, since a "
                        "pooled span would include the restarts and cooldowns between repetitions. "
-                       "See Table 4b for between-run reproducibility and Table 4c for the full "
-                       "error/timeout breakdown.",
+                       "The 'Sampling' column marks each row's sample-size regime: "
+                       "'Iteration-based' levels run a fixed request count per virtual user, while "
+                       "'Duration-calibrated' levels are calibrated to run for a fixed wall-clock "
+                       "duration per cell instead -- which is why N can differ by orders of "
+                       "magnitude between the two regimes rather than scaling with VUS. See Table "
+                       "4b for between-run reproducibility and Table 4c for the full error/timeout "
+                       "breakdown.",
                label="tab:scan-summary-pooled")
 
     # Table 4b: between-run consistency per (tier, concurrency) cell.
@@ -1405,21 +1438,20 @@ def analyze_scan(df, output_dir, true_counts=None):
     ax.grid(True, which="both", linestyle="--", alpha=0.4)
     save_figure(fig, "figure4_throughput_vs_concurrency", output_dir)
 
-    # Figure 5: compute decomposition under load for the heaviest tier. Isolates thread-pool
+    # Figure 5: compute decomposition under load, one figure per real feature tier --
+    # mock/calibration have no predict_proba() cost to decompose. Isolates thread-pool
     # queueing (Thread Dispatch) from the invariant steps (DataFrame construction, predict_proba).
     # Compute stall is drawn as an overlaid line rather than a stacked segment: it is the
     # off-CPU portion of the computation window, already inside the two wall clocks below it.
-    heaviest = "28" if "28" in order else next((t for t in reversed(order) if t not in ("mock", "calibration")), None)
-    if heaviest:
-        stages = [
-            ("python_thread_dispatch_time_ms", "Thread Dispatch"),
-            ("python_dataframe_construction_time_ms", "DataFrame Construction"),
-            ("python_model_inference_time_ms", "predict_proba() Call"),
-        ]
-
-        def _stage_means(metric):
+    stages = [
+        ("python_thread_dispatch_time_ms", "Thread Dispatch"),
+        ("python_dataframe_construction_time_ms", "DataFrame Construction"),
+        ("python_model_inference_time_ms", "predict_proba() Call"),
+    ]
+    for tier in (t for t in order if t not in ("mock", "calibration")):
+        def _stage_means(metric, tier=tier):
             return np.nan_to_num(np.array([
-                scan[(scan["metric"] == metric) & (scan["tier"] == heaviest) & (scan["vus"] == vus)]["value"].mean()
+                scan[(scan["metric"] == metric) & (scan["tier"] == tier) & (scan["vus"] == vus)]["value"].mean()
                 for vus in levels
             ]))
 
@@ -1434,14 +1466,14 @@ def analyze_scan(df, output_dir, true_counts=None):
 
         stall = _stage_means("python_compute_stall_time_ms")
         ax.plot(x_labels, stall, marker="o", linestyle="--", linewidth=1.6, color="#c0392b",
-                label="Compute Stall (of which; GIL/scheduling)")
+                label="GIL/Scheduling Stall (subset of Thread Dispatch, off-CPU)")
 
         ax.set_xlabel("Concurrency (VUs)")
         ax.set_ylabel("Mean Latency (ms)")
-        ax.set_title(f"Compute Decomposition vs. Concurrency (Tier v{heaviest}, pooled)", fontweight="bold")
+        ax.set_title(f"Compute Decomposition vs. Concurrency (Tier v{tier}, pooled)", fontweight="bold")
         ax.legend(fontsize=8)
         ax.grid(True, axis="y", linestyle="--", alpha=0.4)
-        save_figure(fig, f"figure5_decomposition_vs_concurrency_v{heaviest}", output_dir)
+        save_figure(fig, f"figure5_decomposition_vs_concurrency_v{tier}", output_dir)
 
 
 
@@ -1767,6 +1799,12 @@ def analyze_openloop_check(df, output_dir, true_counts=None):
     # with zero successful responses still gets a row instead of disappearing.
     cell_meta = file_meta[~file_meta.index.isin(smoke_files)]
 
+    # Compare against the top of whatever concurrency sweep this run actually used, not a
+    # hardcoded pair -- computed once (it does not depend on tier) so the caption below can
+    # name the levels this run actually used rather than assuming the default sweep's top two.
+    scan_levels = sorted(int(v) for v in df.loc[df["phase"] == "scan", "vus"].dropna().unique())
+    top_levels = scan_levels[-2:]
+
     rows = []
     for tier in sorted(cell_meta["tier"].dropna().unique(), key=lambda t: TIER_ORDER.index(t) if t in TIER_ORDER else 99):
         # Grouping by rate too, not just tier: two open-loop files for the same tier at
@@ -1795,9 +1833,7 @@ def analyze_openloop_check(df, output_dir, true_counts=None):
                          "N": ol_stats["N (pooled, all reps)"],
                          "Dropped iterations": str(dropped_count)})
 
-        # Compare against the top of whatever concurrency sweep this run actually used.
-        scan_levels = sorted(int(v) for v in df.loc[df["phase"] == "scan", "vus"].dropna().unique())
-        for vus in scan_levels[-2:]:
+        for vus in top_levels:
             cl_cell = df[(df["phase"] == "scan") & (df["metric"] == "http_req_duration") &
                          (df["status"] == "200") & (df["tier"] == tier) & (df["vus"] == vus)]
             cl_stats = summarize(cl_cell, f"{_tier_label(tier)} closed-loop VUS={vus}",
@@ -1814,11 +1850,16 @@ def analyze_openloop_check(df, output_dir, true_counts=None):
         return
 
     table = pd.DataFrame(rows)
+    # Named from top_levels itself, not the default sweep, so a CONCURRENCY_OVERRIDE run's
+    # caption never claims levels this run didn't actually use.
+    top_levels_str = "/".join(str(v) for v in top_levels) if top_levels else "n/a"
     save_table(table, "table7_openloop_validity_check", output_dir,
-               caption="Open-loop (constant-arrival-rate) tail latency vs. the closed-loop scan at "
-                       "VUS 32/64, for manually-checked tiers. Validates the concurrency scan against "
-                       "coordinated omission; not part of the automated suite. Smoke-test artifacts "
-                       "(phase=smoke-openloop) are excluded regardless of how many are present.",
+               caption=f"Open-loop (constant-arrival-rate) tail latency vs. the closed-loop scan at "
+                       f"the top {len(top_levels)} concurrency level(s) this run's scan phase actually "
+                       f"used (VUS {top_levels_str}), for manually-checked tiers. Validates the "
+                       f"concurrency scan against coordinated omission; not part of the automated "
+                       f"suite. Smoke-test artifacts (phase=smoke-openloop) are excluded regardless "
+                       f"of how many are present.",
                label="tab:openloop-validity")
 
     fig, ax = plt.subplots(figsize=(6, 4), dpi=300)
@@ -1880,7 +1921,7 @@ def main():
         print("[!] No scan_* files found; skipping concurrency-scan analysis.")
     else:
         print(f"[*] Loaded {len(df2)} metric points (scan+openloop) from {df2['source_file'].nunique()} file(s).")
-        analyze_scan(df2, args.output_dir, true_counts=true2)
+        analyze_scan(df2, args.output_dir, true_counts=true2, metadata=metadata)
         analyze_openloop_check(df2, args.output_dir, true_counts=true2)
         latency_parts.append(cell_mean_latency(df2, "scan"))
     del df2, true2

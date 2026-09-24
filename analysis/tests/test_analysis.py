@@ -150,6 +150,90 @@ def test_scan_tables_keep_non_default_concurrency_values(tmp_path):
     assert drift["Group"].tolist() == ["v28 @ VUS=2", "v28 @ VUS=6", "v28 @ VUS=12"]
 
 
+# figure 5: compute decomposition per tier
+
+def _decomposition_cell(tier, vus, rep, n=10):
+    """One (tier, vus, rep) cell's http_req_duration rows plus its python_* stage means."""
+    base = pd.Timestamp("2026-01-01T00:00:00Z") + pd.Timedelta(seconds=rep * 3600)
+    source = f"scan_{tier}_vus{vus}_rep{rep}.json.gz"
+    rows = [{"metric": "http_req_duration", "value": 5.0, "status": "200", "phase": "scan",
+             "tier": tier, "vus": float(vus), "rep": str(rep), "source_file": source,
+             "time": base + pd.Timedelta(milliseconds=10 * i)} for i in range(n)]
+    for metric, value in (("python_thread_dispatch_time_ms", 0.2),
+                          ("python_dataframe_construction_time_ms", 0.1),
+                          ("python_model_inference_time_ms", 1.0),
+                          ("python_compute_stall_time_ms", 0.3)):
+        rows.append({"metric": metric, "value": value, "status": "200", "phase": "scan",
+                     "tier": tier, "vus": float(vus), "rep": str(rep), "source_file": source, "time": base})
+    return rows
+
+
+def test_figure5_is_drawn_per_real_tier_not_only_the_heaviest(tmp_path):
+    """mock/calibration have no predict_proba() cost to decompose; every feature tier gets its own figure."""
+    rows = []
+    for tier in ("5", "28", "mock"):
+        for vus in (8, 16):
+            for rep in (1, 2):
+                rows += _decomposition_cell(tier, vus, rep)
+    results.analyze_scan(pd.DataFrame(rows), str(tmp_path))
+    figures = {p.name for p in (tmp_path / "figures").glob("figure5_*.png")}
+    assert figures == {"figure5_decomposition_vs_concurrency_v5.png",
+                        "figure5_decomposition_vs_concurrency_v28.png"}
+
+
+# table 4: sampling-regime column and low-rep warnings
+
+def _scan_rows(tier, vus, rep, n=20):
+    return [{"metric": "http_req_duration", "value": 5.0, "status": "200", "phase": "scan",
+             "tier": tier, "vus": float(vus), "rep": str(rep),
+             "source_file": f"scan_{tier}_vus{vus}_rep{rep}.json.gz",
+             "time": pd.Timestamp("2026-01-01T00:00:00Z") + pd.Timedelta(milliseconds=10 * i)}
+            for i in range(n)]
+
+
+def test_table4_sampling_column_reflects_the_runs_own_calibration_config(tmp_path):
+    """N differs by orders of magnitude between iteration-based and duration-calibrated
+    VUS levels; the Sampling column must say which regime produced each row rather than
+    leaving readers to infer it from the jump in N alone."""
+    rows = _scan_rows("28", 2, 1) + _scan_rows("28", 8, 1)
+    metadata = {"suite_config": {"calibration": {"affected_levels": [8], "target_duration_s": 60}}}
+    results.analyze_scan(pd.DataFrame(rows), str(tmp_path), metadata=metadata)
+
+    table4 = pd.read_csv(tmp_path / "tables" / "table4_concurrency_scan_summary_pooled.csv")
+    sampling = dict(zip(table4["Concurrency (VUS)"], table4["Sampling"]))
+    assert sampling[2] == "Iteration-based"
+    assert sampling[8] == "Duration-calibrated (~60s)"
+
+
+def test_table4_sampling_column_is_explicit_when_metadata_is_missing(tmp_path):
+    """No run_metadata.json (or an old one predating this field) must not make the column
+    silently guess -- it should say so rather than mislabel a row."""
+    rows = _scan_rows("28", 8, 1)
+    results.analyze_scan(pd.DataFrame(rows), str(tmp_path))  # metadata omitted
+    table4 = pd.read_csv(tmp_path / "tables" / "table4_concurrency_scan_summary_pooled.csv")
+    assert table4["Sampling"].iloc[0] == "unknown (run_metadata.json not available)"
+
+
+def test_baseline_warns_when_only_one_repetition_is_present(tmp_path, capsys):
+    rows = [{"metric": "http_req_duration", "value": 5.0, "status": "200", "phase": "baseline",
+             "tier": "28", "rep": "1", "source_file": "baseline_28_rep1.json.gz",
+             "time": pd.Timestamp("2026-01-01T00:00:00Z")}]
+    results.analyze_baseline(pd.DataFrame(rows), str(tmp_path))
+    assert "Only 1 repetition detected" in capsys.readouterr().out
+
+
+def test_scan_warns_when_only_one_repetition_is_present(tmp_path, capsys):
+    rows = _scan_rows("28", 8, 1)
+    results.analyze_scan(pd.DataFrame(rows), str(tmp_path))
+    assert "Only 1 repetition detected" in capsys.readouterr().out
+
+
+def test_baseline_and_scan_do_not_warn_with_enough_reps(tmp_path, capsys):
+    rows = _scan_rows("28", 8, 1) + _scan_rows("28", 8, 2)
+    results.analyze_scan(pd.DataFrame(rows), str(tmp_path))
+    assert "repetition detected" not in capsys.readouterr().out
+
+
 # GC log parsing
 
 GC_LOG = """[2026-01-01T12:00:00.100+0000][0.512s][info][gc,init] Version: 21.0.5+11
@@ -420,6 +504,28 @@ def test_openloop_check_reports_real_check_without_smoke_contamination(tmp_path,
     assert ol_rows.iloc[0]["Model"] == "Open-loop (rate=32/s)"
     assert ol_rows.iloc[0]["Dropped iterations"] == 1
     assert ol_rows.iloc[0]["N"] == 20
+
+
+def test_openloop_check_compares_against_the_scan_levels_this_run_actually_used(tmp_path):
+    """The closed-loop rows -- and Table 7's caption -- must name whichever concurrency
+    levels this run's scan phase actually used, not a hardcoded VUS 32/64: a
+    CONCURRENCY_OVERRIDE run would otherwise get a caption naming levels it never ran."""
+    rows = _openloop_rows("openloop_28_rate32.json", "openloop-check", "32", "28", n_ok=20, n_dropped=0)
+    for vus in (6, 12):
+        for i in range(30):
+            rows.append({"metric": "http_req_duration", "value": 5.0, "status": "200",
+                         "phase": "scan", "tier": "28", "rate": np.nan, "rep": "1",
+                         "vus": float(vus), "source_file": f"scan_28_vus{vus}_rep1.json.gz",
+                         "time": pd.Timestamp("2026-01-01T00:00:00Z") + pd.Timedelta(milliseconds=10 * i)})
+    results.analyze_openloop_check(pd.DataFrame(rows), str(tmp_path))
+
+    table = pd.read_csv(tmp_path / "tables" / "table7_openloop_validity_check.csv")
+    cl_rows = table[table["Model"].str.startswith("Closed-loop")]
+    assert sorted(cl_rows["Model"].tolist()) == ["Closed-loop VUS=12", "Closed-loop VUS=6"]
+
+    tex = (tmp_path / "tables" / "table7_openloop_validity_check.tex").read_text()
+    assert "VUS 6/12" in tex
+    assert "32/64" not in tex
 
 
 def test_between_run_sd_is_not_estimable_from_one_rep():

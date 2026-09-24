@@ -104,6 +104,23 @@ setup() {
     = "$(extract_function "$ABLATION_SH" compose_service_value)" ]
 }
 
+# --- SCAN_ITERATIONS_PER_VU: the low-VUS reproducibility floor ---
+
+@test "SCAN_ITERATIONS_PER_VU defaults to the same per-VU sample size as baseline" {
+  # VUS 1/2/4 fall outside CALIB_AFFECTED_LEVELS and get this flat value directly; a
+  # regression back to a much smaller default would reopen the high between-run CoV
+  # those levels showed before this was raised to match BASELINE_ITERATIONS.
+  eval "$(grep -m1 '^SCAN_ITERATIONS_PER_VU=' "$SUITE_SH")"
+  eval "$(grep -m1 '^BASELINE_ITERATIONS=' "$SUITE_SH")"
+  [ "$SCAN_ITERATIONS_PER_VU" = "$BASELINE_ITERATIONS" ]
+}
+
+@test "SCAN_ITERATIONS_PER_VU_OVERRIDE still takes precedence over the default" {
+  SCAN_ITERATIONS_PER_VU_OVERRIDE=250
+  eval "$(grep -m1 '^SCAN_ITERATIONS_PER_VU=' "$SUITE_SH")"
+  [ "$SCAN_ITERATIONS_PER_VU" = "250" ]
+}
+
 @test "compose_service_value reads a service's cpuset from resolved compose config" {
   extract_function "$SUITE_SH" compose_service_value > "${WORKDIR}/f.sh"
 
