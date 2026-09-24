@@ -5,8 +5,9 @@
 # temperature or thermal throttling per cell instead of inferring it.
 #
 # Requires the caller to define abort_suite(), ENV_TRACE_LOG and THERMAL_WARN_C /
-# THERMAL_CRIT_C / THERMAL_COOLDOWN_S / MAX_THERMAL_COOLDOWNS. THERMAL_SYSFS_ROOT points
-# the readers at a synthetic tree for the unit tests.
+# THERMAL_CRIT_C / THERMAL_COOLDOWN_S / MAX_THERMAL_COOLDOWNS. THERMAL_MAX_COOLDOWNS_EXTENDED
+# is optional and defaults to MAX_THERMAL_COOLDOWNS (no extension) when a caller doesn't set
+# it. THERMAL_SYSFS_ROOT points the readers at a synthetic tree for the unit tests.
 THERMAL_SYSFS_ROOT="${THERMAL_SYSFS_ROOT:-/sys}"
 
 # UTC with milliseconds: cells short enough to start and end within one second
@@ -79,17 +80,27 @@ record_cell_thermal() {
 }
 
 # Pauses at/above THERMAL_WARN_C and aborts only if still at/above THERMAL_CRIT_C
-# after MAX_THERMAL_COOLDOWNS pauses: a thermally wedged host loses the whole run, a
-# paused one costs only wall-clock time. Every check is logged with the time it
+# once cooling has stopped making progress: a thermally wedged host loses the whole
+# run, one that is still genuinely cooling gets more wall-clock time to keep doing
+# so. MAX_THERMAL_COOLDOWNS rounds are always given regardless of trend; beyond
+# that, a round is only granted if the previous one actually lowered the reading,
+# up to THERMAL_MAX_COOLDOWNS_EXTENDED total -- the moment a round fails to cool,
+# further waiting is assumed not to help either, so the check stops there rather
+# than spending the rest of the budget. Every check is logged with the time it
 # paused for, so the run's thermal pause cost is measured rather than estimated.
 check_thermal_safety() {
   local label="$1"
-  local ts temp first cooldowns=0
+  local ts temp first cooldowns=0 pre
+  local hard_cap="${THERMAL_MAX_COOLDOWNS_EXTENDED:-$MAX_THERMAL_COOLDOWNS}"
   ts=$(thermal_ts)
   temp=$(read_max_cpu_temp_c)
   first="$temp"
-  while [ -n "$temp" ] && [ "$temp" -ge "$THERMAL_WARN_C" ] && [ "$cooldowns" -lt "$MAX_THERMAL_COOLDOWNS" ]; do
-    echo "  [thermal] ${label}: ${temp}C >= warn ${THERMAL_WARN_C}C -- cooling ${THERMAL_COOLDOWN_S}s ($((cooldowns + 1))/${MAX_THERMAL_COOLDOWNS})"
+  while [ -n "$temp" ] && [ "$temp" -ge "$THERMAL_WARN_C" ] && [ "$cooldowns" -lt "$hard_cap" ]; do
+    if [ "$cooldowns" -ge "$MAX_THERMAL_COOLDOWNS" ] && [ -n "$pre" ] && [ "$temp" -ge "$pre" ]; then
+      break
+    fi
+    echo "  [thermal] ${label}: ${temp}C >= warn ${THERMAL_WARN_C}C -- cooling ${THERMAL_COOLDOWN_S}s ($((cooldowns + 1))/${hard_cap})"
+    pre="$temp"
     sleep "$THERMAL_COOLDOWN_S"
     cooldowns=$((cooldowns + 1))
     temp=$(read_max_cpu_temp_c)

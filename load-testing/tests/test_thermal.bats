@@ -22,8 +22,21 @@ setup() {
   MAX_THERMAL_COOLDOWNS=2
   abort_suite() { echo "$*" > "$ABORT_RECORD"; exit 1; }
   # Records each pause instead of taking it; a test that cools the host during a
-  # pause lowers the zone reading from here.
-  sleep() { echo "slept $1" >> "${BATS_TEST_TMPDIR}/sleeps"; [ -n "${COOL_TO:-}" ] && zone 0 "$COOL_TO"; return 0; }
+  # pause lowers the zone reading from here. COOL_SEQUENCE (space-separated
+  # millidegrees) applies one reading per call, in order, for scripting a specific
+  # multi-round curve; COOL_TO applies the same reading on every call.
+  sleep() {
+    echo "slept $1" >> "${BATS_TEST_TMPDIR}/sleeps"
+    if [ -n "${COOL_SEQUENCE:-}" ]; then
+      set -- $COOL_SEQUENCE
+      zone 0 "$1"
+      shift
+      COOL_SEQUENCE="$*"
+    elif [ -n "${COOL_TO:-}" ]; then
+      zone 0 "$COOL_TO"
+    fi
+    return 0
+  }
   source "$LIB"
 }
 
@@ -124,6 +137,61 @@ core_throttle() {
   run check_thermal_safety "baseline target=mock rep=1"
   [ "$status" -eq 0 ]
   [[ "$(cat "$ENV_TRACE_LOG")" == *" temp_c=na temp_after_c=na cooldowns=0 paused_s=0 label=baseline target=mock rep=1" ]]
+}
+
+# --- extending past MAX_THERMAL_COOLDOWNS ---
+
+@test "a host that keeps cooling extends past the guaranteed cooldowns to convergence" {
+  THERMAL_MAX_COOLDOWNS_EXTENDED=5
+  zone 0 97000
+  COOL_SEQUENCE="95000 93000 91000 89000"
+  run check_thermal_safety "ablation_warmup_thread_limiter_40_rep3 chunk1"
+  [ "$status" -eq 0 ]
+  [ "$(grep -c . "${BATS_TEST_TMPDIR}/sleeps")" = "4" ]
+  [[ "$(cat "$ENV_TRACE_LOG")" == *" temp_c=97 temp_after_c=89 cooldowns=4 paused_s=240 label=ablation_warmup_thread_limiter_40_rep3 chunk1" ]]
+}
+
+@test "extension stops the moment a round fails to cool, short of the extended cap" {
+  THERMAL_MAX_COOLDOWNS_EXTENDED=5
+  zone 0 97000
+  COOL_SEQUENCE="95000 93000 93000 91000"
+  run check_thermal_safety "scan target=28 vus=64 rep=1"
+  [ "$status" -eq 0 ]
+  # 3 rounds: two guaranteed, one extended round that cooled 95->93; the next
+  # round would have started from 93 and did not cool it further, so it is
+  # never taken even though the cap allows two more.
+  [ "$(grep -c . "${BATS_TEST_TMPDIR}/sleeps")" = "3" ]
+  [[ "$(cat "$ENV_TRACE_LOG")" == *" temp_c=97 temp_after_c=93 cooldowns=3 paused_s=180 label=scan target=28 vus=64 rep=1" ]]
+}
+
+@test "the extended cap bounds a host that is still improving too slowly" {
+  THERMAL_MAX_COOLDOWNS_EXTENDED=3
+  zone 0 97000
+  COOL_SEQUENCE="96000 95000 94000 93000 92000"
+  run check_thermal_safety "scan calibration target=28"
+  [ "$status" -eq 0 ]
+  [ "$(grep -c . "${BATS_TEST_TMPDIR}/sleeps")" = "3" ]
+  [[ "$(cat "$ENV_TRACE_LOG")" == *" temp_c=97 temp_after_c=94 cooldowns=3 paused_s=180 label=scan calibration target=28" ]]
+}
+
+@test "a host still critical when the extended cap is reached aborts with the real count" {
+  THERMAL_MAX_COOLDOWNS_EXTENDED=3
+  zone 0 99000
+  COOL_SEQUENCE="98000 97000 96000"
+  run check_thermal_safety "warmup_scan_rep1 chunk2"
+  [ "$status" -eq 1 ]
+  [ "$(grep -c . "${BATS_TEST_TMPDIR}/sleeps")" = "3" ]
+  [[ "$(cat "$ABORT_RECORD")" == "[thermal] warmup_scan_rep1 chunk2 96C still >= critical 95C after 3 cooldown(s)." ]]
+}
+
+@test "a caller that never sets the extended cap keeps the old fixed-count behavior" {
+  # No THERMAL_MAX_COOLDOWNS_EXTENDED: hard_cap falls back to MAX_THERMAL_COOLDOWNS,
+  # matching every caller that predates the extension (the probing scripts included).
+  zone 0 97000
+  COOL_SEQUENCE="95000 93000 91000"
+  run check_thermal_safety "baseline target=28 rep=1"
+  [ "$status" -eq 0 ]
+  [ "$(grep -c . "${BATS_TEST_TMPDIR}/sleeps")" = "2" ]
 }
 
 # --- the harness refuses a synthetic tree ---
