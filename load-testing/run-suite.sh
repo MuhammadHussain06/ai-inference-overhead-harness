@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Detaches stdin: a backgrounded docker compose invocation that inherits the
+# terminal's stdin gets stopped by SIGTTIN the moment it tries to read it.
+exec < /dev/null
+
 # Orchestrates clean-slate stack restarts, randomized execution order, system provenance logging,
 # and verification of CPU pinning, thread caps (n_jobs, BLAS/OpenMP), and CPU governor frequencies.
 
@@ -132,7 +136,11 @@ BASELINE_ITERATIONS="${BASELINE_ITERATIONS_OVERRIDE:-500}"
 # Flat fallback for the concurrency levels outside CALIB_AFFECTED_LEVELS (1/2/4
 # by default), where too few VUs are in flight for the end-of-cell taper to
 # matter. The rest get a per-target calibrated value -- see calibrate_target().
-SCAN_ITERATIONS_PER_VU="${SCAN_ITERATIONS_PER_VU_OVERRIDE:-100}"
+# Matches BASELINE_ITERATIONS rather than a smaller value: these levels are the
+# same per-target sample size baseline already runs at VUS=1, keeping their
+# between-run noise in the range baseline's own reproducibility already shows
+# is acceptable, at a cost of well under a minute added to the whole run.
+SCAN_ITERATIONS_PER_VU="${SCAN_ITERATIONS_PER_VU_OVERRIDE:-500}"
 
 # per-vu-iterations runs each VU to a fixed iteration count independent of the
 # others, so VUs finish at slightly different wall-clock times and effective
@@ -206,6 +214,10 @@ THERMAL_WARN_C="${THERMAL_WARN_C_OVERRIDE:-90}"
 THERMAL_CRIT_C="${THERMAL_CRIT_C_OVERRIDE:-95}"
 THERMAL_COOLDOWN_S="${THERMAL_COOLDOWN_S_OVERRIDE:-60}"
 MAX_THERMAL_COOLDOWNS="${MAX_THERMAL_COOLDOWNS_OVERRIDE:-2}"
+# Rounds beyond MAX_THERMAL_COOLDOWNS are only granted while still cooling
+# (check_thermal_safety), so this bounds the worst case rather than setting the
+# common one.
+THERMAL_MAX_COOLDOWNS_EXTENDED="${THERMAL_MAX_COOLDOWNS_EXTENDED_OVERRIDE:-10}"
 # n=7 vs 7 puts the minimum achievable two-sided Mann-Whitney p-value at
 # 2/C(14,7) = 0.00058, which still clears alpha=0.05 after Holm correction
 # across the five adjacent-tier comparisons (0.00058 x 5 = 0.0029). n=5 vs 5
@@ -218,12 +230,17 @@ REPS_SCAN="${REPS_SCAN_OVERRIDE:-7}"
 # Command substitution in a for-list is not an errexit context, so integer overrides must
 # be validated explicitly before use.
 for _intvar in REPS_BASELINE REPS_SCAN BASELINE_ITERATIONS SCAN_ITERATIONS_PER_VU \
-  THERMAL_WARN_C THERMAL_CRIT_C THERMAL_COOLDOWN_S MAX_THERMAL_COOLDOWNS; do
+  THERMAL_WARN_C THERMAL_CRIT_C THERMAL_COOLDOWN_S MAX_THERMAL_COOLDOWNS THERMAL_MAX_COOLDOWNS_EXTENDED; do
   if ! [[ "${!_intvar}" =~ ^[0-9]+$ ]] || [ "${!_intvar}" -lt 1 ]; then
     echo "[!] ${_intvar} must be a positive integer, got '${!_intvar}'." >&2
     exit 1
   fi
 done
+if [ "$THERMAL_MAX_COOLDOWNS_EXTENDED" -lt "$MAX_THERMAL_COOLDOWNS" ]; then
+  echo "[!] THERMAL_MAX_COOLDOWNS_EXTENDED (${THERMAL_MAX_COOLDOWNS_EXTENDED}) must be >=" \
+       "MAX_THERMAL_COOLDOWNS (${MAX_THERMAL_COOLDOWNS})." >&2
+  exit 1
+fi
 if [ "${#TARGETS[@]}" -eq 0 ] || [ "${#CONCURRENCY_LEVELS[@]}" -eq 0 ]; then
   echo "[!] TARGETS and CONCURRENCY_LEVELS must each be non-empty (check TARGETS_OVERRIDE / CONCURRENCY_OVERRIDE)." >&2
   exit 1
@@ -617,15 +634,25 @@ verify_cpu_pinning() {
 
   # Verifies the k6 container's own cpuset against the compose file, which is also what
   # verify_smt_isolation() compared, so the two can never disagree about what was asked for.
+  # `docker compose run --rm` can hang on cleanup of the ephemeral container; timeout
+  # bounds it, and -k 10 sends SIGKILL if SIGTERM doesn't land.
   local k6_expected
   k6_expected=$(compose_service_value "k6" cpuset)
-  local k6_live
-  k6_live=$(docker compose -f "$COMPOSE_FILE" --profile loadgen run --rm -T --entrypoint sh k6 \
+  local k6_live k6_rc
+  set +e
+  k6_live=$(timeout -k 10 30 docker compose -f "$COMPOSE_FILE" --profile loadgen run --rm -T --entrypoint sh k6 \
     -c 'cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || cat /sys/fs/cgroup/cpuset/cpuset.cpus 2>/dev/null' \
-    2>/dev/null || echo "")
+    2>/dev/null)
+  k6_rc=$?
+  set -e
   echo "  [cpu-pin] ${label}: k6 live(${k6_live:-EMPTY}) expected(${k6_expected})"
   echo "cpu_pin_check label=${label} k6_live=${k6_live:-EMPTY} k6_expected=${k6_expected}" >> "$CPU_PIN_LOG"
-  if [ -z "$k6_live" ]; then
+  if [ "$k6_rc" -eq 124 ]; then
+    echo "  [cpu-pin] ${label}: WARN -- k6 cpuset read timed out after 30s and was killed;" \
+      "skipping k6 pin check for this rep. Not an environment limitation -- check" \
+      "'docker compose version' if this recurs."
+    echo "cpu_pin_check label=${label} k6_live=TIMEOUT k6_expected=${k6_expected} result=WARN_SKIPPED_TIMEOUT" >> "$CPU_PIN_LOG"
+  elif [ -z "$k6_live" ]; then
     echo "  [cpu-pin] ${label}: WARN -- could not read k6 cgroup cpuset (WSL2/cgroup-v2 limitation); skipping k6 pin check."
     echo "cpu_pin_check label=${label} k6_live=UNREADABLE k6_expected=${k6_expected} result=WARN_SKIPPED" >> "$CPU_PIN_LOG"
   elif [ "$k6_live" != "$k6_expected" ]; then

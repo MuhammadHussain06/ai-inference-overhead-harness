@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Detaches stdin: a backgrounded docker compose invocation that inherits the
+# terminal's stdin gets stopped by SIGTTIN the moment it tries to read it.
+exec < /dev/null
+
 # Isolates the drivers of thread-dispatch time at VUS=64 / TARGET=28 across four arms:
 # thread_limiter, cpuset, workers, and workers with aggregate token capacity held constant.
 # python-service takes interleaved even physical cores so it stays SMT-disjoint from Java and k6.
@@ -124,16 +128,25 @@ THERMAL_WARN_C="${THERMAL_WARN_C_OVERRIDE:-90}"
 THERMAL_CRIT_C="${THERMAL_CRIT_C_OVERRIDE:-95}"
 THERMAL_COOLDOWN_S="${THERMAL_COOLDOWN_S_OVERRIDE:-60}"
 MAX_THERMAL_COOLDOWNS="${MAX_THERMAL_COOLDOWNS_OVERRIDE:-2}"
+# Rounds beyond MAX_THERMAL_COOLDOWNS are only granted while still cooling
+# (check_thermal_safety), so this bounds the worst case rather than setting the
+# common one.
+THERMAL_MAX_COOLDOWNS_EXTENDED="${THERMAL_MAX_COOLDOWNS_EXTENDED_OVERRIDE:-10}"
 
 # Command substitution in a for word-list is not an errexit context, so integer overrides
 # must be validated explicitly before use.
 for _intvar in REPS_ABLATION ABLATION_VUS ITERATIONS_PER_VU ABLATION_CALIB_ITER_PER_VU ABLATION_CALIB_TARGET_DURATION_S \
-  THERMAL_WARN_C THERMAL_CRIT_C THERMAL_COOLDOWN_S MAX_THERMAL_COOLDOWNS; do
+  THERMAL_WARN_C THERMAL_CRIT_C THERMAL_COOLDOWN_S MAX_THERMAL_COOLDOWNS THERMAL_MAX_COOLDOWNS_EXTENDED; do
   if [ -n "${!_intvar+x}" ] && { ! [[ "${!_intvar}" =~ ^[0-9]+$ ]] || [ "${!_intvar}" -lt 1 ]; }; then
     echo "[!] ${_intvar} must be a positive integer, got '${!_intvar}'." >&2
     exit 1
   fi
 done
+if [ "$THERMAL_MAX_COOLDOWNS_EXTENDED" -lt "$MAX_THERMAL_COOLDOWNS" ]; then
+  echo "[!] THERMAL_MAX_COOLDOWNS_EXTENDED (${THERMAL_MAX_COOLDOWNS_EXTENDED}) must be >=" \
+       "MAX_THERMAL_COOLDOWNS (${MAX_THERMAL_COOLDOWNS})." >&2
+  exit 1
+fi
 COOLDOWN_S=10
 ANYIO_DEFAULT_TOKENS=40
 EXPECTED_TIERS="5,10,20,28"
@@ -488,13 +501,23 @@ verify_cpu_pinning() {
 
   # K6_CPUSET is resolved once from the compose config and fixed for the whole
   # ablation (unlike python-service's), so it is this check's expected value.
-  local k6_live
-  k6_live=$(docker compose -f "$COMPOSE_FILE" --profile loadgen run --rm -T --entrypoint sh k6 \
+  # `docker compose run --rm` can hang on cleanup of the ephemeral container; timeout
+  # bounds it, and -k 10 sends SIGKILL if SIGTERM doesn't land.
+  local k6_live k6_rc
+  set +e
+  k6_live=$(timeout -k 10 30 docker compose -f "$COMPOSE_FILE" --profile loadgen run --rm -T --entrypoint sh k6 \
     -c 'cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || cat /sys/fs/cgroup/cpuset/cpuset.cpus 2>/dev/null' \
-    2>/dev/null || echo "")
+    2>/dev/null)
+  k6_rc=$?
+  set -e
   echo "  [cpu-pin] ${label}: k6 live(${k6_live:-EMPTY}) expected(${K6_CPUSET})"
   echo "cpu_pin_check label=${label} k6_live=${k6_live:-EMPTY} k6_expected=${K6_CPUSET}" >> "$CPU_PIN_LOG"
-  if [ -z "$k6_live" ]; then
+  if [ "$k6_rc" -eq 124 ]; then
+    echo "  [cpu-pin] ${label}: WARN -- k6 cpuset read timed out after 30s and was killed;" \
+      "skipping k6 pin check for this cell. Not an environment limitation -- check" \
+      "'docker compose version' if this recurs."
+    echo "cpu_pin_check label=${label} k6_live=TIMEOUT k6_expected=${K6_CPUSET} result=WARN_SKIPPED_TIMEOUT" >> "$CPU_PIN_LOG"
+  elif [ -z "$k6_live" ]; then
     echo "  [cpu-pin] ${label}: WARN -- could not read k6 cgroup cpuset (WSL2/cgroup-v2 limitation); skipping k6 pin check."
     echo "cpu_pin_check label=${label} k6_live=UNREADABLE k6_expected=${K6_CPUSET} result=WARN_SKIPPED" >> "$CPU_PIN_LOG"
   elif [ "$k6_live" != "$K6_CPUSET" ]; then
