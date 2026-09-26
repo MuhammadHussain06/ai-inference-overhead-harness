@@ -29,6 +29,7 @@ results = _load("analyze_results", "analyze-results.py")
 ablation = _load("analyze_ablation", "analyze-ablation.py")
 warmup_check = sys.modules["warmup_check"]
 thermal = sys.modules["thermal"]
+run_dirs = sys.modules["run_dirs"]
 
 
 # run-ablation.sh cell values
@@ -574,7 +575,7 @@ def _warmup_file(path, segments, step_ms=10, gz=True):
 def _metadata(tmp_path, targets, **gate):
     (tmp_path / "run_metadata.json").write_text(json.dumps(
         {"suite_config": {"targets": targets, **({"warmup_gate": gate} if gate else {})}}))
-    return results.read_run_metadata(str(tmp_path))
+    return run_dirs.read_metadata(str(tmp_path), "suite")
 
 
 def _table0(tmp_path, targets=("28",)):
@@ -682,7 +683,7 @@ def test_table0_without_warmup_files_is_skipped_not_raised(tmp_path, capsys):
 def _ablation_metadata(tmp_path, **extra):
     config = {"target": "28", **extra}
     (tmp_path / "ablation_run_metadata.json").write_text(json.dumps({"ablation_config": config}))
-    return ablation.read_metadata(str(tmp_path))
+    return run_dirs.read_metadata(str(tmp_path), "ablation")
 
 
 def test_ablation_table0_applies_the_same_gate_per_cell(tmp_path):

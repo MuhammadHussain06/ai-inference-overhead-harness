@@ -9,8 +9,11 @@ as analyze-results.py, applied to one planned comparison per arm (its
 control value against the sweep value farthest from it) rather than a full
 pairwise grid, since each arm has an a priori ordered sweep.
 
+Every run-ablation.sh run directory found under --results-dir is analyzed in turn,
+into its own folder under output/tables/ and output/figures/.
+
 Usage:
-    python3 analyze-ablation.py [--results-dir ../results] [--output-dir ./output]
+    python3 analyze-ablation.py [--results-dir ../results ...] [--output-dir ./output]
 """
 
 import argparse
@@ -29,8 +32,10 @@ from scipy.stats import mannwhitneyu
 
 ANALYSIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ANALYSIS_DIR, "lib"))
+import run_dirs  # noqa: E402
 import thermal  # noqa: E402
 import warmup_check  # noqa: E402
+from report import save_figure, save_table  # noqa: E402
 
 DEFAULT_RESULTS_DIR = os.path.join(ANALYSIS_DIR, "..", "results")
 DEFAULT_OUTPUT_DIR = os.path.join(ANALYSIS_DIR, "output")
@@ -69,19 +74,6 @@ CONTROL_CELL = {"thread_limiter": "40", "cpuset": "0-1,4-5,8-9", "workers": "3"}
 # keep 3 metrics, so the cap is normally slack; it bounds memory if an arm/value
 # combination ever raises throughput enough to reach it.
 MAX_POINTS_PER_FILE = 250_000
-
-
-def read_metadata(results_dir):
-    """ablation_run_metadata.json, or {} when absent or unreadable."""
-    path = os.path.join(results_dir, "ablation_run_metadata.json")
-    if not os.path.isfile(path):
-        return {}
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"[!] ablation_run_metadata.json could not be read ({e}); using defaults.")
-        return {}
 
 
 def control_cells(metadata):
@@ -124,17 +116,18 @@ def _is_cell_file(path):
     return m is not None and m.group("arm") in ARM_LABELS
 
 
-def load_ablation_cells(results_dir):
-    """Loads ablation_<arm>_<value>_rep<N>.json[.gz] cell files.
+def load_ablation_cells(results_dir, files=None):
+    """Loads ablation_<arm>_<value>_rep<N>.json[.gz] cell files: every one in
+    results_dir, or only the given paths.
 
     Returns (df, counts): df holds the METRICS points (reservoir-sampled per file);
     counts holds each cell's full request outcome tally, counted before sampling --
     HTTP 200s, other responses, requests with no response, and dropped iterations.
     Both are None when no cell file exists."""
-    files = [f for f in sorted(
-                glob.glob(os.path.join(results_dir, "ablation_*.json"))
-                + glob.glob(os.path.join(results_dir, "ablation_*.json.gz"))
-             ) if _is_cell_file(f)]
+    if files is None:
+        files = sorted(glob.glob(os.path.join(results_dir, "ablation_*.json"))
+                       + glob.glob(os.path.join(results_dir, "ablation_*.json.gz")))
+    files = [f for f in files if _is_cell_file(f)]
     if not files:
         return None, None
 
@@ -401,35 +394,7 @@ def build_error_table(counts):
     return pd.DataFrame(rows)
 
 
-def _latex_text(text):
-    """Escapes the LaTeX specials a caption can contain, leaving already-escaped ones."""
-    return re.sub(r"(?<!\\)([%_&#])", r"\\\1", text)
-
-
-def save_table(df, name, output_dir, caption=None, label=None):
-    """Emits csv/md/tex, matching analyze-results.py so both sets drop into the same paper."""
-    if df is None or df.empty:
-        print(f"[!] Skipping empty table: {name}")
-        return
-    tables_dir = os.path.join(output_dir, "tables")
-    os.makedirs(tables_dir, exist_ok=True)
-    df.to_csv(os.path.join(tables_dir, f"{name}.csv"), index=False)
-    with open(os.path.join(tables_dir, f"{name}.md"), "w") as f:
-        f.write(df.to_markdown(index=False))
-    with open(os.path.join(tables_dir, f"{name}.tex"), "w") as f:
-        f.write("\\begin{table}[t]\n\\centering\n")
-        # Caption precedes the tabular body so it renders above the table,
-        # matching Elsevier/JSS style.
-        if caption:
-            f.write(f"\\caption{{{_latex_text(caption)}}}\n")
-        if label:
-            f.write(f"\\label{{{label}}}\n")
-        f.write(df.to_latex(index=False, escape=True))
-        f.write("\\end{table}\n")
-    print(f"[+] Table  -> {tables_dir}/{name}.csv / .md / .tex")
-
-
-def plot_ablation(df, output_dir):
+def plot_ablation(df, output_dir, vus=None):
     arms = sorted(df["arm"].unique())
     fig, axes = plt.subplots(1, len(arms), figsize=(5 * len(arms), 4), sharey=True)
     if len(arms) == 1:
@@ -465,15 +430,9 @@ def plot_ablation(df, output_dir):
     axes[0].legend()
     n_reps = df["rep"].nunique()
     fig.suptitle(f"Thread Dispatch vs. Candidate Mechanism "
-                 f"(VUS=64, N={n_reps} runs, error bars = SD of thread dispatch across runs)")
+                 f"(VUS={vus or 'unrecorded'}, N={n_reps} runs, error bars = SD of thread dispatch across runs)")
     fig.tight_layout()
-
-    figures_dir = os.path.join(output_dir, "figures")
-    os.makedirs(figures_dir, exist_ok=True)
-    fig.savefig(os.path.join(figures_dir, "figure_ablation_mechanisms.png"), dpi=300, bbox_inches="tight")
-    fig.savefig(os.path.join(figures_dir, "figure_ablation_mechanisms.pdf"), bbox_inches="tight")
-    plt.close(fig)
-    print(f"[+] Figure -> {figures_dir}/figure_ablation_mechanisms.png / .pdf")
+    save_figure(fig, "figure_ablation_mechanisms", output_dir)
 
 
 def build_ablation_warmup_table(results_dir, metadata=None):
@@ -575,41 +534,35 @@ def analyze_thermal(results_dir, output_dir, metadata, df):
 
     fig = thermal.timeline_figure(trace, _ablation_phase, "Host temperature across the ablation run")
     if fig is not None:
-        figures_dir = os.path.join(output_dir, "figures")
-        os.makedirs(figures_dir, exist_ok=True)
-        fig.savefig(os.path.join(figures_dir, "figure_ablation_thermal_timeline.png"), dpi=300, bbox_inches="tight")
-        fig.savefig(os.path.join(figures_dir, "figure_ablation_thermal_timeline.pdf"), bbox_inches="tight")
-        plt.close(fig)
-        print(f"[+] Figure -> {figures_dir}/figure_ablation_thermal_timeline.png / .pdf")
+        save_figure(fig, "figure_ablation_thermal_timeline", output_dir)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Analyze run-ablation.sh's thread-dispatch mechanism sweep.")
-    parser.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
-    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
-    args = parser.parse_args()
-
-    failures_log = os.path.join(args.results_dir, "ablation_run_failures_log.txt")
+def analyze_run(run, out):
+    """Every ablation table and figure for one run directory. Returns False when the run
+    is rejected or holds no usable cell."""
+    results_dir = run.path
+    failures_log = os.path.join(results_dir, "ablation_run_failures_log.txt")
     if os.path.isfile(failures_log) and os.path.getsize(failures_log) > 0:
         print(f"[!] {failures_log} has entries -- fix the cause and re-run run-ablation.sh.")
-        sys.exit(1)
+        return False
 
-    metadata = read_metadata(args.results_dir)
+    metadata = run.metadata
     controls = control_cells(metadata)
+    vus = metadata.get("ablation_config", {}).get("vus")
 
-    warmup_table, params = build_ablation_warmup_table(args.results_dir, metadata)
-    save_table(warmup_table, "table0_ablation_warmup_convergence_check", args.output_dir,
+    warmup_table, params = build_ablation_warmup_table(results_dir, metadata)
+    save_table(warmup_table, "table0_ablation_warmup_convergence_check", out,
                caption=warmup_check.caption(params, "Per-cell"),
                label="tab:ablation-warmup-convergence")
     warmup_check.report(warmup_table, params, "ablation warm-up(s)", ["Arm", "Value", "Rep"])
 
-    df, counts = load_ablation_cells(args.results_dir)
+    df, counts = load_ablation_cells(results_dir)
     # An all-dropped frame reaches plot_ablation() as zero arms, which plt.subplots()
     # rejects; stop here so a file set with no usable points reports rather than raises.
     if df is None or df.empty:
-        print(f"[!] No usable ablation_*.json cell points found in {args.results_dir}. "
+        print(f"[!] No usable ablation_*.json cell points found in {results_dir}. "
               f"Run run-ablation.sh first.")
-        sys.exit(1)
+        return False
 
     n_reps = df["rep"].nunique()
     print(f"[*] Loaded {len(df)} metric points across {df['arm'].nunique()} arm(s), {n_reps} rep(s).")
@@ -626,7 +579,7 @@ def main():
               f"be significant regardless of effect size. Re-run with REPS_ABLATION_OVERRIDE>=7.")
 
     errors = build_error_table(counts)
-    save_table(errors, "table_ablation_error_rates", args.output_dir,
+    save_table(errors, "table_ablation_error_rates", out,
                caption="Request outcomes per arm value, pooled across repetitions and counted before "
                        "any sampling, with the iterations k6 dropped. The latency tables cover HTTP 200 "
                        "requests only, so a value with errors or dropped iterations ran fewer requests "
@@ -637,14 +590,14 @@ def main():
         print("[!] Some ablation cells had failed requests or dropped iterations -- see "
               "table_ablation_error_rates before comparing their latency.")
 
-    save_table(build_decomposition_table(df, counts), "table_ablation_decomposition", args.output_dir,
-               caption="Per-arm latency decomposition at VUS=64. Each arm holds the other "
-                       "mechanisms at their control value and sweeps one. CIs are 95\\% cluster "
-                       "bootstraps resampling whole repetitions, so they reflect between-run "
+    save_table(build_decomposition_table(df, counts), "table_ablation_decomposition", out,
+               caption=f"Per-arm latency decomposition at VUS={vus or 'unrecorded'}. Each arm holds "
+                       "the other mechanisms at their control value and sweeps one. CIs are 95\\% "
+                       "cluster bootstraps resampling whole repetitions, so they reflect between-run "
                        "variation rather than within-run request spread.",
                label="tab:ablation-decomposition")
     save_table(build_control_agreement_table(df, controls=controls), "table_ablation_control_agreement",
-               args.output_dir,
+               out,
                caption="Agreement between the cells that realize the shared control configuration. "
                        "Each arm holds the other two mechanisms at this configuration, so these "
                        "cells are repeated measurements of one setup; the spread between them "
@@ -652,17 +605,48 @@ def main():
                        "the manipulated factor.",
                label="tab:ablation-control-agreement")
     save_table(control_vs_extreme_test(df, controls=controls), "table_ablation_control_vs_extreme",
-               args.output_dir,
+               out,
                caption="Rep-level two-sided Mann-Whitney comparing each arm's control value to the "
                        "sweep value farthest from it, on mean thread-dispatch time. One planned "
                        "comparison per arm, so no multiple-comparison correction is applied. "
                        "Rank-biserial effect size reported alongside significance.",
                label="tab:ablation-significance")
-    plot_ablation(df, args.output_dir)
-    analyze_thermal(args.results_dir, args.output_dir, metadata, df)
+    plot_ablation(df, out, vus)
+    analyze_thermal(results_dir, out, metadata, df)
+    return True
 
-    print(f"\n[+] Done. Tables -> {os.path.join(args.output_dir, 'tables')}")
-    print(f"[+] Done. Figures -> {os.path.join(args.output_dir, 'figures')}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Analyze run-ablation.sh's thread-dispatch mechanism sweep.")
+    parser.add_argument("--results-dir", nargs="+", default=[DEFAULT_RESULTS_DIR],
+                        help="Run directories, or directories holding them (default: ../results).")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR,
+                        help="Root for tables/<run>/ and figures/<run>/ (default: ./output).")
+    args = parser.parse_args()
+
+    try:
+        runs = run_dirs.resolve(args.results_dir, "ablation")
+    except ValueError as e:
+        print(f"[!] {e}")
+        sys.exit(1)
+    if not runs:
+        print(f"[!] No usable ablation run found in {' '.join(args.results_dir)}. "
+              f"Run load-testing/run-ablation.sh first.")
+        sys.exit(1)
+
+    outs = run_dirs.prepare_run_outputs(args.output_dir, "ablation", runs)
+    rejected = []
+    for run in runs:
+        print(f"\n[*] === {run.name} ({run.path}) ===")
+        if not analyze_run(run, outs[run.name]):
+            rejected.append(run.name)
+
+    print(f"\n[+] Analyzed {len(runs) - len(rejected)}/{len(runs)} run(s). "
+          f"Tables -> {os.path.join(args.output_dir, 'tables')}/<run>, "
+          f"figures -> {os.path.join(args.output_dir, 'figures')}/<run>")
+    if rejected:
+        print(f"[!] Not analyzed: {', '.join(rejected)}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

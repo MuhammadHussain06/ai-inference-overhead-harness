@@ -7,8 +7,11 @@ run on rep-level means (Holm-Bonferroni corrected, with rank-biserial effect
 size) to avoid pseudoreplication. Latency tables cover HTTP 200 requests only,
 each paired with an error-rate table.
 
+Every run-suite.sh run directory found under --results-dir is analyzed in turn, into
+its own folder under output/tables/ and output/figures/.
+
 Usage:
-    python3 analyze-results.py [--results-dir ../results] [--output-dir ./output]
+    python3 analyze-results.py [--results-dir ../results ...] [--output-dir ./output]
 """
 
 import argparse
@@ -30,8 +33,10 @@ from statsmodels.stats.multitest import multipletests
 
 ANALYSIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ANALYSIS_DIR, "lib"))
+import run_dirs  # noqa: E402
 import thermal  # noqa: E402
 import warmup_check  # noqa: E402
+from report import save_figure, save_table  # noqa: E402
 
 warmup_gate = warmup_check.gate
 
@@ -127,12 +132,14 @@ def check_cpu_pin_log(results_dir):
             if not line.startswith("cpu_pin_check"):
                 continue
             fields = kv(line)
-            if fields.get("result") == "WARN_SKIPPED":
+            # WARN_SKIPPED (cgroup unreadable) and WARN_SKIPPED_TIMEOUT (k6 read timed out)
+            # are checks the harness skipped, not mismatches.
+            if fields.get("result", "").startswith("WARN_SKIPPED"):
                 n_skipped += 1
                 continue
             for expected_key, live_key in pairs:
-                # An unreadable live cgroup cpuset is a check run-suite.sh skipped
-                # (result=WARN_SKIPPED), not a mismatch.
+                # An EMPTY or UNREADABLE live cpuset is a read the harness logged as skipped
+                # (the result=WARN_SKIPPED line that follows it), not a mismatch.
                 if live_key in CGROUP_LIVE_KEYS and fields.get(live_key) in ("EMPTY", "UNREADABLE"):
                     continue
                 if expected_key in fields and live_key in fields:
@@ -148,8 +155,8 @@ def check_cpu_pin_log(results_dir):
 
     if n_skipped:
         print(f"[cpu-pin] NOTE: {n_skipped} live cgroup cpuset check(s) were skipped by the harness "
-              f"(cgroup not readable, WARN_SKIPPED); live pinning is unverified there and only the "
-              f"requested cpuset is on record.")
+              f"(cgroup not readable or the k6 read timed out); live pinning is unverified there and "
+              f"only the requested cpuset is on record.")
     if smt_unverifiable:
         print(f"[cpu-pin] NOTE: {smt_unverifiable} SMT topology check(s) reported 'unverifiable' "
               f"(thread_siblings_list not exposed, common under WSL2). Physical-core isolation is "
@@ -846,74 +853,10 @@ def between_run_consistency(df, metric, phase, group_cols, label_fn):
     return pivot
 
 
-# Output helpers
-
-def _latex_text(text):
-    """Escapes the LaTeX specials a caption can contain, leaving already-escaped ones."""
-    return re.sub(r"(?<!\\)([%_&#])", r"\\\1", text)
-
-
-def save_table(df, name, output_dir, caption=None, label=None):
-    if df is None or df.empty:
-        print(f"[!] Skipping empty table: {name}")
-        return
-
-    tables_dir = os.path.join(output_dir, "tables")
-    os.makedirs(tables_dir, exist_ok=True)
-
-    csv_path = os.path.join(tables_dir, f"{name}.csv")
-    md_path = os.path.join(tables_dir, f"{name}.md")
-    tex_path = os.path.join(tables_dir, f"{name}.tex")
-
-    df.to_csv(csv_path, index=False)
-
-    with open(md_path, "w") as f:
-        f.write(df.to_markdown(index=False))
-
-    with open(tex_path, "w") as f:
-        f.write("\\begin{table}[t]\n\\centering\n")
-        # Caption precedes the tabular body so it renders above the table,
-        # matching Elsevier/JSS style.
-        if caption:
-            f.write(f"\\caption{{{_latex_text(caption)}}}\n")
-        if label:
-            f.write(f"\\label{{{label}}}\n")
-        f.write(df.to_latex(index=False, escape=True))
-        f.write("\\end{table}\n")
-
-    print(f"[+] Table  -> {csv_path} / .md / .tex")
-
-
-def save_figure(fig, name, output_dir):
-    figures_dir = os.path.join(output_dir, "figures")
-    os.makedirs(figures_dir, exist_ok=True)
-
-    png_path = os.path.join(figures_dir, f"{name}.png")
-    pdf_path = os.path.join(figures_dir, f"{name}.pdf")
-    fig.savefig(png_path, dpi=300, bbox_inches="tight")
-    fig.savefig(pdf_path, bbox_inches="tight")
-    plt.close(fig)
-
-    print(f"[+] Figure -> {png_path} / .pdf")
-
-
 # warm-up convergence (post-hoc steady-state check)
 
 # warmup_<pass>_rep<N>.json[.gz]; pass is baseline, scan or scan_maxvus.
 WARMUP_FILE_RE = re.compile(r"^warmup_(?P<pass>[a-z_]+?)_rep(?P<rep>\d+)\.json(?:\.gz)?$")
-
-
-def read_run_metadata(results_dir, name="run_metadata.json"):
-    """The run's own metadata, or {} when absent or unreadable."""
-    path = os.path.join(results_dir, name)
-    if not os.path.isfile(path):
-        return {}
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"[!] {name} could not be read ({e}); falling back to defaults where it is consulted.")
-        return {}
 
 
 def analyze_warmup(results_dir, output_dir, metadata=None):
@@ -1466,7 +1409,7 @@ def analyze_scan(df, output_dir, true_counts=None, metadata=None):
 
         stall = _stage_means("python_compute_stall_time_ms")
         ax.plot(x_labels, stall, marker="o", linestyle="--", linewidth=1.6, color="#c0392b",
-                label="GIL/Scheduling Stall (subset of Thread Dispatch, off-CPU)")
+                label="GIL/Scheduling Stall (off-CPU part of computation)")
 
         ax.set_xlabel("Concurrency (VUs)")
         ax.set_ylabel("Mean Latency (ms)")
@@ -1878,66 +1821,92 @@ def analyze_openloop_check(df, output_dir, true_counts=None):
     save_figure(fig, "figure7_openloop_validity_check", output_dir)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Analyze k6 results for the fraud-eval-harness testbed.")
-    parser.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR,
-                        help="Directory containing k6 JSON-lines output files (default: ../results).")
-    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR,
-                        help="Directory to write tables/ and figures/ into (default: ./output).")
-    args = parser.parse_args()
+def analyze_run(run, out):
+    """Every table and figure for one run directory. Returns False when the run is
+    rejected or holds nothing to analyze."""
+    results_dir = run.path
+    check_cpu_pin_log(results_dir)
 
-    print(f"[*] Loading results from {args.results_dir} ...")
-
-    check_cpu_pin_log(args.results_dir)
-
-    failures = parse_run_failures(args.results_dir)
+    failures = parse_run_failures(results_dir)
     if failures:
-        print(f"[!] {len(failures)} entries in run_failures_log.txt:")
+        print(f"[!] {len(failures)} entries in {os.path.join(results_dir, 'run_failures_log.txt')}:")
         for line in failures:
             print(f"    {line}")
-        print("[!] Exiting -- fix the cause and re-run the suite for a clean dataset.")
-        sys.exit(1)
+        print("[!] Run rejected -- fix the cause and re-run the suite for a clean dataset.")
+        return False
 
-    metadata = read_run_metadata(args.results_dir)
-    warmup_table = analyze_warmup(args.results_dir, args.output_dir, metadata)
+    metadata = run.metadata
+    warmup_table = analyze_warmup(results_dir, out, metadata)
 
     # Two passes, not one combined load: no analysis below needs baseline and
     # scan/openloop data at the same time, so only one of the two is ever resident.
     latency_parts = []
-    df1, true1 = load_results(args.results_dir, prefixes=("baseline_",))
+    df1, true1 = load_results(results_dir, prefixes=("baseline_",))
     df1_loaded = df1 is not None
     if df1 is None:
         print("[!] No baseline_* files found; skipping baseline analysis.")
     else:
         print(f"[*] Loaded {len(df1)} metric points (baseline) from {df1['source_file'].nunique()} file(s).")
-        analyze_baseline(df1, args.output_dir, true_counts=true1)
+        analyze_baseline(df1, out, true_counts=true1)
         latency_parts.append(cell_mean_latency(df1, "baseline"))
     del df1, true1
     gc.collect()
 
-    df2, true2 = load_results(args.results_dir, prefixes=("scan_", "openloop_"))
+    df2, true2 = load_results(results_dir, prefixes=("scan_", "openloop_"))
     df2_loaded = df2 is not None
     if df2 is None:
         print("[!] No scan_* files found; skipping concurrency-scan analysis.")
     else:
         print(f"[*] Loaded {len(df2)} metric points (scan+openloop) from {df2['source_file'].nunique()} file(s).")
-        analyze_scan(df2, args.output_dir, true_counts=true2, metadata=metadata)
-        analyze_openloop_check(df2, args.output_dir, true_counts=true2)
+        analyze_scan(df2, out, true_counts=true2, metadata=metadata)
+        analyze_openloop_check(df2, out, true_counts=true2)
         latency_parts.append(cell_mean_latency(df2, "scan"))
     del df2, true2
     gc.collect()
 
-    analyze_gc_logs(args.results_dir, args.output_dir)
-    analyze_thermal(args.results_dir, args.output_dir, metadata,
+    analyze_gc_logs(results_dir, out)
+    analyze_thermal(results_dir, out, metadata,
                     pd.concat(latency_parts, ignore_index=True) if latency_parts else None)
 
     if not df1_loaded and not df2_loaded and warmup_table is None:
-        print(f"[!] No warmup_*/baseline_*/scan_*/openloop_* files found in "
-              f"{args.results_dir} -- nothing was analyzed.")
+        print(f"[!] No warmup_*/baseline_*/scan_*/openloop_* files found in {results_dir} -- "
+              f"nothing was analyzed.")
+        return False
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Analyze k6 results for the fraud-eval-harness testbed.")
+    parser.add_argument("--results-dir", nargs="+", default=[DEFAULT_RESULTS_DIR],
+                        help="Run directories, or directories holding them (default: ../results).")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR,
+                        help="Root for tables/<run>/ and figures/<run>/ (default: ./output).")
+    args = parser.parse_args()
+
+    try:
+        runs = run_dirs.resolve(args.results_dir, "suite")
+    except ValueError as e:
+        print(f"[!] {e}")
+        sys.exit(1)
+    if not runs:
+        print(f"[!] No run-suite.sh run found in {' '.join(args.results_dir)}. "
+              f"Run load-testing/run-suite.sh first.")
         sys.exit(1)
 
-    print(f"\n[+] Done. Tables -> {os.path.join(args.output_dir, 'tables')}")
-    print(f"[+] Done. Figures -> {os.path.join(args.output_dir, 'figures')}")
+    outs = run_dirs.prepare_run_outputs(args.output_dir, "suite", runs)
+    rejected = []
+    for run in runs:
+        print(f"\n[*] === {run.name} ({run.path}) ===")
+        if not analyze_run(run, outs[run.name]):
+            rejected.append(run.name)
+        gc.collect()
+
+    print(f"\n[+] Analyzed {len(runs) - len(rejected)}/{len(runs)} run(s). "
+          f"Tables -> {os.path.join(args.output_dir, 'tables')}/<run>, "
+          f"figures -> {os.path.join(args.output_dir, 'figures')}/<run>")
+    if rejected:
+        print(f"[!] Not analyzed: {', '.join(rejected)}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
