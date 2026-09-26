@@ -12,8 +12,8 @@ class Settings:
 
     FRAUD_THRESHOLD = float(os.getenv("FRAUD_THRESHOLD", "0.50"))
 
-    # Ablation-only knob. Unset leaves anyio's own default thread-limiter capacity
-    # in place, so the main suite measures the stock configuration.
+    # docker-compose.yml sets this for every run (40, anyio's own default, unless the
+    # ablation overrides it). Unset leaves anyio's default capacity in place.
     _thread_limiter_env = os.getenv("THREAD_LIMITER_TOKENS", "").strip()
     THREAD_LIMITER_TOKENS = int(_thread_limiter_env) if _thread_limiter_env else None
 
