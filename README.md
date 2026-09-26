@@ -23,6 +23,7 @@ analysis/venv/bin/python3 analysis/analyze-results.py   # generate tables + figu
 - [Containerization & Hardware](#containerization--hardware)
 - [Running](#running)
 - [Outputs](#outputs)
+- [Cross-host comparison](#cross-host-comparison)
 - [Diagnostics](#diagnostics)
 - [Tests](#tests)
 - [Fault-injection guard verification](#fault-injection-guard-verification)
@@ -126,21 +127,22 @@ Each service runs in its own container, pinned to a disjoint CPU range, so they 
 - Host thermal state is recorded, not inferred. `env_trace_log.txt` carries the CPU governor, per-core frequency, highest thermal-zone temperature and the kernel's per-core thermal-throttle counters at both ends of every rep and of every measured cell, plus every thermal check with the time it paused for (`load-testing/lib/thermal.sh`). The analysis turns that into per-cell temperature and throttling, the wall-clock cost of thermal pauses, and a test of whether either tracks latency.
 - Valid feature-tier set is fetched from `fraud-ml-service`'s `/health` at startup, never hardcoded in Java. `run-suite.sh` re-verifies this per rep (`loadedTiers` matches expected, `nJobsVerified` all true) and aborts the suite if it does not.
 - JVM thread pins are verified against how the JVM itself resolved them. G1 as the collector and its worker-thread ceilings are read back via `-XX:+PrintFlagsFinal` (`load-testing/lib/jvm-pins.sh`), including each flag's *origin*, distinguishing a value that merely coincides with the pinned one through JVM ergonomics from a value the compose file actually set. The Reactor Netty event-loop count is a system property, invisible to that flag dump, so it is checked instead by a `/proc` thread census counting live GC and event-loop threads against their pinned ceilings. The flag-origin check runs at the start of every rep; the census runs after warm-up, once every event loop has served traffic. Either mismatch aborts the suite, same as a cpu-pin failure.
-- Host-level state that can shift measured latency without appearing in this project's own configuration (kernel `isolcpus`, AC vs. battery power, whether `irqbalance` is migrating interrupts across pinned cores) is sampled every rep (`load-testing/lib/host-provenance.sh`) and recorded in `run_metadata.json`. Warn-only by design: none of the three has one correct value for every host, so the harness records what it found rather than dictating a setting. Only conditions that invalidate a measurement outright (cpu-pin, tier, JVM-pin mismatches) abort the run.
+- Host-level state that can shift measured latency without appearing in this project's own configuration (kernel `isolcpus`, AC vs. battery power, whether `irqbalance` is migrating interrupts across pinned cores, and virtualization) is recorded in `run_metadata.json` at the start of every run (`load-testing/lib/host-provenance.sh`). Warn-only by design: none of the four has one correct value for every host, so the harness records what it found rather than dictating a setting. Only conditions that invalidate a measurement outright (cpu-pin, tier, JVM-pin mismatches) abort the run. The cross-host analysis gates on all four (see [Cross-host comparison](#cross-host-comparison)).
 - Outbound Java to Python connection pool is sized by the harness at 2x the run's peak VUS (`PYTHON_SERVICE_MAX_CONNECTIONS`), so it can never become the bottleneck being measured, and is logged at startup. A hand-started stack falls back to `128`.
 - A thermal guard samples every readable `thermal_zone*` after every cell and warm-up chunk. At or above `THERMAL_WARN_C` (90C) the run pauses for `THERMAL_COOLDOWN_S` (60s) and retries: `MAX_THERMAL_COOLDOWNS` (2) rounds are always given, and further rounds beyond that for as long as each one is still colder than the last, up to `THERMAL_MAX_COOLDOWNS_EXTENDED` (10) total. Still at or above `THERMAL_CRIT_C` (95C) once the pausing stops -- whether because a round failed to cool further or because the round cap was reached -- aborts the suite. Every check is logged with the time it paused for, so a long run's thermal cost is measured rather than absorbed into the numbers.
 - In-memory H2, clean slate every run.
 - Per-request logging is off on both services (Java: `TransactionService` at `WARN`; Python: `uvicorn --no-access-log`). A synchronous stdout write on the WebFlux event loop or the request coroutine would otherwise stall it, adding latency and throughput noise unrelated to inference.
-- JVM GC events are logged to `results/gc-logs/gc_<phase>_rep<N>.log`, one file per rep. The rep's pin-check probe JVMs share the container's `JAVA_TOOL_OPTIONS`, so the last of them reopens `gc.log` before warm-up; each archived log therefore spans that rep from its verification to the service JVM's exit, and the GC table measures that window by the records' wall-clock timestamps. This lets tail-latency spikes be cross-checked against GC pauses. Unified JVM logging has negligible overhead and does not sit on the request path.
+- JVM GC events are logged to `gc-logs/gc_<phase>_rep<N>.log` in the run directory, one file per rep. The rep's pin-check probe JVMs share the container's `JAVA_TOOL_OPTIONS`, so the last of them reopens `gc.log` before warm-up; each archived log therefore spans that rep from its verification to the service JVM's exit, and the GC table measures that window by the records' wall-clock timestamps. This lets tail-latency spikes be cross-checked against GC pauses. Unified JVM logging has negligible overhead and does not sit on the request path.
 </details>
 
 <details>
 <summary><b>Orchestration and analysis</b></summary>
 
-- `run-suite.sh`: full baseline plus concurrency-scan suite across clean-slate restarts, with per-repetition target and concurrency shuffling, CPU-pin verification, host and toolchain provenance fingerprinting, and a failures log. Any condition that invalidates a rep (k6 itself failing, an OOM kill, a pinning, tier or JVM-pin mismatch, a readiness timeout, a host still critically hot after its cooldowns) aborts the suite rather than being logged and skipped, and `analyze-results.py` rejects the whole dataset if that log has any entries. Request-level errors inside a cell (non-200 responses, timeouts) do not abort: they are counted per cell in the error tables, and every latency table covers HTTP 200 requests only.
+- `run-suite.sh`: full baseline plus concurrency-scan suite across clean-slate restarts, with per-repetition target and concurrency shuffling, CPU-pin verification, host and toolchain provenance fingerprinting, and a failures log. Any condition that invalidates a rep (k6 itself failing, an OOM kill, a pinning, tier or JVM-pin mismatch, a readiness timeout, a host still critically hot after its cooldowns) aborts the suite rather than being logged and skipped, and `analyze-results.py` rejects the run if that log has any entries. Request-level errors inside a cell (non-200 responses, timeouts) do not abort: they are counted per cell in the error tables, and every latency table covers HTTP 200 requests only.
 - `warm-up.js`: JIT and pool warm-up, hitting every target sequentially in its own window. `converge_warmup()` re-runs it in 15s chunks (`WARMUP_CHUNK_DURATION_S`) up to `MAX_WARMUP_CHUNKS` (4) times per restart, stopping as soon as every target's tail has settled (see [Experimental design rationale](#experimental-design-rationale)). Warm-up shares code with `run-target.js`, so warm-up traffic is tagged and classified identically to measured traffic.
 - `calibrate_scan_targets()`: once, before the scan reps, a stack prepared exactly like a scan rep (restart, pin checks, both warm-up passes) runs a measured pre-pass per target at `CALIB_VUS=16`, and `ITERATIONS_PER_VU` for each of `CALIB_AFFECTED_LEVELS` (8, 16, 32, 64) is derived from it so every cell spans about `CALIB_TARGET_DURATION_S` (60s) of wall clock. Every scan rep then runs those counts. Throughput differs by a large factor between targets, so a flat iteration count would make a trivial target's cell span seconds and an AI tier's span minutes. The pre-pass writes `calib_*.json.gz`, which the analysis ignores, and `calibration_log.txt`.
 - `analyze-results.py`: P50/P95/P99 tables and histograms per strategy and tier, Mann-Whitney U significance testing (Holm-Bonferroni corrected, rank-biserial effect sizes), cluster-level bootstrap CIs, reproducibility (CoV% across reps), paired error and timeout tables, client-contention diagnostics, warm-up convergence checks, within-cell drift, per-cell thermal state and throttling, throughput-vs-concurrency figures, and an optional open-loop-vs-closed-loop validity check (see [Running](#running)) when `openloop_*.json` files are present. Throughput is measured within each repetition and then averaged; a span pooled across repetitions would include the restarts and cooldowns between them.
+- `analyze-host-variance.py`, `analyze-ablation-host-variance.py`: compare runs from different hosts on ratios measured within each run, with an equivalence test per pair of runs, after checking that the runs' controlled environment matches (see [Cross-host comparison](#cross-host-comparison)).
 </details>
 
 ---
@@ -285,7 +287,7 @@ Resource limits (`mem_limit`/`mem_reservation`/`cpus`) use Compose's plain (non-
 ./setup.sh
 ```
 
-Neither service's Dockerfile sets a non-root `USER`, and the upstream `k6` image runs as its own fixed non-root UID. Without this step, `docker compose up` auto-creates `results/` and `results/gc-logs/` owned by root (or by a UID that is not yours), and later writes into them from the `k6` container fail outright. `setup.sh` writes a `.env` with your UID and GID (which `docker-compose.yml` picks up via `user: ${HOST_UID:-1000}:${HOST_GID:-1000}` on all three services), pre-creates `results/gc-logs/` so it is host-owned from the start, and creates `analysis/venv/` with `analysis/requirements.txt` installed into it (Ubuntu 24.04+ refuses a bare `pip install` against the system Python). Safe to re-run.
+Neither service's Dockerfile sets a non-root `USER`, and the upstream `k6` image runs as its own fixed non-root UID. Without this step, containers write their bind mounts as root (or as a UID that is not yours), and a hand-started `docker compose up` auto-creates `results/` and `results/gc-logs/` owned by root, so later writes from the `k6` container fail outright. `setup.sh` writes a `.env` with your UID and GID (which `docker-compose.yml` picks up via `user: ${HOST_UID:-1000}:${HOST_GID:-1000}` on all three services), pre-creates `results/gc-logs/`, the GC log mount of a hand-started stack, so it is host-owned from the start, and creates `analysis/venv/` with `analysis/requirements.txt` installed into it (Ubuntu 24.04+ refuses a bare `pip install` against the system Python). Safe to re-run.
 
 ### Smoke test (recommended before the full suite)
 
@@ -297,9 +299,11 @@ cd load-testing
 ./run-smoke-test.sh
 ```
 
-Check `run_failures_log.txt` and `cpu_pin_check_log.txt` afterward, and confirm the `[+] smoke-openloop:` line the script prints reports a nonzero `dropped_iterations` count. Table 7 will *not* show that cell: `analyze-results.py` excludes `phase=smoke-openloop` on purpose, and the script checks the raw file directly instead. Clean here means the pipeline is trustworthy, not that any given rep count is sufficient. Re-run the smoke test after any fix until it passes, then move to the full suite.
+Check `run_failures_log.txt` and `cpu_pin_check_log.txt` in the two run directories it names afterward, and confirm the `[+] smoke-openloop:` line the script prints reports a nonzero `dropped_iterations` count. Table 7 will *not* show that cell: `analyze-results.py` excludes `phase=smoke-openloop` on purpose, and the script checks the raw file directly instead. Clean here means the pipeline is trustworthy, not that any given rep count is sufficient. Re-run the smoke test after any fix until it passes, then move to the full suite.
 
 Table 0 is also expected to list every target as `fewer than three windows` on a smoke run: its convergence check needs three windows of at least 500 requests each, and the smoke slice sends about 20 per target.
+
+The smoke test's runs are ordinary runs: they supersede this machine's previous suite and ablation runs, which move to `results/archive/`, and its analysis step leaves `analysis/output/` holding the two smoke runs only.
 
 `run-suite.sh`'s `TARGETS`, `CONCURRENCY_LEVELS`, `REPS_BASELINE`, `REPS_SCAN`, `BASELINE_ITERATIONS`, and `SCAN_ITERATIONS_PER_VU` are all overridable via `TARGETS_OVERRIDE`, `CONCURRENCY_OVERRIDE`, `REPS_BASELINE_OVERRIDE`, `REPS_SCAN_OVERRIDE`, `BASELINE_ITERATIONS_OVERRIDE`, and `SCAN_ITERATIONS_PER_VU_OVERRIDE`. `run-ablation.sh` takes `ABLATION_CELLS_OVERRIDE`, `REPS_ABLATION_OVERRIDE`, `ABLATION_VUS_OVERRIDE`, `ABLATION_TARGET_OVERRIDE`, `ABLATION_CALIB_ITER_PER_VU_OVERRIDE` and `ABLATION_CALIB_TARGET_DURATION_S_OVERRIDE` (`ABLATION_ITERATIONS_PER_VU_OVERRIDE` also exists but only sets a metadata fallback; the measured cell's actual count always comes from calibration, so the two `ABLATION_CALIB_*_OVERRIDE` variables are what actually shrink an ablation slice). `run-smoke-test.sh` is a thin wrapper setting both to a small slice; unset, each script runs its full default design.
 
@@ -315,7 +319,7 @@ cd load-testing
 ../analysis/venv/bin/python3 ../analysis/analyze-results.py   # tables + figures
 ```
 
-Requires `APP_DB_SAVE_ENABLED=false` in `docker-compose.yml`.
+Requires `APP_DB_SAVE_ENABLED=false` in `docker-compose.yml`. Each invocation writes one run directory under `results/` (see [Outputs](#outputs)).
 
 Per repetition, `run-suite.sh` restarts the stack, runs the convergence-gated warm-up, then drives `run-target.js` per target and concurrency cell across `mock`, `calibration`, and the four AI tiers. A second max-VUS warm-up pass runs before each scan rep's cells, and every target is throughput-calibrated once, in its own pass before the scan reps. Defaults: 7 baseline reps, 7 scan reps, concurrency levels 1/2/4/8/16/32/64, 10s cooldown between cells.
 
@@ -338,11 +342,12 @@ It holds the workload fixed at `TARGET=28`, `VUS=64` and sweeps one mechanism at
 ```bash
 docker compose up                                    # waits for python health check
 k6 run load-testing/warm-up.js                       # JIT warm-up
-k6 run --out json=results/results.json your-test.js  # real load test
-analysis/venv/bin/python3 analysis/analyze-results.py   # tables + figures
+TARGET=28 VUS=8 PHASE=scan REP=1 ITERATIONS_PER_VU=100 \
+  k6 run --out json=results/manual/scan_28_vus8_rep1.json load-testing/run-target.js   # one cell
+analysis/venv/bin/python3 analysis/analyze-results.py --results-dir results/manual
 ```
 
-These commands invoke `k6` directly rather than through Docker, so they need a host-installed `k6` binary; `run-suite.sh` and `run-ablation.sh` run it in its own container instead and need no such install.
+These commands invoke `k6` directly rather than through Docker, so they need a host-installed `k6` binary; `run-suite.sh` and `run-ablation.sh` run it in its own container instead and need no such install. The analysis reads only files named as the harness names them (`baseline_*`, `scan_*`, `warmup_*`, `openloop_*`).
 
 `warm-up.js` reads `WARMUP_TARGETS` (default `mock calibration 5 10 20 28`), `WARMUP_VUS` (5), and `BASE_URL` (falls back to `http://localhost:8080/api/v1/transactions`). By default it uses a `constant-vus` executor bounded by `WARMUP_DURATION_S` (15). Setting `WARMUP_ITERATIONS_PER_TARGET` switches it to a fixed-count `per-vu-iterations` pass bounded by `WARMUP_MAX_DURATION_S` (60) instead, which is the path the smoke test takes; that variable also bypasses `converge_warmup()`'s chunked gate entirely, so do not set it when you want the adaptive warm-up.
 
@@ -354,18 +359,20 @@ The main suite's concurrency scan is closed-loop (see [Threats to validity](#thr
 docker compose up
 k6 run load-testing/warm-up.js
 TARGET=28 RATE=32 TIME_UNIT=1s DURATION=2m PRE_ALLOCATED_VUS=64 MAX_VUS=128 \
-  k6 run --out json=results/openloop_28_rate32.json load-testing/run-target-openloop.js
+  k6 run --out json=results/suite_<host>_<timestamp>/openloop_28_rate32.json load-testing/run-target-openloop.js
 ```
 
 `RATE` is requests per `TIME_UNIT`. Set it to roughly the throughput the closed-loop cell achieved at that VUS level, not the VUS count itself. `PRE_ALLOCATED_VUS` and `MAX_VUS` must be generous enough to sustain `RATE` if response times climb. k6 emits `dropped_iterations` when it cannot keep up, which is itself diagnostic: it means the server cannot sustain that arrival rate, a real finding rather than a script bug. This script is standalone and manual by design. It is not invoked by `run-suite.sh` and does not replace the main suite.
 
-Output filenames must start with `openloop` (for example `openloop_28_rate32.json`). `analyze-results.py` detects any such files in `--results-dir`, and if present adds `table7_openloop_validity_check` and `figure7_openloop_validity_check` comparing open-loop P95/P99 against the closed-loop scan at the top two scanned concurrency levels for the same tier. If no `openloop_*` files are present, this step is skipped silently and the rest of the analysis is unaffected. `run-smoke-test.sh`'s own `RATE=5000` overload cell (`phase=smoke-openloop`) is always excluded from this table, whether or not its file happens to still be sitting in `results/`. Table 7 is grouped by tier *and* `RATE`, so a real check at a sane rate is never pooled with a leftover overload cell from a different one.
+Output filenames must start with `openloop` (for example `openloop_28_rate32.json`) and go into the suite run directory being checked. `analyze-results.py` detects any such files in the run directory, and if present adds `table7_openloop_validity_check` and `figure7_openloop_validity_check` comparing open-loop P95/P99 against the closed-loop scan at the top two scanned concurrency levels for the same tier. If no `openloop_*` files are present, this step is skipped silently and the rest of the analysis is unaffected. `run-smoke-test.sh`'s own `RATE=5000` overload cell (`phase=smoke-openloop`) is always excluded from this table, whether or not its file happens to still be sitting in the run directory. Table 7 is grouped by tier *and* `RATE`, so a real check at a sane rate is never pooled with a leftover overload cell from a different one.
 
 ---
 
 ## Outputs
 
-`run-suite.sh` writes into `results/`:
+Each invocation of `run-suite.sh` or `run-ablation.sh` writes one run directory, `results/<kind>_<host>_<UTC timestamp>/`, where `<kind>` is `suite` or `ablation` and `<host>` is the hostname lowercased and reduced to `[a-z0-9.-]`. Starting a run moves this machine's previous run of the same kind to `results/archive/`; runs of the other kind, and run directories copied in from other machines, stay in place. A machine is its hostname plus a hash of its machine ID, so a copied run from another machine with the same hostname is not archived; give each host a distinct hostname anyway, since the hostname labels its runs in every table. Result files that the flat layout used before v1.2 left directly in `results/` move to `results/archive/<timestamp>/` (`<timestamp>_ablation/` for the ablation's) on the next run of their kind. Docker Compose receives the run directory as `RUN_RESULTS_DIR`; a hand-started stack writes to `results/` itself.
+
+`run-suite.sh` writes into `results/suite_<host>_<timestamp>/`:
 
 | File | Contents |
 |---|---|
@@ -375,17 +382,17 @@ Output filenames must start with `openloop` (for example `openloop_28_rate32.jso
 | `calib_<target>_vus16.json.gz`, `calib_warmup_scan*.json.gz` | The calibration pass's measurement per target and its warm-up; not read by the analysis |
 | `calibration_log.txt` | The iteration counts per concurrency level that every scan rep ran each target with |
 | `run_order_log.txt` | Shuffle order per repetition |
-| `run_metadata.json` | Timestamp, Docker/Compose versions and k6 image digest, git commit and dirty flag, CPU/RAM, CPU governor and frequency snapshot, host provenance (`isolcpus` live state and boot cmdline, AC/battery power source, `irqbalance` status) |
+| `run_metadata.json` | Run ID, timestamp, hostname and machine-ID hash, Docker/Compose versions and k6 image digest, git commit and dirty flag, measurement fingerprint (SHA-256 over the tracked files that shape a measurement: the compose file, both services and the load-testing harness, excluding tests, probes and model training), CPU/RAM, CPU governor and frequency snapshot, host provenance (`isolcpus` live state and boot cmdline, AC/battery power source, `irqbalance` status, virtualization as reported by `systemd-detect-virt`), each service's cpuset, CPU quota and physical cores, and the run configuration including uvicorn workers and thread-limiter tokens |
 | `cpu_pin_check_log.txt` | Per-repetition requested-vs-live cpuset, including the `smt_check` lines |
 | `env_trace_log.txt` | `env_sample` lines at both ends of every rep (governor, per-core frequency, temperature, throttle counters); `cell_start`/`cell_end` lines around every measured cell (temperature and the package and per-core thermal-throttle counters, `na` where the host does not expose them); and a `thermal_check` line for every safety check with the time it paused. Per-core values are `cpuN=value` pairs in core-index order, so each is attributable to a specific core |
-| `run_failures_log.txt` | Empty on a valid run; any entry makes `analyze-results.py` reject the dataset |
+| `run_failures_log.txt` | Empty on a valid run; any entry makes `analyze-results.py` reject the run |
 | `gc-logs/gc_<phase>_rep<N>.log` | JVM GC events for that rep, from its last pin-check probe to the service JVM's exit |
 
-`run-ablation.sh` writes the same shapes under `ablation_` prefixes: `ablation_<arm>_<value>_rep<N>.json.gz` plus `ablation_warmup_*`, `ablation_calib_*` (the calibration pass's measurement and warm-up per cell), `ablation_calibration_log.txt`, `ablation_run_order_log.txt`, `ablation_run_metadata.json` (including the control value of each arm), `ablation_cpu_pin_check_log.txt`, `ablation_env_trace_log.txt`, and `ablation_run_failures_log.txt`.
+`run-ablation.sh` writes the same shapes into `results/ablation_<host>_<timestamp>/` under `ablation_` prefixes: `ablation_<arm>_<value>_rep<N>.json.gz` plus `ablation_warmup_*`, `ablation_calib_*` (the calibration pass's measurement and warm-up per cell), `ablation_calibration_log.txt`, `ablation_run_order_log.txt`, `ablation_run_metadata.json` (the same host and toolchain fields as `run_metadata.json`, plus the control value of each arm), `ablation_cpu_pin_check_log.txt`, `ablation_env_trace_log.txt`, and `ablation_run_failures_log.txt`.
 
-k6 writes its full unfiltered trail to `results/raw/` first; `finalize_result()` keeps only the metrics the analysis reads (`KEEP_METRICS`, which includes `request_http_error` and `request_timeout_error` so `crosscheck_error_counters()`'s independent error-count check has data to run against, and `java_execution_time_ms` so the Java-side total stays recoverable), gzips the result into `results/`, and deletes the raw copy, so the stored file is a filtered subset of k6's output rather than the raw stream. The filter (`lib/k6_filter.py`) reads each line's metric name from k6's fixed JSON prefix and falls back to a full parse for any line not in that shape. And at the start of a run, the previous run's JSON and logs are moved into `results/archive/<timestamp>/` rather than deleted, so only the top level is cleared.
+k6 writes its full unfiltered trail to the run directory's `raw/` first; `finalize_result()` keeps only the metrics the analysis reads (`KEEP_METRICS`, which includes `request_http_error` and `request_timeout_error` so `crosscheck_error_counters()`'s independent error-count check has data to run against, and `java_execution_time_ms` so the Java-side total stays recoverable), gzips the result into the run directory, and deletes the raw copy, so the stored file is a filtered subset of k6's output rather than the raw stream. The filter (`lib/k6_filter.py`) reads each line's metric name from k6's fixed JSON prefix and falls back to a full parse for any line not in that shape. `raw/` is removed once the run completes.
 
-Analysis output lands in `analysis/output/tables/` and `analysis/output/figures/`, each table as `.csv`, `.md` and `.tex`:
+`analyze-results.py` and `analyze-ablation.py` analyze every run of their kind under `--results-dir` (default `results/`, excluding `archive/`); the option also takes one or more run directories. A pre-v1.2 `results/` holding result files directly is analyzed as one run. Each run's output lands in `analysis/output/tables/<run>/` and `analysis/output/figures/<run>/`, named as its run directory, each table as `.csv`, `.md` and `.tex`. Every invocation first removes all output folders of its kind, so `analysis/output/` holds exactly the runs last analyzed. A run with entries in its failures log is reported and skipped, and the script exits non-zero.
 
 | | |
 |---|---|
@@ -416,13 +423,48 @@ A mismatch aborts the whole suite immediately (`abort_suite`). No results are wr
 
 `run-suite.sh` also verifies python-service's feature-tier loading each rep via its own `/health` endpoint: the reported `loadedTiers` must match `5,10,20,28` (python-service loads every `FEATURE_TIERS` entry from `docker-compose.yml` on every start, regardless of which subset of targets this run exercises), `nJobsVerified` must be true for every tier, and the thread-limiter token count must match the pinned value. A silent tier-load failure would otherwise corrupt AI-tier cells without ever showing up as a request-level error. Same abort behavior as a cpu-pin mismatch.
 
-A cell whose k6 run fails, or whose containers were OOM-killed, aborts the suite the same way rather than logging it and continuing; `analyze-results.py` rejects the whole dataset if `run_failures_log.txt` has any entries, so there is no benefit to continuing past the first one. Request-level errors inside a cell that ran (non-200 responses, timeouts) are not a failure of the cell: tables 1c and 4c report them per cell, and the latency tables are computed on HTTP 200s only.
+A cell whose k6 run fails, or whose containers were OOM-killed, aborts the suite the same way rather than logging it and continuing; `analyze-results.py` rejects the run if `run_failures_log.txt` has any entries, so there is no benefit to continuing past the first one. Request-level errors inside a cell that ran (non-200 responses, timeouts) are not a failure of the cell: tables 1c and 4c report them per cell, and the latency tables are computed on HTTP 200s only.
+
+---
+
+## Cross-host comparison
+
+`analyze-host-variance.py` and `analyze-ablation-host-variance.py` compare runs of one kind recorded on different hosts. Copy each host's run directory into `results/`, or name the run directories on the command line:
+
+```bash
+cd analysis
+venv/bin/python3 analyze-host-variance.py              # every suite run under ../results
+venv/bin/python3 analyze-ablation-host-variance.py     # every ablation run under ../results
+venv/bin/python3 analyze-host-variance.py RUN_DIR RUN_DIR [--margin-pct 10] [--allow-env-mismatch]
+```
+
+Absolute latency and throughput scale with hardware, so they are reported as context and not tested. The compared metrics are ratios measured within each run, paired by repetition, since every cell a ratio compares was measured in the same rep:
+
+| Script | Compared metrics |
+|---|---|
+| `analyze-host-variance.py` | Each target's baseline latency relative to `calibration`; each pipeline stage's share of Python time per AI tier at VUS 1, and thread dispatch's share at the highest VUS; throughput relative to `calibration` at the highest VUS; P95 at the highest VUS relative to the lowest. Reported alongside: the lowest concurrency at which each target reaches 95% of its own peak throughput, and agreement between runs on the ordering of targets (Kendall's W, tie-corrected, with its chi-square test) |
+| `analyze-ablation-host-variance.py` | Per arm, thread-dispatch and total Python time at the value farthest from control relative to control, with whether every run's effect points the same way |
+
+Each run's ratio carries a 95% bootstrap CI over repetitions. Each pair of runs gets the percent difference of every ratio with 90% and 95% bootstrap CIs, and a verdict against a margin fixed in advance on the ratio of their values (`--margin-pct`, default 10%). The margin is symmetric on the log scale, -9.1% to +10% at the default, so the verdict does not depend on which run is the reference: `equivalent` when the 90% CI lies inside it (two one-sided tests at α = 0.05), `different` when it lies entirely outside, `inconclusive` otherwise, and `insufficient reps` below two repetitions. Percentile bootstrap intervals over seven repetitions are approximate, so a CI bound close to the margin is weak evidence either way.
+
+**Environment gate.** Runs are compared only when they match on every field the harness or the operator controls: measured code (`measurement_fingerprint`, or the git commit when a run predates the fingerprint), run configuration (including uvicorn workers and thread-limiter tokens), JVM pins, k6 image and digest, logical CPU count, CPU quota and physical core count per service, physical-core isolation status, `isolcpus` coverage of the pinned CPUs, `irqbalance`, power source, CPU governor, WSL2 and virtualization. CPU numbers are not compared, since the same isolation maps to different numbers on different topologies; the ablation's cpuset values are compared by CPU count. Hostname, machine-ID hash, CPU model, memory, kernel and Docker versions are reported and may differ. A mismatch prints both values and exits non-zero; `--allow-env-mismatch` compares anyway and names the differing fields in every caption. A field not recorded by every run is reported as unverified. Runs with entries in their failures log, or without a metadata file, are excluded. Runs sharing a hostname are labelled `<host>-<timestamp>`; runs from one machine are noted in every caption, since their comparison measures between-run rather than between-host variance.
+
+Output goes to `analysis/output/hostvariance/tables/` and `analysis/output/hostvariance/figures/`, each file named `<table>_<run labels>_<UTC date>` (`<N>runs` in place of the labels when they would make the name too long). Each invocation replaces that script's earlier files. Both scripts read one cell file at a time through the per-run scripts' own loaders, so sampling, status filtering and throughput match the per-run tables.
+
+| Suite | Ablation | Contents |
+|---|---|---|
+| `table_hv0_environment` | `table_ablation_hv0_environment` | Every gated and reported field per run, with its status |
+| `table_hv1_portable_metrics` | `table_ablation_hv1_effect_ratios` | Each ratio per run with its CI, the between-run CoV, the largest pairwise difference and the overall verdict |
+| `table_hv2_pairwise_differences` | `table_ablation_hv2_pairwise_differences` | Percent difference per pair of runs with 90% and 95% CIs and its verdict |
+| `table_hv3_saturation_points`, `table_hv4_order_concordance` | | Saturation concurrency per target; Kendall's W |
+| `table_hv5_host_context` | `table_ablation_hv3_host_context` | Absolute figures, rep-to-rep spread and throttled cells per run, with GC overhead (suite) or each arm's own Mann-Whitney test (ablation) |
+| `figure_hv1_normalized_throughput`, `figure_hv2_pairwise_differences` | `figure_ablation_hv1_effect_ratios`, `figure_ablation_hv2_pairwise_differences` | Throughput normalized to each run's own peak, or each run's effect ratio; pairwise differences against the margin |
 
 ---
 
 ## Diagnostics
 
-`load-testing/probing/` holds six standalone diagnostics, none wired into `run-suite.sh` or `run-ablation.sh`. They exist to re-derive the harness's tuning constants on a new host, which is what a reproducer needs to justify those constants rather than inherit them. `probe_warmup_joint.sh` and `probe_warmup_settle.sh` write their intermediates to `results/probes/` and clean up after themselves; `probe_ablation_taper.sh` and `calibrate_scan_iterations.sh` write straight into the main `results/` tree and leave their output there, so running either one leaves a `probe_ablation_*`/`calib_*` file behind. Each resolves the compose file at `../../docker-compose.yml`, so run them from inside `load-testing/probing/`.
+`load-testing/probing/` holds six standalone diagnostics, none wired into `run-suite.sh` or `run-ablation.sh`. They exist to re-derive the harness's tuning constants on a new host, which is what a reproducer needs to justify those constants rather than inherit them. `probe_warmup_joint.sh` and `probe_warmup_settle.sh` write their intermediates to `results/probes/` and clean up after themselves; `probe_ablation_taper.sh` and `calibrate_scan_iterations.sh` write straight into the main `results/` tree and leave their output there, so running either one leaves a `probe_ablation_*`/`calib_*` file behind. Each changes to its own directory first, so it runs from any working directory.
 
 | Script | Question it answers |
 |---|---|
@@ -433,7 +475,7 @@ A cell whose k6 run fails, or whose containers were OOM-killed, aborts the suite
 | `probe_ablation_taper.sh LABEL CPUSET CPUS WORKERS TOKENS [TARGET_DURATION_S]` | Does a given ablation arm's real processing capacity change what cell duration it needs? Checked per arm, because each arm changes python-service's throughput by design |
 | `probe_telemetry_completeness.sh [N_REQUESTS] [TARGET...]` | Is every telemetry field actually present on a live response, for every target? Checks build freshness against source mtimes first, then all eight `python_*` and two `java_*` fields per response |
 
-`analysis/probing/plot_warmup_curve.py` is a seventh diagnostic, for thermal investigation rather than warm-up tuning. It overlays rolling P50 latency against active VUs, package temperature and core frequency within a single result file (`.json` or `.json.gz`), so a throttle signature can be read against the load rather than inferred from temperature alone. It takes `--thermal-log` (a `sensors` poll) and/or `--turbostat-log`, and resolves `--results-dir` relative to its own location, so it runs from any directory. The active-VU line needs the `vus` metric, which the harness filters out of finalized files. `calibrate_scan_iterations.sh` writes with a bare `--out json=` rather than through the harness's filter, so its raw file is the one that still has it.
+`analysis/probing/plot_warmup_curve.py` is a seventh diagnostic, for thermal investigation rather than warm-up tuning. It overlays rolling P50 latency against active VUs, package temperature and core frequency within a single result file (`.json` or `.json.gz`), so a throttle signature can be read against the load rather than inferred from temperature alone. It takes `--thermal-log` (a `sensors` poll) and/or `--turbostat-log`, and `--results-dir` names a run directory. The active-VU line needs the `vus` metric, which the harness filters out of finalized files. `calibrate_scan_iterations.sh` writes with a bare `--out json=` rather than through the harness's filter, so its raw file is the one that still has it.
 
 ---
 
@@ -459,14 +501,15 @@ automatically on first `./mvnw test`, so there is nothing to pre-install there.
 cd services/fraud-ml-service
 .venv/bin/python3 -m pytest tests/ -q
 
-# Analysis pipeline and the harness's Python libraries (115 tests): cell-value
+# Analysis pipeline and the harness's Python libraries (163 tests): cell-value
 # parsing, throughput measurement, cluster bootstrap, effect size, GC log
 # parsing, k6 JSON loading, reservoir sampling and its non-200 exemption, true
 # request counts, extremes and throughput under subsampling, the warm-up gate
 # (lib/warmup_gate.py) and table 0, the k6 result filter (lib/k6_filter.py),
 # thermal telemetry and its tables, the ablation's outcome tally and planned
-# comparison, low-rep significance floor, open-loop cell identity, and the
-# silent-success-on-empty-input guards
+# comparison, low-rep significance floor, open-loop cell identity, the
+# silent-success-on-empty-input guards, run-directory discovery, and the
+# cross-host environment gate and statistics
 cd analysis
 venv/bin/python3 -m pytest tests/ -q
 
@@ -477,11 +520,11 @@ venv/bin/python3 -m pytest tests/ -q
 cd services/transaction-service
 ./mvnw test
 
-# Load-testing harness (90 tests, bats-core): CPU-topology expansion and
+# Load-testing harness (116 tests, bats-core): CPU-topology expansion and
 # formatting, SMT-sibling and cpuset-quota guards, JVM flag-origin parsing, the
 # helpers both harness scripts duplicate, the warm-up convergence gate, the
-# throughput calibration and its once-per-run pass, and the thermal guard and
-# telemetry
+# throughput calibration and its once-per-run pass, the thermal guard and
+# telemetry, and run directories, archiving and the measurement fingerprint
 cd load-testing
 bats tests/
 ```
@@ -503,6 +546,7 @@ What they guard, and why it matters for the results:
 | `test_warmup_convergence.bats` | The gate's window spans at least 3s of each target's own traffic, so a sub-second blip is not drift while a sustained shift still is; both bounds behave as documented; one lagging target, or an expected target with no data or no HTTP 200, blocks the chunk; the verdict after the last chunk is the one reported; and `run-ablation.sh`'s copy of the gate is identical to `run-suite.sh`'s |
 | `test_calibration.bats` | The per-target iteration derivation scales inversely with concurrency, clamps at one iteration per VU, fails loudly rather than carrying a previous target's counts forward when a calibration yields nothing, and matches `analyze-results.py`'s own `(N-1)/span` throughput convention in both scripts; the calibration pass prepares the stack like a rep, measures each target or cell once, and every rep reads back those counts |
 | `test_thermal.bats` | Temperature and throttle counters are read from the hottest zone and in core order, `na` rather than zero where the host exposes nothing; the safety check pauses, logs the pause, and aborts only when still critical after its cooldowns; neither harness script runs against a synthetic sysfs tree |
+| `test_run_layout.bats` | Run directories are named per kind and host, a new run archives only the same host's earlier run of its kind, the flat-layout sweep takes only its own kind's files, `RESULTS_DIR_OVERRIDE` archives nothing, and the measurement fingerprint changes with measured code but not with tests, docs or commit state |
 | `test_harness_libs.py` | `lib/warmup_gate.py` orders Go-trimmed timestamps numerically, sizes the window by time, reports every status, and takes true medians; `lib/k6_filter.py`'s fast path keeps exactly the lines a full JSON parse would |
 | `test_analysis.py` table 0 tests | Table 0 judges each warm-up file with the live gate at the run's recorded parameters and keeps a row for every expected target, including ones that never converged, in both analysis scripts |
 | `test_analysis.py` reservoir-sampling tests | Non-200 `http_req_duration` points are retained in full regardless of file size, so the error-count cross-check is never degraded by random subsampling; a truncated gzip keeps what decompressed |
@@ -512,6 +556,7 @@ What they guard, and why it matters for the results:
 | `test_analysis.py` significance-floor test | `pairwise_mannwhitney` emits a `[!]` when the rep count makes even perfect separation unable to clear alpha, so "Significant: No" at low N is never misread as a null result |
 | `test_analysis.py` open-loop cell-identity test | A cell with zero 200 responses (total overload) still gets a table 7 row with its `dropped_iterations` count, instead of vanishing because cell identity was built from 200-only data |
 | `test_analysis.py` silent-success guard tests | `crosscheck_error_counters`, `analyze_measurement_floor` and `analyze_gc_logs` each emit a `[!]`/warning on empty or unmeasurable input instead of returning as if the check had passed |
+| `test_host_variance.py` | Runs are found per kind and never in `archive/`; each run's outputs go to its own folder and a rejected run fails the invocation; the environment gate compares core counts and isolation rather than CPU numbers and stops on any gated difference; a uniformly slower host reads as equivalent, while a target or ablation effect that scales differently reads as different |
 
 ---
 
@@ -571,7 +616,6 @@ are covered by the unit tests above instead.
 - **`permission denied` writing to `/results/*.json` or `/gc-logs/*` from inside a container.** Means `./setup.sh` was not run, or its `.env` predates a fresh clone. Neither service's Dockerfile sets a non-root `USER`, and `grafana/k6` runs as its own fixed non-root UID either way, so without `HOST_UID`/`HOST_GID` in `.env` the bind-mounted directories end up owned by root or the wrong UID. Run `./setup.sh`, confirm `.env` exists and matches `id -u`/`id -g`, then retry. If `results/` was already created root-owned before `setup.sh` ever ran, `sudo chown -R $(id -u):$(id -g) results/` once to reclaim it.
 - **`./setup.sh` or `./run-suite.sh` fails with `Permission denied` before even starting.** The executable bit did not survive however you got the repo onto this machine. A plain `git clone` carries it, but GitHub's "Download ZIP" button does not, and some Windows-side file transfers strip it too. Fix once: `chmod +x setup.sh load-testing/*.sh load-testing/probing/*.sh fault-injection/*.sh`.
 - **`Conflict. The container name "/..." is already in use`** on `docker compose up`. Leftover stopped containers from an earlier interrupted run, or from a *different clone or directory* of this same repo, since `container_name` in `docker-compose.yml` is fixed (`python`/`java`) rather than project-scoped, are holding the name. `docker rm -f python java`, then retry.
-- **A probe script fails with `open .../load-testing/docker-compose.yml: no such file or directory`.** The probes live one directory below `load-testing/` and resolve the compose file at `../../docker-compose.yml`. Run them from inside `load-testing/probing/`.
 - **The suite pauses for a minute or more mid-run, or aborts with a `[thermal]` message.** The thermal guard found a zone at or above 90C after a cell or warm-up chunk and is cooling down; it keeps extending the pause in 60s rounds for as long as each one is actually colder than the last, up to a hard cap, and aborts rather than record throttled numbers if it's still at or above 95C once the pausing stops for either reason. On a laptop this is the common cause of a long run stopping on its own. `env_trace_log.txt` has the temperature and throttle counters around every cell and every pause, and table 8b totals the time paused per phase.
 - **`error: externally-managed-environment` from `pip install`.** Ubuntu 24.04+ (PEP 668) refuses a bare `pip install` against the system Python. This is what `./setup.sh` exists to avoid: it builds `analysis/venv` and installs `analysis/requirements.txt` into that instead. Use `analysis/venv/bin/python3` or its `pip` for anything analysis-related rather than the bare `python3`/`pip3` on `PATH`.
 - **`pip install` fails building from source inside `analysis/venv`.** Usually means no prebuilt wheel exists for your Python version at these floors, which is more likely on very new or very old CPython. `analysis/venv/bin/pip install --upgrade pip` first often surfaces a compatible wheel; if it still falls back to a source build and fails, installing without version constraints (`analysis/venv/bin/pip install pandas numpy matplotlib scipy tabulate statsmodels jinja2`) is a safe fallback, since the analysis phase is not sensitive to exact versions of these.
@@ -614,8 +658,8 @@ are covered by the unit tests above instead.
 - **Pinning assumes a native Linux Docker host.** On Docker Desktop (macOS or Windows), `cpuset` inside the VM has no fixed relationship to physical cores.
 - **WSL2 specifically: `verify_cpu_pinning()` can pass while pinning is not real.** cgroup `cpuset` is honored inside the WSL2 VM so the requested-vs-live check reports OK, but the Hyper-V host scheduler can still migrate the underlying virtual CPUs across physical cores, and no in-VM check can observe that. `thread_siblings_list` is often not exposed there either, in which case the SMT check reports `unverifiable` rather than passing. `wsl2_detected` and `physical_core_isolation` are recorded in `run_metadata.json` so any affected snapshot is traceable. **This is disclosure, not mitigation; a native-Linux run is the stronger dataset.** Treat concurrency-scan tail claims (E2) as more exposed than the baseline decomposition (E1), since migration risk scales with scheduling pressure.
 - **CPU governor and per-core frequency are sampled at both ends of every rep** to `env_trace_log.txt`. Set the governor to `performance` before a run (`sudo cpupower frequency-set -g performance`); `cpu_governor_at_start` in `run_metadata.json` records what was actually in effect.
-- **Thermal state is measured per cell, and guarded.** Temperature and the kernel's thermal-throttle counters are recorded at both edges of every measured cell, so table 8a (and its ablation counterpart) shows whether any service's cores were throttled during a cell, table 8b what the thermal pauses cost, and table 8c whether temperature or throttling tracks a cell's latency within its design cell. Throttling is measured where the host exposes Intel's `thermal_throttle` counters (Linux 5.18+) and reported as `not exposed` elsewhere, never as zero. The guard also pauses the run at 90C and aborts at 95C after two cooldowns, so a heat-soaked laptop stops rather than contributing cells it cannot cool. Randomized target, concurrency and cell order keeps residual heat from aligning with any one condition.
-- **`isolcpus`, AC/battery power, and `irqbalance` are recorded but not enforced.** All three can shift measured latency without appearing anywhere in this project's own configuration, so `host-provenance.sh` samples them into `run_metadata.json` every rep. This is disclosure rather than a guarantee: a run on battery power or with `irqbalance` active is not blocked, so check `run_metadata.json` before treating two runs as comparable.
+- **Thermal state is measured per cell, and guarded.** Temperature and the kernel's thermal-throttle counters are recorded at both edges of every measured cell, so table 8a (and its ablation counterpart) shows whether any service's cores were throttled during a cell, table 8b what the thermal pauses cost, and table 8c whether temperature or throttling tracks a cell's latency within its design cell. Throttling is measured where the host exposes Intel's `thermal_throttle` counters (Linux 5.18+) and reported as `not exposed` elsewhere, never as zero. The guard also pauses the run at 90C and aborts at 95C once further cooldowns stop lowering the temperature, so a heat-soaked laptop stops rather than contributing cells it cannot cool. Randomized target, concurrency and cell order keeps residual heat from aligning with any one condition.
+- **`isolcpus`, AC/battery power, `irqbalance` and virtualization are recorded but not enforced.** All four can shift measured latency without appearing anywhere in this project's own configuration, so `host-provenance.sh` records them in `run_metadata.json` at the start of every run. This is disclosure rather than a guarantee: a run on battery power or with `irqbalance` active is not blocked. The cross-host analysis gates on all four, `isolcpus` by its coverage of the pinned CPUs.
 - **GC pause overhead is measured, not eliminated.** `table_gc_overhead` reports per-rep GC pause time as a percentage of wall clock. A rep above about 1%, or with a single pause near the P99, is a candidate confound for that rep's tail rather than inference cost.
 - **k6 is pinned to its own cpuset and capped at 4 CPUs.** That stops direct cgroup-level contention with the services under test, but does not isolate any of the three from the Docker daemon or the rest of the host OS, which remain unpinned. `http_req_blocked` (tables 1d and 4d) is a partial diagnostic only; it cannot independently prove k6 never became the bottleneck at high concurrency.
 - **The Java outbound connection pool is sized at 2x the run's peak VUS** by both harness scripts, so pool queueing cannot masquerade as network or Python cost. A hand-started stack falls back to the 128 default.
@@ -628,9 +672,10 @@ are covered by the unit tests above instead.
 - **Synthetic, uniformly-random feature vectors.** The licensed dataset cannot be bundled, so `randomFeatures()` draws in a roughly PCA-shaped range. Two things bound the exposure: booster traversal is structure-dominated (measured flat at 0.04 to 0.05 ms across all four tiers, against a depth-4, 100-tree model), and the term that actually dominates `modelInferenceTimeMs`, the DataFrame to `DMatrix` conversion, is a dtype-and-shape operation independent of the values. The feature distribution therefore has little influence on the measured cost, though the models were trained on real data and their tree structure reflects it.
 - **Reduced feature space even at the largest tier.** `V1..V28` plus `Amount` is the full PCA set available, but the source dataset is itself a reduced anonymized representation.
 - **Core pinning is host-specific.** Results are not comparable across different core counts or SMT settings without re-picking `cpuset` values, and the SMT check will abort rather than silently produce incomparable numbers.
+- **Absolute figures describe one host.** Latency and throughput scale with hardware, so the cross-host analysis tests only within-run ratios for agreement. Agreement across a few hosts bounds, but does not establish, how far a ratio generalizes.
 - **Concurrency-scan P99s are not uniformly powered.** Cells at VUS 8 and above are calibrated to a fixed wall-clock duration rather than a fixed sample count, so total N varies by target; VUS 1, 2 and 4 use the flat `SCAN_ITERATIONS_PER_VU` instead. P99 confidence intervals therefore differ in width across a row. Do not read a row of per-concurrency P99s as equally precise; the achieved N is printed alongside every result.
 - **Mock and calibration are latency baselines only**, never real fraud checks. `--synthetic` training data is a smoke test, not a benchmark source.
-- **In-memory H2** is wiped on restart, and the top-level log files reflect the last run only. `run_metadata.json`, `run_order_log.txt`, `run_failures_log.txt`, `cpu_pin_check_log.txt` and `env_trace_log.txt` (and their `ablation_`-prefixed counterparts) are written fresh each run, with the previous run's copies moved into `results/archive/<timestamp>/`.
+- **In-memory H2** is wiped on restart. `run_metadata.json`, `run_order_log.txt`, `run_failures_log.txt`, `cpu_pin_check_log.txt` and `env_trace_log.txt` (and their `ablation_`-prefixed counterparts) belong to their run directory; a host's previous run of the same kind moves to `results/archive/`.
 
 ---
 
@@ -642,14 +687,20 @@ are covered by the unit tests above instead.
 ├── setup.sh                       # once per machine: .env (HOST_UID/GID), results/gc-logs/, analysis/venv
 ├── install-test-deps.sh           # once per machine: every *test* toolchain below, in one pass
 ├── analysis/
-│   ├── analyze-results.py        # tables, figures, significance tests
-│   ├── analyze-ablation.py       # thread-dispatch mechanism sweep
+│   ├── analyze-results.py        # tables, figures, significance tests, per suite run
+│   ├── analyze-ablation.py       # thread-dispatch mechanism sweep, per ablation run
+│   ├── analyze-host-variance.py            # suite runs compared across hosts
+│   ├── analyze-ablation-host-variance.py   # ablation runs compared across hosts
 │   ├── lib/
 │   │   ├── warmup_check.py       # table 0 for both scripts, judged by load-testing/lib/warmup_gate.py
-│   │   └── thermal.py            # per-cell thermal state, pauses, thermal-latency association
+│   │   ├── thermal.py            # per-cell thermal state, pauses, thermal-latency association
+│   │   ├── run_dirs.py           # run-directory discovery and identity, output folders
+│   │   ├── report.py             # table (.csv/.md/.tex) and figure (.png/.pdf) writers
+│   │   └── hostvariance.py       # environment gate and cross-run statistics
 │   ├── probing/
 │   │   └── plot_warmup_curve.py  # thermal diagnostic: latency vs VUs, temp and core frequency
-│   ├── tests/                    # pytest (115): analysis pipeline, warm-up gate, k6 filter, thermal
+│   ├── output/                   # generated: tables/<run>/, figures/<run>/, hostvariance/{tables,figures}/
+│   ├── tests/                    # pytest (163): analysis pipeline, warm-up gate, k6 filter, thermal, host variance
 │   ├── requirements.txt
 │   └── requirements-dev.txt      # test-only: pytest, kept off analyze-*.py's real runtime deps
 ├── load-testing/
@@ -664,7 +715,8 @@ are covered by the unit tests above instead.
 │   │   ├── common.js             # shared sendTransaction()/TARGETS + telemetry Trends
 │   │   ├── topology.sh           # cpuset to physical-core resolution; SMT-overlap/cpuset-quota guards
 │   │   ├── jvm-pins.sh           # verifies G1/thread-pool ceilings against the JVM's own flag origin
-│   │   ├── host-provenance.sh    # isolcpus/power-source/irqbalance sampling for run_metadata.json
+│   │   ├── host-provenance.sh    # isolcpus/power-source/irqbalance/virtualization sampling for run_metadata.json
+│   │   ├── run-layout.sh         # per-run results directory, archiving, measurement fingerprint
 │   │   ├── thermal.sh            # thermal guard, per-cell temperature and throttle telemetry
 │   │   ├── warmup_gate.py        # warm-up convergence criterion shared by the gate, probes and table 0
 │   │   └── k6_filter.py          # keeps the metrics the analysis reads and gzips each result
@@ -675,15 +727,15 @@ are covered by the unit tests above instead.
 │   │   ├── probe_calibration_drift.sh    # checks calibrated throughput actually holds across reps
 │   │   ├── probe_ablation_taper.sh       # per-arm cell-duration check
 │   │   └── probe_telemetry_completeness.sh  # per-target telemetry field presence, build-freshness check
-│   └── tests/                    # bats-core (90): topology, JVM pins, shared helpers, warm-up gate, calibration, thermal
+│   └── tests/                    # bats-core (116): topology, JVM pins, shared helpers, warm-up gate, calibration, thermal, run layout
 ├── fault-injection/
 │   ├── verify-guards.sh          # runs each case, records whether the expected guard fired
 │   ├── cases/*.case              # 9 cases: 00 unmodified as control, 01-08 each misconfigure one pinned setting
 │   └── results/guard_verification_report.{md,csv}
-├── results/                       # generated: *.json.gz, run_metadata.json, logs (gitignored except .gitkeep)
-│   ├── raw/                       # k6's unfiltered output, deleted per cell after filtering
-│   ├── archive/<timestamp>/       # previous run's files, moved aside at the start of a new run
-│   └── gc-logs/                   # generated: gc_<phase>_rep{N}.log per repetition
+├── results/                       # generated, gitignored except .gitkeep
+│   ├── suite_<host>_<timestamp>/  # one run-suite.sh run: *.json.gz, run_metadata.json, logs, gc-logs/
+│   ├── ablation_<host>_<timestamp>/  # one run-ablation.sh run: ablation_* files
+│   └── archive/                   # superseded runs of the same kind and host
 └── services/
     ├── fraud-ml-service/            # Python FastAPI inference service
     │   ├── app/
