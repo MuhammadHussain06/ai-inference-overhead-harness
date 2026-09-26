@@ -36,7 +36,7 @@ services:
     transaction-service:
         build: ./services/transaction-service
         container_name: java
-        # Same reason as python-service, for results/gc-logs/.
+        # Same reason as python-service, for the GC log directory mounted below.
         user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
         ports:
             - "8080:8080"
@@ -53,8 +53,9 @@ services:
             # CPU/memory detection and is not guaranteed to resolve identically across hosts
             # or JDK builds. Values match this container's own cpus: 4.0 / 4-core cpuset.
             - JAVA_TOOL_OPTIONS=-Xms1536m -Xmx1536m -XX:+UseG1GC -XX:ParallelGCThreads=4 -XX:ConcGCThreads=1 -Dreactor.netty.ioWorkerCount=4 -Xlog:gc*:file=/gc-logs/gc.log:time,uptime,level,tags:filecount=0
+        # RUN_RESULTS_DIR is the harness's per-run directory; a hand-started stack uses ./results.
         volumes:
-            - ./results/gc-logs:/gc-logs
+            - ${RUN_RESULTS_DIR:-./results}/gc-logs:/gc-logs
         depends_on:
             python-service:
                 condition: service_healthy
@@ -85,7 +86,7 @@ services:
         user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
         volumes:
             - ./load-testing:/scripts
-            - ./results:/results
+            - ${RUN_RESULTS_DIR:-./results}:/results
         environment:
             - BASE_URL=http://java:8080/api/v1/transactions
         # Physical cores 5, 7 (CPUs 10-11, 14-15) -- disjoint from both services.

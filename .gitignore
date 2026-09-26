@@ -8,18 +8,15 @@ services/fraud-ml-service/training/data/
 analysis/**/__pycache__/
 analysis/venv/
 
-# Benchmark raw output -- keep dirs via .gitkeep, ignore their contents.
+# Benchmark output: one directory per run, plus archive/ -- keep results/ via .gitkeep.
 results/*
 !results/.gitkeep
-!results/gc-logs/
-results/gc-logs/*
-!results/gc-logs/.gitkeep
 
 # Analysis output
 analysis/output/
 
 # Fault-injection working copies of the compose configuration and per-case run logs.
-# guard_verification_report.{m  d,csv} is host- and run-specific regenerable evidence
+# guard_verification_report.{md,csv} is host- and run-specific regenerable evidence
 # (see README's fault-injection section), not something this repo carries a
 # checked-in copy of -- same convention as the main suite's results/ above.
 fault-injection/scratch/

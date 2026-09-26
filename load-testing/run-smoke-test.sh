@@ -7,6 +7,16 @@ set -euo pipefail
 # to end before committing to the full multi-day suite.
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+. lib/run-layout.sh
+HOST_LABEL=$(run_host_label)
+
+# Each harness script archives this host's earlier runs of its kind at start, so the one
+# match left afterwards is the run it just made.
+latest_run_dir() {
+  local dirs=(../results/"${1}_${HOST_LABEL}"_*)
+  [ -d "${dirs[-1]}" ] || { echo "[!] No ${1} run directory for host ${HOST_LABEL} under ../results." >&2; exit 1; }
+  printf '%s' "${dirs[-1]}"
+}
 
 echo "[*] Smoke test 1/4: main suite -- calibration + tier 28, VUS 1 & 32, 2 reps"
 TARGETS_OVERRIDE="calibration 28" \
@@ -17,10 +27,12 @@ BASELINE_ITERATIONS_OVERRIDE=20 \
 SCAN_ITERATIONS_PER_VU_OVERRIDE=10 \
 WARMUP_ITERATIONS_PER_TARGET_OVERRIDE=20 \
 ./run-suite.sh
+SUITE_DIR=$(latest_run_dir suite)
 
 echo "[*] Smoke test 2/4: deliberate over-rate open-loop check (expect dropped_iterations > 0)"
-# Runs in a container to mirror run-suite.sh's k6_run() without a host k6 install.
-docker compose -f ../docker-compose.yml --profile loadgen run --rm -T \
+# Runs in a container to mirror run-suite.sh's k6_run() without a host k6 install, writing
+# into the suite's run directory the way a real open-loop check does.
+RUN_RESULTS_DIR=$(cd "$SUITE_DIR" && pwd) docker compose -f ../docker-compose.yml --profile loadgen run --rm -T \
   -e TARGET=28 -e RATE=5000 -e TIME_UNIT=1s -e DURATION=20s \
   -e PRE_ALLOCATED_VUS=32 -e MAX_VUS=64 -e PHASE=smoke-openloop -e REP=1 \
   k6 run /scripts/run-target-openloop.js --out json=/results/openloop_28_smoke.json
@@ -30,7 +42,7 @@ docker compose -f ../docker-compose.yml --profile loadgen run --rm -T \
 SMOKE_DROPPED=$(python3 -c "
 import json
 n = 0
-with open('../results/openloop_28_smoke.json') as f:
+with open('${SUITE_DIR}/openloop_28_smoke.json') as f:
     for line in f:
         line = line.strip()
         if not line:
@@ -50,8 +62,8 @@ else
 fi
 
 # table7's phase-based exclusion is defense in depth; the raw file itself still has no
-# business outliving this script in ../results/.
-rm -f ../results/openloop_28_smoke.json
+# business outliving this script in the run directory.
+rm -f "${SUITE_DIR}/openloop_28_smoke.json"
 
 echo "[*] Smoke test 3/4: ablation slice -- exercises the cpuset arm's multi-range values"
 # The cpuset arm is the one whose cell values are cpuset strings rather than integers,
@@ -63,16 +75,17 @@ WARMUP_ITERATIONS_PER_TARGET_OVERRIDE=20 \
 ABLATION_CALIB_ITER_PER_VU_OVERRIDE=20 \
 ABLATION_CALIB_TARGET_DURATION_S_OVERRIDE=5 \
 ./run-ablation.sh
+ABLATION_DIR=$(latest_run_dir ablation)
 
-echo "[*] Smoke test 4/4: both analysis scripts"
+echo "[*] Smoke test 4/4: both analysis scripts, on this smoke test's two runs only"
 # Same venv setup.sh builds (PEP 668 blocks a bare pip install/system python3 here).
-../analysis/venv/bin/python3 ../analysis/analyze-results.py
-../analysis/venv/bin/python3 ../analysis/analyze-ablation.py
+../analysis/venv/bin/python3 ../analysis/analyze-results.py --results-dir "$SUITE_DIR"
+../analysis/venv/bin/python3 ../analysis/analyze-ablation.py --results-dir "$ABLATION_DIR"
 
-echo "[+] Smoke test complete. Before trusting this run, check:"
-echo "    ../results/run_failures_log.txt and ../results/ablation_run_failures_log.txt (both empty)"
-echo "    ../results/cpu_pin_check_log.txt and ../results/ablation_cpu_pin_check_log.txt, incl. the smt_check lines"
-echo "    ../results/env_trace_log.txt and ../results/ablation_env_trace_log.txt (cell_start/cell_end and"
+echo "[+] Smoke test complete. Before trusting this run, check, in ${SUITE_DIR} and ${ABLATION_DIR}:"
+echo "    run_failures_log.txt and ablation_run_failures_log.txt (both empty)"
+echo "    cpu_pin_check_log.txt and ablation_cpu_pin_check_log.txt, incl. the smt_check lines"
+echo "    env_trace_log.txt and ablation_env_trace_log.txt (cell_start/cell_end and"
 echo "    thermal_check lines for every cell), and both *calibration_log.txt files"
 echo "    the [+]/[!] smoke-openloop line printed above (dropped_iterations at RATE=5000);"
 echo "    table7 itself will not show this cell -- it excludes phase=smoke-openloop on purpose"

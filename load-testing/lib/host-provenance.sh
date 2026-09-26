@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Host-state provenance for run_metadata.json: kernel CPU isolation, power source, and
-# IRQ balancing. All three shift measured latency without appearing anywhere in the
-# harness's own configuration, so without them two runs look comparable when they are not.
+# Host-state provenance for run_metadata.json: kernel CPU isolation, power source, IRQ
+# balancing and virtualization. All four shift measured latency without appearing anywhere
+# in the harness's own configuration, so without them two runs look comparable when they
+# are not.
 #
 # Recorded, never enforced: each setting has a defensible value either way on a given
 # host, so the operator decides. Only conditions that invalidate a measurement outright
@@ -58,7 +59,18 @@ irqbalance_state() {
   printf 'not_present'
 }
 
-# Emits the three states as a JSON object for embedding in run metadata. Values are
+# Hypervisor or container technology the host runs under, "none" on bare metal. Inside a
+# VM the cpusets bind virtual CPUs, whose placement on physical cores the guest cannot
+# observe, so pinning is verified only up to the hypervisor.
+virtualization_state() {
+  local v=""
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    v=$(systemd-detect-virt 2>/dev/null || true)
+  fi
+  printf '%s' "${v:-unknown}"
+}
+
+# Emits the four states as a JSON object for embedding in run metadata. Values are
 # drawn from a fixed vocabulary or are kernel CPU lists, so none require escaping.
 host_provenance_json() {
   local iso live cmdline
@@ -70,7 +82,8 @@ host_provenance_json() {
     "isolcpus_live": "${live}",
     "isolcpus_cmdline": "${cmdline}",
     "power_source": "$(power_source_state)",
-    "irqbalance": "$(irqbalance_state)"
+    "irqbalance": "$(irqbalance_state)",
+    "virtualization": "$(virtualization_state)"
   }
 EOF
 }
@@ -79,6 +92,6 @@ EOF
 host_provenance_line() {
   local iso
   iso=$(isolcpus_state)
-  printf 'isolcpus=%s power=%s irqbalance=%s' \
-    "${iso%%|*}" "$(power_source_state)" "$(irqbalance_state)"
+  printf 'isolcpus=%s power=%s irqbalance=%s virtualization=%s' \
+    "${iso%%|*}" "$(power_source_state)" "$(irqbalance_state)" "$(virtualization_state)"
 }

@@ -14,6 +14,10 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 
+# render_compose() repoints mounts that resolve to the repo's own results/; an inherited
+# per-run directory would resolve elsewhere and escape that rewrite.
+unset RUN_RESULTS_DIR
+
 for _req_cmd in docker python3 timeout; do
   if ! command -v "$_req_cmd" >/dev/null 2>&1; then
     echo "[!] Required command not found: ${_req_cmd}." >&2

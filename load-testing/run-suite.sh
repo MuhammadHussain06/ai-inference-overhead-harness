@@ -23,7 +23,7 @@ for _req_cmd in docker curl shuf python3; do
 done
 
 for _req_lib in lib/host-provenance.sh lib/jvm-pins.sh lib/topology.sh lib/thermal.sh \
-  lib/warmup_gate.py lib/k6_filter.py; do
+  lib/run-layout.sh lib/warmup_gate.py lib/k6_filter.py; do
   if [ ! -r "$_req_lib" ]; then
     echo "[!] Required helper not found: ${_req_lib}. Aborting before touching any containers." >&2
     exit 1
@@ -31,12 +31,13 @@ for _req_lib in lib/host-provenance.sh lib/jvm-pins.sh lib/topology.sh lib/therm
 done
 
 # Host-state provenance for run_metadata.json, the JVM collector/thread-pool guards, the
-# topology checks that decide whether this host's cpusets mean what they say, and the
-# thermal guard and telemetry.
+# topology checks that decide whether this host's cpusets mean what they say, the
+# thermal guard and telemetry, and the per-run results directory.
 . lib/host-provenance.sh
 . lib/jvm-pins.sh
 . lib/topology.sh
 . lib/thermal.sh
+. lib/run-layout.sh
 
 # Reading topology or temperatures from anywhere but the live tree would verify core
 # placement, or guard heat, on a host that is not the one running the containers.
@@ -55,41 +56,28 @@ IS_WSL2="false"
 if grep -qi microsoft /proc/version 2>/dev/null; then
   IS_WSL2="true"
   echo "[!] WSL2 detected -- physical-core pinning is not guaranteed even when" >&2
-  echo "    verify_cpu_pinning() reports OK (see README Limitations). Recorded" >&2
-  echo "    in run_metadata.json for this run." >&2
+  echo "    verify_cpu_pinning() reports OK (see README Threats to validity)." >&2
+  echo "    Recorded in run_metadata.json for this run." >&2
 fi
 
 # Set by verify_smt_isolation() during metadata capture; recorded in run_metadata.json.
 SMT_TOPOLOGY_STATUS="not checked"
 
 # Both overridable so the fault-injection suite can run the harness against a patched
-# configuration without writing into a real dataset.
+# configuration without writing into a real dataset; see prepare_run_dir() for the latter.
 COMPOSE_FILE="${COMPOSE_FILE_OVERRIDE:-../docker-compose.yml}"
-RESULTS_DIR="${RESULTS_DIR_OVERRIDE:-../results}"
+prepare_run_dir ../results suite
 # k6 writes its full, unfiltered trail here (container-visible as /results/raw);
 # finalize_result() filters + gzips each file into RESULTS_DIR and deletes the
 # raw copy right after, so this stays near-empty except mid-cell.
 RAW_RESULTS_DIR="${RESULTS_DIR}/raw"
 rm -rf "$RAW_RESULTS_DIR"
-mkdir -p "$RESULTS_DIR" "$RESULTS_DIR/gc-logs" "$RAW_RESULTS_DIR"
-
-# Moves a prior run's cell logs, JSON metrics and GC output into a timestamped
-# subdirectory. The analysis scripts glob RESULTS_DIR non-recursively, so anything
-# left at its top level would be read as part of this run. ablation_* files belong to
-# run-ablation.sh, which shares RESULTS_DIR and archives its own.
-if [ -n "$(find "$RESULTS_DIR" -maxdepth 1 \( -name '*.json' -o -name '*.json.gz' -o -name 'run_order_log.txt' \) \
-      ! -name 'ablation_*' -print -quit)" ]; then
-  ARCHIVE_DIR="${RESULTS_DIR}/archive/$(date +%Y%m%d_%H%M%S)"
-  mkdir -p "$ARCHIVE_DIR"
-  for _pattern in '*.json' '*.json.gz' '*_log.txt'; do
-    find "$RESULTS_DIR" -maxdepth 1 -name "$_pattern" ! -name 'ablation_*' -exec mv {} "$ARCHIVE_DIR/" \;
-  done
-  if [ -d "${RESULTS_DIR}/gc-logs" ] && [ -n "$(ls -A "${RESULTS_DIR}/gc-logs" 2>/dev/null)" ]; then
-    mv "${RESULTS_DIR}/gc-logs" "${ARCHIVE_DIR}/gc-logs"
-    mkdir -p "${RESULTS_DIR}/gc-logs"
-  fi
-  echo "[*] Archives previous run's results to ${ARCHIVE_DIR}"
-fi
+mkdir -p "$RESULTS_DIR/gc-logs" "$RAW_RESULTS_DIR"
+# docker-compose.yml mounts this directory at /results for k6 and its gc-logs/ at /gc-logs
+# for the JVM.
+RUN_RESULTS_DIR=$(cd "$RESULTS_DIR" && pwd)
+export RUN_RESULTS_DIR
+echo "[*] Run directory: ${RUN_RESULTS_DIR}"
 
 ORDER_LOG="${RESULTS_DIR}/run_order_log.txt"
 : > "$ORDER_LOG"   # truncate/create fresh each suite run
@@ -287,10 +275,13 @@ capture_run_metadata() {
   # tree, so its resolved digest is what makes the run reproducible.
   local k6_image k6_digest
   k6_image=$(docker compose -f "$COMPOSE_FILE" --profile loadgen config --images 2>/dev/null | grep -i 'k6' | head -1 || true)
+  # Pulled here when absent, so a host's first run records the digest too.
+  docker image inspect "${k6_image:-grafana/k6}" >/dev/null 2>&1 \
+    || docker compose -f "$COMPOSE_FILE" --profile loadgen pull -q k6 >/dev/null 2>&1 || true
   k6_digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "${k6_image:-grafana/k6}" 2>/dev/null \
     || echo "unknown (image not pulled yet)")
 
-  local git_commit git_dirty
+  local git_commit git_dirty fingerprint
   if command -v git >/dev/null 2>&1 && git -C .. rev-parse HEAD >/dev/null 2>&1; then
     git_commit=$(git -C .. rev-parse HEAD)
     if [ -n "$(git -C .. status --porcelain 2>/dev/null)" ]; then
@@ -298,9 +289,11 @@ capture_run_metadata() {
     else
       git_dirty="false"
     fi
+    fingerprint=$(measurement_fingerprint ..)
   else
     git_commit="unknown"
     git_dirty="unknown"
+    fingerprint="unknown (not a git checkout)"
   fi
 
   local cpu_model cpu_count
@@ -350,16 +343,25 @@ capture_run_metadata() {
   k6_cores=$(count_cpuset_cores "${k6_cpuset:-}")
   total_pinned_cores=$((py_cores + java_cores + k6_cores))
 
+  local py_quota java_quota k6_quota uvicorn_workers
+  py_quota=$(compose_service_value "python-service" cpus)
+  java_quota=$(compose_service_value "transaction-service" cpus)
+  k6_quota=$(compose_service_value "k6" cpus)
+  uvicorn_workers=$(compose_service_value "python-service" UVICORN_WORKERS)
+
   # Aborts before any container starts if the three cpusets share physical cores with each
   # other, or if any of them owns only part of a physical core on this host.
   verify_smt_isolation "${py_cpuset:-}" "${java_cpuset:-}" "${k6_cpuset:-}"
-  verify_service_cpuset "startup" "python-service" "${py_cpuset:-}" "$(compose_service_value "python-service" cpus)"
-  verify_service_cpuset "startup" "transaction-service" "${java_cpuset:-}" "$(compose_service_value "transaction-service" cpus)"
-  verify_service_cpuset "startup" "k6" "${k6_cpuset:-}" "$(compose_service_value "k6" cpus)"
+  verify_service_cpuset "startup" "python-service" "${py_cpuset:-}" "$py_quota"
+  verify_service_cpuset "startup" "transaction-service" "${java_cpuset:-}" "$java_quota"
+  verify_service_cpuset "startup" "k6" "${k6_cpuset:-}" "$k6_quota"
 
   cat > "$METADATA_FILE" <<EOF
 {
+  "run_id": "$(json_escape "$RUN_ID")",
   "timestamp_utc": "$(json_escape "$timestamp")",
+  "hostname": "$(json_escape "$(uname -n 2>/dev/null || echo unknown)")",
+  "machine_id_hash": "$(machine_id_hash)",
   "host_uname": "$(json_escape "$host_uname")",
   "wsl2_detected": "${IS_WSL2}",
   "docker_version": "$(json_escape "$docker_version")",
@@ -368,6 +370,7 @@ capture_run_metadata() {
   "k6_image_digest": "$(json_escape "$k6_digest")",
   "git_commit": "$(json_escape "$git_commit")",
   "git_dirty": "$(json_escape "$git_dirty")",
+  "measurement_fingerprint": "$(json_escape "$fingerprint")",
   "cpu_model": "$(json_escape "$cpu_model")",
   "cpu_count": "$(json_escape "$cpu_count")",
   "cpu_governor_at_start": "$(json_escape "$cpu_governor")",
@@ -382,6 +385,9 @@ capture_run_metadata() {
     "transaction_service_cores": ${java_cores},
     "k6_cpuset": "$(json_escape "${k6_cpuset:-unknown}")",
     "k6_cores": ${k6_cores},
+    "python_service_cpus_quota": "$(json_escape "${py_quota:-unknown}")",
+    "transaction_service_cpus_quota": "$(json_escape "${java_quota:-unknown}")",
+    "k6_cpus_quota": "$(json_escape "${k6_quota:-unknown}")",
     "total_pinned_cores": ${total_pinned_cores},
     "host_cores_available": "$(json_escape "$cpu_count")",
     "physical_core_isolation": "$(json_escape "$SMT_TOPOLOGY_STATUS")"
@@ -397,6 +403,8 @@ capture_run_metadata() {
     "reps_baseline": ${REPS_BASELINE},
     "reps_scan": ${REPS_SCAN},
     "java_outbound_max_connections": ${PYTHON_SERVICE_MAX_CONNECTIONS},
+    "uvicorn_workers": "$(json_escape "${uvicorn_workers:-unknown}")",
+    "thread_limiter_tokens": ${EXPECTED_THREAD_LIMITER_TOKENS},
     "warmup_gate": {
       "chunk_duration_s": ${WARMUP_CHUNK_DURATION_S},
       "max_chunks": ${MAX_WARMUP_CHUNKS},
@@ -416,7 +424,8 @@ capture_run_metadata() {
       "warn_c": ${THERMAL_WARN_C},
       "crit_c": ${THERMAL_CRIT_C},
       "cooldown_s": ${THERMAL_COOLDOWN_S},
-      "max_cooldowns": ${MAX_THERMAL_COOLDOWNS}
+      "max_cooldowns": ${MAX_THERMAL_COOLDOWNS},
+      "max_cooldowns_extended": ${THERMAL_MAX_COOLDOWNS_EXTENDED}
     }
   }
 }
@@ -1236,7 +1245,8 @@ for rep in $(seq 1 "$REPS_SCAN"); do
   archive_gc_log "scan_rep${rep}"
 done
 
-echo "[+] Suite complete. Raw results in ${RESULTS_DIR}/"
+rmdir "$RAW_RESULTS_DIR" 2>/dev/null || true
+echo "[+] Suite complete. Results in ${RESULTS_DIR}/"
 echo "    Per-rep cell order logged to ${ORDER_LOG}"
 echo "    Host/toolchain fingerprint (incl. physical-core isolation) logged to ${METADATA_FILE}"
 echo "    CPU pinning, SMT topology and thread-env checks logged to ${CPU_PIN_LOG}"

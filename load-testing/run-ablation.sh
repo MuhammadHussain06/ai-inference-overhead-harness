@@ -20,7 +20,7 @@ for _req_cmd in docker curl shuf python3; do
 done
 
 for _req_lib in lib/host-provenance.sh lib/jvm-pins.sh lib/topology.sh lib/thermal.sh \
-  lib/warmup_gate.py lib/k6_filter.py; do
+  lib/run-layout.sh lib/warmup_gate.py lib/k6_filter.py; do
   if [ ! -r "$_req_lib" ]; then
     echo "[!] Required helper not found: ${_req_lib}. Aborting before touching any containers." >&2
     exit 1
@@ -28,11 +28,13 @@ for _req_lib in lib/host-provenance.sh lib/jvm-pins.sh lib/topology.sh lib/therm
 done
 
 # Host-state provenance for ablation_run_metadata.json, the CPU-topology and JVM
-# collector/thread-pool guards every cell is gated on, and the thermal guard and telemetry.
+# collector/thread-pool guards every cell is gated on, the thermal guard and telemetry, and
+# the per-run results directory.
 . lib/host-provenance.sh
 . lib/jvm-pins.sh
 . lib/topology.sh
 . lib/thermal.sh
+. lib/run-layout.sh
 
 # Reading topology or temperatures from anywhere but the live tree would verify core
 # placement, or guard heat, on a host that is not the one running the containers.
@@ -47,42 +49,32 @@ done
 IS_WSL2="false"
 if grep -qi microsoft /proc/version 2>/dev/null; then
   IS_WSL2="true"
-  echo "[!] WSL2 detected -- see README Limitations on cpu-pin verification under WSL2." >&2
+  echo "[!] WSL2 detected -- see README Threats to validity on cpu-pin verification under WSL2." >&2
 fi
 
 # Both overridable so the fault-injection suite can run the ablation against a patched
-# configuration without writing into a real dataset.
+# configuration without writing into a real dataset; see prepare_run_dir() for the latter.
 COMPOSE_FILE="${COMPOSE_FILE_OVERRIDE:-../docker-compose.yml}"
-RESULTS_DIR="${RESULTS_DIR_OVERRIDE:-../results}"
+prepare_run_dir ../results ablation
 # k6 writes its full, unfiltered trail here (container-visible as /results/raw);
 # finalize_result() filters + gzips each file into RESULTS_DIR and deletes the
-# raw copy right after, so this stays near-empty except mid-cell. Shared
-# scratch with run-suite.sh's own raw dir -- cleared at whichever starts first.
+# raw copy right after, so this stays near-empty except mid-cell.
 RAW_RESULTS_DIR="${RESULTS_DIR}/raw"
 rm -rf "$RAW_RESULTS_DIR"
-mkdir -p "$RESULTS_DIR" "$RAW_RESULTS_DIR"
-
-# Moves a prior ablation run's own files into a timestamped subdirectory before this
-# run writes any. Scoped to ablation_* -- RESULTS_DIR is shared with run-suite.sh, and
-# an unscoped sweep here would archive a main-suite run's results out from under it.
-if compgen -G "${RESULTS_DIR}/ablation_*.json" > /dev/null 2>&1 || compgen -G "${RESULTS_DIR}/ablation_*.json.gz" > /dev/null 2>&1 \
-    || [ -f "${RESULTS_DIR}/ablation_run_order_log.txt" ]; then
-  ABLATION_ARCHIVE_DIR="${RESULTS_DIR}/archive/$(date +%Y%m%d_%H%M%S)_ablation"
-  mkdir -p "$ABLATION_ARCHIVE_DIR"
-  find "$RESULTS_DIR" -maxdepth 1 -name 'ablation_*.json' -exec mv {} "$ABLATION_ARCHIVE_DIR/" \;
-  find "$RESULTS_DIR" -maxdepth 1 -name 'ablation_*.json.gz' -exec mv {} "$ABLATION_ARCHIVE_DIR/" \;
-  find "$RESULTS_DIR" -maxdepth 1 -name 'ablation_*_log.txt' -exec mv {} "$ABLATION_ARCHIVE_DIR/" \;
-  echo "[*] Archives previous ablation run's results to ${ABLATION_ARCHIVE_DIR}"
-fi
+mkdir -p "$RESULTS_DIR/gc-logs" "$RAW_RESULTS_DIR"
+# docker-compose.yml mounts this directory at /results for k6 and its gc-logs/ at /gc-logs
+# for the JVM.
+RUN_RESULTS_DIR=$(cd "$RESULTS_DIR" && pwd)
+export RUN_RESULTS_DIR
+echo "[*] Run directory: ${RUN_RESULTS_DIR}"
 
 # The three metrics in analyze-ablation.py's METRICS dict; http_req_duration, which
 # calibration, the warm-up gate and the error table all read back; and the counters
 # that tell a truncated or failing cell from a clean one.
 ABLATION_KEEP_METRICS="python_thread_dispatch_time_ms,python_model_inference_time_ms,python_total_time_ms,http_req_duration,dropped_iterations,request_http_error,request_timeout_error"
 
-# Separate log files from run-suite.sh's, so an ablation run never trips
-# analyze-results.py's hard-fail-on-any-failures-log-entry check for the main
-# suite's own dataset.
+# Prefixed apart from run-suite.sh's files, so the two stay distinguishable wherever they
+# share a directory, as in the pre-v1.2 flat results/ layout.
 ORDER_LOG="${RESULTS_DIR}/ablation_run_order_log.txt"
 : > "$ORDER_LOG"
 METADATA_FILE="${RESULTS_DIR}/ablation_run_metadata.json"
@@ -214,17 +206,36 @@ if [ -n "$WARMUP_ITERATIONS_PER_TARGET_OVERRIDE" ]; then
 fi
 
 capture_run_metadata() {
-  local timestamp git_commit git_dirty cpu_model cpu_count total_mem_kb
+  local timestamp git_commit git_dirty fingerprint cpu_model cpu_count total_mem_kb
   timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   if command -v git >/dev/null 2>&1 && git -C .. rev-parse HEAD >/dev/null 2>&1; then
     git_commit=$(git -C .. rev-parse HEAD)
     git_dirty=$([ -n "$(git -C .. status --porcelain 2>/dev/null)" ] && echo "true" || echo "false")
+    fingerprint=$(measurement_fingerprint ..)
   else
-    git_commit="unknown"; git_dirty="unknown"
+    git_commit="unknown"; git_dirty="unknown"; fingerprint="unknown (not a git checkout)"
   fi
   cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | sed 's/.*: //' || echo "unknown")
   cpu_count=$(nproc 2>/dev/null || echo "unknown")
   total_mem_kb=$(grep -m1 "MemTotal" /proc/meminfo 2>/dev/null | grep -o '[0-9]*' || echo "unknown")
+  json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+  # Same host and toolchain fields as run-suite.sh records, so the two metadata files
+  # compare field for field.
+  local host_uname docker_version compose_version k6_image k6_digest cpu_governor cpu_freq_khz
+  host_uname=$(uname -a 2>/dev/null || echo "unknown")
+  docker_version=$(docker --version 2>/dev/null || echo "unknown")
+  compose_version=$(docker compose version 2>/dev/null || echo "unknown")
+  k6_image=$(docker compose -f "$COMPOSE_FILE" --profile loadgen config --images 2>/dev/null | grep -i 'k6' | head -1 || true)
+  # Pulled here when absent, so a host's first run records the digest too.
+  docker image inspect "${k6_image:-grafana/k6}" >/dev/null 2>&1 \
+    || docker compose -f "$COMPOSE_FILE" --profile loadgen pull -q k6 >/dev/null 2>&1 || true
+  k6_digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "${k6_image:-grafana/k6}" 2>/dev/null \
+    || echo "unknown (image not pulled yet)")
+  cpu_governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null \
+    || echo "unknown (cpufreq not exposed on this host)")
+  cpu_freq_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null \
+    || echo "unknown (cpufreq not exposed on this host)")
 
   # Records each service's cpuset as the resolved compose config declares it;
   # python-service's is the control value, since the cpuset arm sweeps others at runtime.
@@ -251,17 +262,37 @@ capture_run_metadata() {
   verify_service_cpuset "startup" "transaction-service" "$JAVA_CPUSET" "$JAVA_QUOTA"
   verify_service_cpuset "startup" "k6" "$K6_CPUSET" "$K6_QUOTA"
 
+  # Physical cores behind the control configuration, in run-suite.sh's format;
+  # verify_smt_isolation() re-checks every cell's own placement.
+  local isolation
+  if [ -r /sys/devices/system/cpu/cpu0/topology/thread_siblings_list ]; then
+    isolation="python=$(core_keys_of_cpuset "$py_cpuset") java=$(core_keys_of_cpuset "$java_cpuset") k6=$(core_keys_of_cpuset "$k6_cpuset")"
+  else
+    isolation="unverifiable (thread_siblings_list not exposed)"
+  fi
+
   cat > "$METADATA_FILE" <<EOF
 {
+  "run_id": "$(json_escape "$RUN_ID")",
   "timestamp_utc": "${timestamp}",
+  "hostname": "$(json_escape "$(uname -n 2>/dev/null || echo unknown)")",
+  "machine_id_hash": "$(machine_id_hash)",
+  "host_uname": "$(json_escape "$host_uname")",
   "wsl2_detected": "${IS_WSL2}",
+  "docker_version": "$(json_escape "$docker_version")",
+  "docker_compose_version": "$(json_escape "$compose_version")",
+  "k6_image": "$(json_escape "${k6_image:-unknown}")",
+  "k6_image_digest": "$(json_escape "$k6_digest")",
   "git_commit": "${git_commit}",
   "git_dirty": "${git_dirty}",
-  "cpu_model": "${cpu_model}",
+  "measurement_fingerprint": "$(json_escape "$fingerprint")",
+  "cpu_model": "$(json_escape "$cpu_model")",
   "cpu_count": "${cpu_count}",
+  "cpu_governor_at_start": "$(json_escape "$cpu_governor")",
+  "cpu_freq_khz_at_start": "$(json_escape "$cpu_freq_khz")",
   "total_mem_kb": "${total_mem_kb}",
   "host_provenance": $(host_provenance_json),
-  "jvm_pinned_options": "$(jvm_pinned_options)",
+  "jvm_pinned_options": "$(json_escape "$(jvm_pinned_options)")",
   "cores_used_by_suite": {
     "python_service_cpuset": "${py_cpuset:-unknown}",
     "python_service_cores": ${py_cores},
@@ -269,8 +300,12 @@ capture_run_metadata() {
     "transaction_service_cores": ${java_cores},
     "k6_cpuset": "${k6_cpuset:-unknown}",
     "k6_cores": ${k6_cores},
+    "python_service_cpus_quota": "${CONTROL_CPUS}",
+    "transaction_service_cpus_quota": "$(json_escape "${JAVA_QUOTA:-unknown}")",
+    "k6_cpus_quota": "$(json_escape "${K6_QUOTA:-unknown}")",
     "total_pinned_cores": ${total_pinned_cores},
     "host_cores_available": "${cpu_count}",
+    "physical_core_isolation": "$(json_escape "$isolation")",
     "note": "python_service_cpuset reflects the docker-compose.yml control value; the cpuset arm sweeps other values at runtime"
   },
   "ablation_config": {
@@ -301,7 +336,8 @@ capture_run_metadata() {
       "warn_c": ${THERMAL_WARN_C},
       "crit_c": ${THERMAL_CRIT_C},
       "cooldown_s": ${THERMAL_COOLDOWN_S},
-      "max_cooldowns": ${MAX_THERMAL_COOLDOWNS}
+      "max_cooldowns": ${MAX_THERMAL_COOLDOWNS},
+      "max_cooldowns_extended": ${THERMAL_MAX_COOLDOWNS_EXTENDED}
     }
   }
 }
@@ -944,6 +980,7 @@ for rep in $(seq 1 "$REPS_ABLATION"); do
 done
 
 docker compose -f "$COMPOSE_FILE" down
+rmdir "$RAW_RESULTS_DIR" 2>/dev/null || true
 # Guards against an empty run: the completion banner would otherwise report success after
 # executing no cells at all. ablation_calib_* and ablation_warmup_* also match the cell
 # pattern, so they are excluded to count measured cells only.
@@ -954,7 +991,7 @@ if [ "$_n_cells" -eq 0 ]; then
     "REPS_ABLATION_OVERRIDE. Not reporting this run as successful."
 fi
 
-echo "[+] Ablation complete. Raw results in ${RESULTS_DIR}/ablation_*.json.gz"
+echo "[+] Ablation complete. Results in ${RESULTS_DIR}/"
 echo "    SMT topology and pinning checks logged to ${CPU_PIN_LOG}"
 echo "    Per-cell governor/frequency/temperature and thermal samples logged to ${ENV_TRACE_LOG}"
 echo "    The iteration count every cell ran with logged to ${CALIB_LOG}"
