@@ -23,7 +23,7 @@ for _req_cmd in docker curl shuf python3; do
 done
 
 for _req_lib in lib/host-provenance.sh lib/jvm-pins.sh lib/topology.sh lib/thermal.sh \
-  lib/run-layout.sh lib/warmup_gate.py lib/k6_filter.py; do
+  lib/run-layout.sh lib/warmup_gate.py lib/k6_filter.py lib/placement.py; do
   if [ ! -r "$_req_lib" ]; then
     echo "[!] Required helper not found: ${_req_lib}. Aborting before touching any containers." >&2
     exit 1
@@ -106,6 +106,10 @@ ENV_TRACE_LOG="${RESULTS_DIR}/env_trace_log.txt"
 # The iteration counts every scan rep runs each calibrated target with.
 CALIB_LOG="${RESULTS_DIR}/calibration_log.txt"
 : > "$CALIB_LOG"
+# Which python-service worker holds each inbound connection during every measured cell
+# (lib/placement.py).
+PLACEMENT_LOG="${RESULTS_DIR}/connection_placement_log.txt"
+: > "$PLACEMENT_LOG"
 
 TARGETS=(${TARGETS_OVERRIDE:-mock calibration 5 10 20 28})
 CONCURRENCY_LEVELS=(${CONCURRENCY_OVERRIDE:-1 2 4 8 16 32 64})
@@ -1144,22 +1148,51 @@ archive_gc_log() {
   fi
 }
 
+# Samples connection-to-worker placement in the background for one cell, off the
+# services' and k6's CPUs. A host where the container's processes are not readable
+# gets a placement_unavailable line and the cell runs unaffected.
+start_placement_sampler() {
+  local cell="$1" container pid
+  PLACEMENT_SAMPLER=""
+  container=$(docker compose -f "$COMPOSE_FILE" ps -q python-service 2>/dev/null || true)
+  pid=$(docker inspect -f '{{.State.Pid}}' "$container" 2>/dev/null || true)
+  if ! [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    echo "placement_unavailable cell=${cell} ts=$(thermal_ts) reason=container_pid_unresolved" >> "$PLACEMENT_LOG"
+    return 0
+  fi
+  python3 "${LIB_DIR}/placement.py" --container-pid "$pid" --cell "$cell" \
+    --avoid-cpus "$PINNED_CPUS" >> "$PLACEMENT_LOG" 2>/dev/null &
+  PLACEMENT_SAMPLER=$!
+}
+
+stop_placement_sampler() {
+  if [ -n "${PLACEMENT_SAMPLER:-}" ]; then
+    kill -TERM "$PLACEMENT_SAMPLER" 2>/dev/null || true
+    wait "$PLACEMENT_SAMPLER" 2>/dev/null || true
+    PLACEMENT_SAMPLER=""
+  fi
+}
+
 # Runs one measured cell, named by its result file's stem, between two thermal
-# samples. Aborts the suite on a k6 failure -- no benefit to continuing once
-# analyze-results.py will reject the whole run anyway.
+# samples and under the placement sampler. Aborts the suite on a k6 failure -- no
+# benefit to continuing once analyze-results.py will reject the whole run anyway.
 run_cell() {
   local label="$1" cell="$2"
   shift 2
+  start_placement_sampler "$cell"
   record_cell_thermal start "$cell"
   if ! "$@"; then
+    stop_placement_sampler
     abort_suite "[cell] ${label}" "k6 exited non-zero."
   fi
   record_cell_thermal end "$cell"
+  stop_placement_sampler
   check_oom_killed "$label"
   check_thermal_safety "$label"
 }
 
 capture_run_metadata
+PINNED_CPUS="$(compose_service_value python-service cpuset),$(compose_service_value transaction-service cpuset),$(compose_service_value k6 cpuset)"
 
 echo "[*] E1: baseline decomposition x ${REPS_BASELINE} independent repetitions"
 for rep in $(seq 1 "$REPS_BASELINE"); do
@@ -1248,6 +1281,7 @@ done
 rmdir "$RAW_RESULTS_DIR" 2>/dev/null || true
 echo "[+] Suite complete. Results in ${RESULTS_DIR}/"
 echo "    Per-rep cell order logged to ${ORDER_LOG}"
+echo "    Connection-to-worker placement per cell logged to ${PLACEMENT_LOG}"
 echo "    Host/toolchain fingerprint (incl. physical-core isolation) logged to ${METADATA_FILE}"
 echo "    CPU pinning, SMT topology and thread-env checks logged to ${CPU_PIN_LOG}"
 echo "    Per-rep governor/frequency/temperature and per-cell thermal samples logged to ${ENV_TRACE_LOG}"
