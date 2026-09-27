@@ -34,6 +34,7 @@ from statsmodels.stats.multitest import multipletests
 ANALYSIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ANALYSIS_DIR, "lib"))
 import run_dirs  # noqa: E402
+import scan_outliers  # noqa: E402
 import thermal  # noqa: E402
 import warmup_check  # noqa: E402
 from report import save_figure, save_table  # noqa: E402
@@ -1690,16 +1691,61 @@ def analyze_thermal(results_dir, output_dir, metadata, latency):
         save_figure(fig, "figure8_thermal_timeline", output_dir)
 
 
+def analyze_scan_outliers(results_dir, output_dir, metadata, df):
+    """Table 4f, the scan cells far off their design cell's other reps with the features
+    that tell their cause apart; table 4g and figure 9, latency and Python stall by
+    connection-to-worker placement, when the run recorded placement."""
+    cells = scan_outliers.cell_features(df)
+    if cells.empty:
+        return
+    cells = scan_outliers.flag_outliers(cells)
+    placement = scan_outliers.parse_placement_log(results_dir)
+    if placement is not None:
+        cells = cells.merge(placement, on="cell", how="left")
+    thermal_cells = None
+    trace_path = os.path.join(results_dir, "env_trace_log.txt")
+    if os.path.isfile(trace_path):
+        cores = (metadata or {}).get("cores_used_by_suite", {})
+        cpusets = {svc: cores[key] for svc, key in SUITE_SERVICES if cores.get(key) not in (None, "", "unknown")}
+        thermal_cells = thermal.cell_thermal(thermal.parse_env_trace(trace_path), lambda cell: cpusets)
+
+    n_flagged = int(cells["flagged"].sum())
+    by_level = cells.groupby("vus")["flagged"].sum().astype(int)
+    print(f"[outliers] {n_flagged}/{len(cells)} scan cells flagged; per VUS level: "
+          + ", ".join(f"{v}={n}" for v, n in by_level.items()))
+    if n_flagged:
+        save_table(scan_outliers.outlier_table(cells, thermal_cells), "table4f_scan_outlier_cells", output_dir,
+                   caption=f"Scan cells whose mean latency sits far above their design cell's other repetitions "
+                           f"(modified z-score above {scan_outliers.Z_THRESHOLD:g} and at least "
+                           f"{scan_outliers.MIN_DEVIATION_PCT:g}% above the median rep). A median shift as large as "
+                           f"the deviation, with a first-tenth ratio near the other reps', means the whole cell "
+                           f"moved rather than its start; compute stall above the other reps' means Python threads "
+                           f"waited off-CPU; placement is the cell's connections per python-service worker, "
+                           f"busiest first.",
+                   label="tab:scan-outliers")
+    if placement is None:
+        print("[outliers] No connection_placement_log.txt -- table 4g and figure 9 need a run that recorded "
+              "placement.")
+        return
+    save_table(scan_outliers.placement_table(cells), "table4g_scan_connection_placement", output_dir,
+               caption="Scan cells by how evenly their connections were spread across the python-service "
+                       "workers: the busiest worker's connections beyond the most even split (0 = even). "
+                       "Latency deviation is from the cell's design-cell median rep; extra stall and dispatch "
+                       "are above that median. Mann-Whitney compares each uneven class's deviations with the "
+                       "even cells' at the same level, cells as units; a positive rank-biserial r means the "
+                       "uneven cells ran slower.",
+               label="tab:scan-placement")
+    fig = scan_outliers.placement_figure(cells)
+    if fig is not None:
+        save_figure(fig, "figure9_scan_connection_placement", output_dir)
+
+
 def analyze_openloop_check(df, output_dir, true_counts=None):
-    # Open-loop (constant-arrival-rate) cells are run manually, so this returns without a
-    # table when none are present.
+    # Returns without a table when the run has no open-loop cells.
     #
-    # run-smoke-test.sh's own open-loop cell (openloop_28_smoke.json) lands in this same
-    # results dir at a deliberately unsustainable RATE=5000, to prove dropped_iterations
-    # fires before trusting a real run. Excluded by phase=="smoke-openloop" (the tag
-    # run-target-openloop.js sets from PHASE; a real manual check defaults to
-    # "openloop-check") rather than by filename, so a leftover smoke artifact is never
-    # reported as a real validity check.
+    # run-smoke-test.sh's overload cell (RATE=5000) is excluded by phase=="smoke-openloop",
+    # the tag run-target-openloop.js sets from PHASE, rather than by filename, so a leftover
+    # smoke cell is never reported as a real validity check.
     # Unfiltered by status: a cell so overloaded that nothing succeeded must still be
     # identifiable as a cell, or it and its dropped_iterations vanish from the table
     # entirely -- exactly the overload case this check exists to catch.
@@ -1859,6 +1905,7 @@ def analyze_run(run, out):
     else:
         print(f"[*] Loaded {len(df2)} metric points (scan+openloop) from {df2['source_file'].nunique()} file(s).")
         analyze_scan(df2, out, true_counts=true2, metadata=metadata)
+        analyze_scan_outliers(results_dir, out, metadata, df2)
         analyze_openloop_check(df2, out, true_counts=true2)
         latency_parts.append(cell_mean_latency(df2, "scan"))
     del df2, true2
