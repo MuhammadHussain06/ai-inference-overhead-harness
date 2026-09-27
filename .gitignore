@@ -8,7 +8,7 @@ services/fraud-ml-service/training/data/
 analysis/**/__pycache__/
 analysis/venv/
 
-# Benchmark output: one directory per run, plus archive/ -- keep results/ via .gitkeep.
+# Benchmark output: one directory per run, plus archive/ and logs/ -- keep results/ via .gitkeep.
 results/*
 !results/.gitkeep
 

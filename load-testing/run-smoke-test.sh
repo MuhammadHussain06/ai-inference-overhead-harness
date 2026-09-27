@@ -30,40 +30,37 @@ WARMUP_ITERATIONS_PER_TARGET_OVERRIDE=20 \
 SUITE_DIR=$(latest_run_dir suite)
 
 echo "[*] Smoke test 2/4: deliberate over-rate open-loop check (expect dropped_iterations > 0)"
-# Runs in a container to mirror run-suite.sh's k6_run() without a host k6 install, writing
-# into the suite's run directory the way a real open-loop check does.
-RUN_RESULTS_DIR=$(cd "$SUITE_DIR" && pwd) docker compose -f ../docker-compose.yml --profile loadgen run --rm -T \
-  -e TARGET=28 -e RATE=5000 -e TIME_UNIT=1s -e DURATION=20s \
-  -e PRE_ALLOCATED_VUS=32 -e MAX_VUS=64 -e PHASE=smoke-openloop -e REP=1 \
-  k6 run /scripts/run-target-openloop.js --out json=/results/openloop_28_smoke.json
+# Through run-openloop.sh, so the smoke test exercises the same restart, warm-up and
+# finalize path as a real open-loop check, at a rate no host sustains.
+OPENLOOP_RATES=5000 OPENLOOP_DURATION=20s OPENLOOP_PRE_ALLOCATED_VUS=32 OPENLOOP_MAX_VUS=64 \
+OPENLOOP_PHASE=smoke-openloop ./run-openloop.sh "$SUITE_DIR"
+SMOKE_FILE="${SUITE_DIR}/openloop_28_rate5000.json.gz"
 
 # table7 excludes phase=smoke-openloop on purpose (see analyze_openloop_check()), so
-# it will never report this cell -- checked directly against the raw file instead.
-SMOKE_DROPPED=$(python3 -c "
-import json
+# it will never report this cell -- checked directly against the file instead.
+SMOKE_DROPPED=$(python3 - "$SMOKE_FILE" <<'PYEOF'
+import gzip, json, sys
 n = 0
-with open('${SUITE_DIR}/openloop_28_smoke.json') as f:
+with gzip.open(sys.argv[1], "rt") as f:
     for line in f:
-        line = line.strip()
-        if not line:
-            continue
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if obj.get('type') == 'Point' and obj.get('metric') == 'dropped_iterations':
-            n += obj.get('data', {}).get('value', 0)
+        if obj.get("type") == "Point" and obj.get("metric") == "dropped_iterations":
+            n += obj.get("data", {}).get("value", 0)
 print(int(n))
-")
+PYEOF
+)
 if [ "$SMOKE_DROPPED" -gt 0 ]; then
   echo "  [+] smoke-openloop: ${SMOKE_DROPPED} dropped_iterations recorded (RATE=5000 was, as intended, unsustainable)."
 else
   echo "  [!] smoke-openloop: 0 dropped_iterations at RATE=5000 -- the open-loop executor did not detect the overload. Investigate before trusting the real suite's own open-loop checks." >&2
 fi
 
-# table7's phase-based exclusion is defense in depth; the raw file itself still has no
+# table7's phase-based exclusion is defense in depth; the file itself still has no
 # business outliving this script in the run directory.
-rm -f "${SUITE_DIR}/openloop_28_smoke.json"
+rm -f "$SMOKE_FILE"
 
 echo "[*] Smoke test 3/4: ablation slice -- exercises the cpuset arm's multi-range values"
 # The cpuset arm is the one whose cell values are cpuset strings rather than integers,
@@ -87,6 +84,7 @@ echo "    run_failures_log.txt and ablation_run_failures_log.txt (both empty)"
 echo "    cpu_pin_check_log.txt and ablation_cpu_pin_check_log.txt, incl. the smt_check lines"
 echo "    env_trace_log.txt and ablation_env_trace_log.txt (cell_start/cell_end and"
 echo "    thermal_check lines for every cell), and both *calibration_log.txt files"
+echo "    connection_placement_log.txt: placement lines for every cell, not placement_unavailable"
 echo "    the [+]/[!] smoke-openloop line printed above (dropped_iterations at RATE=5000);"
 echo "    table7 itself will not show this cell -- it excludes phase=smoke-openloop on purpose"
 echo "    table_ablation_decomposition lists both cpuset values, ordered by core count"

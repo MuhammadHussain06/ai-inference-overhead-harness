@@ -1,7 +1,7 @@
 import { sendTransaction, TARGETS } from './lib/common.js';
 
-// Standalone open-loop check on the closed-loop scan's coordinated omission, run by
-// hand at the top concurrency cells. constant-arrival-rate fires on a fixed schedule
+// Open-loop check on the closed-loop scan's coordinated omission, run by
+// run-openloop.sh. constant-arrival-rate fires on a fixed schedule
 // regardless of response time; k6's own dropped_iterations rises once maxVUs can no
 // longer sustain RATE, marking the point where the arrival rate exceeded capacity.
 
