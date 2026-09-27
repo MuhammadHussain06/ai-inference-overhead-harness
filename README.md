@@ -3,10 +3,9 @@
 A containerized testbed that measures the **latency and throughput cost of a live AI fraud-inference call**, benchmarked against a network-equivalent mock and a zero-work calibration floor.
 
 ```bash
-./setup.sh                                   # once per machine
-docker compose up                            # bring up the stack
-./load-testing/run-suite.sh                  # run the full benchmark suite
-analysis/venv/bin/python3 analysis/analyze-results.py   # generate tables + figures
+./setup.sh                        # once per machine
+docker compose build              # build both service images
+./load-testing/run-all.sh         # suite, open-loop check, ablation, then both analyses
 ```
 
 ---
@@ -127,6 +126,7 @@ Each service runs in its own container, pinned to a disjoint CPU range, so they 
 - Host thermal state is recorded, not inferred. `env_trace_log.txt` carries the CPU governor, per-core frequency, highest thermal-zone temperature and the kernel's per-core thermal-throttle counters at both ends of every rep and of every measured cell, plus every thermal check with the time it paused for (`load-testing/lib/thermal.sh`). The analysis turns that into per-cell temperature and throttling, the wall-clock cost of thermal pauses, and a test of whether either tracks latency.
 - Valid feature-tier set is fetched from `fraud-ml-service`'s `/health` at startup, never hardcoded in Java. `run-suite.sh` re-verifies this per rep (`loadedTiers` matches expected, `nJobsVerified` all true) and aborts the suite if it does not.
 - JVM thread pins are verified against how the JVM itself resolved them. G1 as the collector and its worker-thread ceilings are read back via `-XX:+PrintFlagsFinal` (`load-testing/lib/jvm-pins.sh`), including each flag's *origin*, distinguishing a value that merely coincides with the pinned one through JVM ergonomics from a value the compose file actually set. The Reactor Netty event-loop count is a system property, invisible to that flag dump, so it is checked instead by a `/proc` thread census counting live GC and event-loop threads against their pinned ceilings. The flag-origin check runs at the start of every rep; the census runs after warm-up, once every event loop has served traffic. Either mismatch aborts the suite, same as a cpu-pin failure.
+- Connection-to-worker placement is recorded for every measured cell: which python-service worker process holds each inbound connection, read from the host's procfs by `load-testing/lib/placement.py` (the information `ss -tnp` reports) without executing anything in the measured container, on CPUs outside every service's cpuset. At low concurrency the placement decides whether two in-flight requests contend for one worker's GIL, so it is recorded rather than inferred.
 - Host-level state that can shift measured latency without appearing in this project's own configuration (kernel `isolcpus`, AC vs. battery power, whether `irqbalance` is migrating interrupts across pinned cores, and virtualization) is recorded in `run_metadata.json` at the start of every run (`load-testing/lib/host-provenance.sh`). Warn-only by design: none of the four has one correct value for every host, so the harness records what it found rather than dictating a setting. Only conditions that invalidate a measurement outright (cpu-pin, tier, JVM-pin mismatches) abort the run. The cross-host analysis gates on all four (see [Cross-host comparison](#cross-host-comparison)).
 - Outbound Java to Python connection pool is sized by the harness at 2x the run's peak VUS (`PYTHON_SERVICE_MAX_CONNECTIONS`), so it can never become the bottleneck being measured, and is logged at startup. A hand-started stack falls back to `128`.
 - A thermal guard samples every readable `thermal_zone*` after every cell and warm-up chunk. At or above `THERMAL_WARN_C` (90C) the run pauses for `THERMAL_COOLDOWN_S` (60s) and retries: `MAX_THERMAL_COOLDOWNS` (2) rounds are always given, and further rounds beyond that for as long as each one is still colder than the last, up to `THERMAL_MAX_COOLDOWNS_EXTENDED` (10) total. Still at or above `THERMAL_CRIT_C` (95C) once the pausing stops -- whether because a round failed to cool further or because the round cap was reached -- aborts the suite. Every check is logged with the time it paused for, so a long run's thermal cost is measured rather than absorbed into the numbers.
@@ -141,7 +141,9 @@ Each service runs in its own container, pinned to a disjoint CPU range, so they 
 - `run-suite.sh`: full baseline plus concurrency-scan suite across clean-slate restarts, with per-repetition target and concurrency shuffling, CPU-pin verification, host and toolchain provenance fingerprinting, and a failures log. Any condition that invalidates a rep (k6 itself failing, an OOM kill, a pinning, tier or JVM-pin mismatch, a readiness timeout, a host still critically hot after its cooldowns) aborts the suite rather than being logged and skipped, and `analyze-results.py` rejects the run if that log has any entries. Request-level errors inside a cell (non-200 responses, timeouts) do not abort: they are counted per cell in the error tables, and every latency table covers HTTP 200 requests only.
 - `warm-up.js`: JIT and pool warm-up, hitting every target sequentially in its own window. `converge_warmup()` re-runs it in 15s chunks (`WARMUP_CHUNK_DURATION_S`) up to `MAX_WARMUP_CHUNKS` (4) times per restart, stopping as soon as every target's tail has settled (see [Experimental design rationale](#experimental-design-rationale)). Warm-up shares code with `run-target.js`, so warm-up traffic is tagged and classified identically to measured traffic.
 - `calibrate_scan_targets()`: once, before the scan reps, a stack prepared exactly like a scan rep (restart, pin checks, both warm-up passes) runs a measured pre-pass per target at `CALIB_VUS=16`, and `ITERATIONS_PER_VU` for each of `CALIB_AFFECTED_LEVELS` (8, 16, 32, 64) is derived from it so every cell spans about `CALIB_TARGET_DURATION_S` (60s) of wall clock. Every scan rep then runs those counts. Throughput differs by a large factor between targets, so a flat iteration count would make a trivial target's cell span seconds and an AI tier's span minutes. The pre-pass writes `calib_*.json.gz`, which the analysis ignores, and `calibration_log.txt`.
-- `analyze-results.py`: P50/P95/P99 tables and histograms per strategy and tier, Mann-Whitney U significance testing (Holm-Bonferroni corrected, rank-biserial effect sizes), cluster-level bootstrap CIs, reproducibility (CoV% across reps), paired error and timeout tables, client-contention diagnostics, warm-up convergence checks, within-cell drift, per-cell thermal state and throttling, throughput-vs-concurrency figures, and an optional open-loop-vs-closed-loop validity check (see [Running](#running)) when `openloop_*.json` files are present. Throughput is measured within each repetition and then averaged; a span pooled across repetitions would include the restarts and cooldowns between them.
+- `run-openloop.sh`: the open-loop validity check against one suite run, at fractions of the target's closed-loop plateau throughput, on a restarted and warmed-up stack under the suite's thermal guard.
+- `run-all.sh`: the whole design unattended, `run-suite.sh`, `run-openloop.sh`, `run-ablation.sh`, then both analyses on the runs it produced, resumable with `START_AT`.
+- `analyze-results.py`: P50/P95/P99 tables and histograms per strategy and tier, Mann-Whitney U significance testing (Holm-Bonferroni corrected, rank-biserial effect sizes), cluster-level bootstrap CIs, reproducibility (CoV% across reps), paired error and timeout tables, client-contention diagnostics, warm-up convergence checks, within-cell drift, scan cells that sit far off their other reps together with the features that explain them, latency by connection-to-worker placement, per-cell thermal state and throttling, throughput-vs-concurrency figures, and an open-loop-vs-closed-loop validity check (see [Running](#running)) when `openloop_*` files are present. Throughput is measured within each repetition and then averaged; a span pooled across repetitions would include the restarts and cooldowns between them.
 - `analyze-host-variance.py`, `analyze-ablation-host-variance.py`: compare runs from different hosts on ratios measured within each run, with an equivalence test per pair of runs, after checking that the runs' controlled environment matches (see [Cross-host comparison](#cross-host-comparison)).
 </details>
 
@@ -273,13 +275,28 @@ Resource limits (`mem_limit`/`mem_reservation`/`cpus`) use Compose's plain (non-
 - 16 logical cores. The `cpuset` values span CPUs 0 to 15 and are chosen for a host whose SMT siblings are *adjacent* logical CPUs, so each service owns whole physical cores. On a host that enumerates siblings differently (Intel's classic `N` / `N+8` layout, for instance), `verify_smt_isolation()` resolves each cpuset through `thread_siblings_list` and aborts before any container starts, avoiding incomparable data.
 - Re-pick the values for your topology with `cat /sys/devices/system/cpu/cpu*/topology/thread_siblings_list`, or let `load-testing/recommend-cpusets.sh` do it: it reads this host's topology, restricts itself to performance cores on a hybrid CPU, and prints `export` lines for `PYTHON_CPUSET`/`JAVA_CPUSET`/`K6_CPUSET` (plus the ablation's narrow and wide cpuset values), pre-checked against the same guard the suite runs. It only recommends: review the output, `export` it, then run the suite.
 - About 7GB free RAM
-- k6 runs containerized for `run-suite.sh` and `run-ablation.sh`, pulled automatically on first invocation, so no host install is needed for either. A host-installed `k6` binary is only needed for the manual and open-loop commands below
+- k6 runs containerized for `run-suite.sh`, `run-ablation.sh` and `run-openloop.sh`, pulled automatically on first invocation, so no host install is needed for any of them. A host-installed `k6` binary is only needed for the manual commands below
 - Python 3 on the host, required by `run-suite.sh` itself (tier verification) in addition to `pip install -r analysis/requirements.txt` (pandas, numpy, matplotlib, scipy, statsmodels, tabulate, jinja2) for the analysis phase. `jinja2` backs the LaTeX table export, so omitting it breaks `.tex` output. `requirements.txt` pins floors, not ceilings: recent CPython (3.13+) needs recent-enough wheels of these anyway, and older exact pins can fail a from-source build on a newer compiler toolchain
 - No GPU required
 
 ---
 
 ## Running
+
+### Everything in one run
+
+`run-all.sh` runs the full suite, the open-loop check against that suite run, the ablation, and then `analyze-results.py` and `analyze-ablation.py` on the two runs it produced. Each step's output goes to `results/logs/run-all_<UTC timestamp>/`, with one line per step in `run-all.log`. A failed suite stops the chain; a failed open-loop check or ablation is reported and the remaining steps still run; the exit status is non-zero if any step failed. `START_AT=openloop`, `ablation` or `analysis` resumes at that step against this host's latest runs.
+
+The full design takes most of a day. To run it detached, with the machine kept awake:
+
+```bash
+sudo cpupower frequency-set -g performance      # before launch: sudo cannot prompt once detached
+nohup systemd-inhibit --what=sleep:idle:handle-lid-switch --who=harness --why="benchmark run" \
+  ./load-testing/run-all.sh >/dev/null 2>&1 & disown
+tail -F results/logs/run-all_*/run-all.log
+```
+
+`run-all.log` records the CPU governor and power source at launch but does not enforce them, as elsewhere in the harness.
 
 ### First-time setup (once per machine)
 
@@ -299,7 +316,7 @@ cd load-testing
 ./run-smoke-test.sh
 ```
 
-Check `run_failures_log.txt` and `cpu_pin_check_log.txt` in the two run directories it names afterward, and confirm the `[+] smoke-openloop:` line the script prints reports a nonzero `dropped_iterations` count. Table 7 will *not* show that cell: `analyze-results.py` excludes `phase=smoke-openloop` on purpose, and the script checks the raw file directly instead. Clean here means the pipeline is trustworthy, not that any given rep count is sufficient. Re-run the smoke test after any fix until it passes, then move to the full suite.
+Check `run_failures_log.txt` and `cpu_pin_check_log.txt` in the two run directories it names afterward, confirm the suite run's `connection_placement_log.txt` has `placement` lines rather than `placement_unavailable`, and confirm the `[+] smoke-openloop:` line the script prints reports a nonzero `dropped_iterations` count. Table 7 will *not* show that cell: `analyze-results.py` excludes `phase=smoke-openloop` on purpose, and the script checks the cell's file directly instead. Clean here means the pipeline is trustworthy, not that any given rep count is sufficient. Re-run the smoke test after any fix until it passes, then move to the full suite.
 
 Table 0 is also expected to list every target as `fewer than three windows` on a smoke run: its convergence check needs three windows of at least 500 requests each, and the smoke slice sends about 20 per target.
 
@@ -321,7 +338,7 @@ cd load-testing
 
 Requires `APP_DB_SAVE_ENABLED=false` in `docker-compose.yml`. Each invocation writes one run directory under `results/` (see [Outputs](#outputs)).
 
-Per repetition, `run-suite.sh` restarts the stack, runs the convergence-gated warm-up, then drives `run-target.js` per target and concurrency cell across `mock`, `calibration`, and the four AI tiers. A second max-VUS warm-up pass runs before each scan rep's cells, and every target is throughput-calibrated once, in its own pass before the scan reps. Defaults: 7 baseline reps, 7 scan reps, concurrency levels 1/2/4/8/16/32/64, 10s cooldown between cells.
+Per repetition, `run-suite.sh` restarts the stack, runs the convergence-gated warm-up, then drives `run-target.js` per target and concurrency cell across `mock`, `calibration`, and the four AI tiers. A second max-VUS warm-up pass runs before each scan rep's cells, and every target is throughput-calibrated once, in its own pass before the scan reps. Defaults: 7 baseline reps, 7 scan reps, concurrency levels 1/2/4/8/16/32/64, 10s cooldown between cells. During every measured cell, `lib/placement.py` records which python-service worker holds each inbound connection (see [Outputs](#outputs)).
 
 ### Ablation (RQ3)
 
@@ -347,24 +364,23 @@ TARGET=28 VUS=8 PHASE=scan REP=1 ITERATIONS_PER_VU=100 \
 analysis/venv/bin/python3 analysis/analyze-results.py --results-dir results/manual
 ```
 
-These commands invoke `k6` directly rather than through Docker, so they need a host-installed `k6` binary; `run-suite.sh` and `run-ablation.sh` run it in its own container instead and need no such install. The analysis reads only files named as the harness names them (`baseline_*`, `scan_*`, `warmup_*`, `openloop_*`).
+These commands invoke `k6` directly rather than through Docker, so they need a host-installed `k6` binary; the harness scripts run it in its own container instead and need no such install. The analysis reads only files named as the harness names them (`baseline_*`, `scan_*`, `warmup_*`, `openloop_*`).
 
 `warm-up.js` reads `WARMUP_TARGETS` (default `mock calibration 5 10 20 28`), `WARMUP_VUS` (5), and `BASE_URL` (falls back to `http://localhost:8080/api/v1/transactions`). By default it uses a `constant-vus` executor bounded by `WARMUP_DURATION_S` (15). Setting `WARMUP_ITERATIONS_PER_TARGET` switches it to a fixed-count `per-vu-iterations` pass bounded by `WARMUP_MAX_DURATION_S` (60) instead, which is the path the smoke test takes; that variable also bypasses `converge_warmup()`'s chunked gate entirely, so do not set it when you want the adaptive warm-up.
 
-### Open-loop validity check (optional)
+### Open-loop validity check
 
-The main suite's concurrency scan is closed-loop (see [Threats to validity](#threats-to-validity)). `run-target-openloop.js` runs the same target under a `constant-arrival-rate` executor instead, so requests fire on a fixed schedule regardless of how fast responses come back. This is the standard mitigation for coordinated omission. Run it against the top one or two concurrency cells only, after the main suite, as a check on whether the closed-loop tail-latency numbers hold up:
+The main suite's concurrency scan is closed-loop (see [Threats to validity](#threats-to-validity)). `run-target-openloop.js` runs the same target under a `constant-arrival-rate` executor instead, so requests fire on a fixed schedule regardless of how fast responses come back. This is the standard mitigation for coordinated omission. `run-openloop.sh` runs it against one suite run, after that run, and `run-all.sh` does so automatically:
 
 ```bash
-docker compose up
-k6 run load-testing/warm-up.js
-TARGET=28 RATE=32 TIME_UNIT=1s DURATION=2m PRE_ALLOCATED_VUS=64 MAX_VUS=128 \
-  k6 run --out json=results/suite_<host>_<timestamp>/openloop_28_rate32.json load-testing/run-target-openloop.js
+cd load-testing
+./run-openloop.sh                                   # this host's latest suite run
+./run-openloop.sh ../results/suite_<host>_<timestamp>
 ```
 
-`RATE` is requests per `TIME_UNIT`. Set it to roughly the throughput the closed-loop cell achieved at that VUS level, not the VUS count itself. `PRE_ALLOCATED_VUS` and `MAX_VUS` must be generous enough to sustain `RATE` if response times climb. k6 emits `dropped_iterations` when it cannot keep up, which is itself diagnostic: it means the server cannot sustain that arrival rate, a real finding rather than a script bug. This script is standalone and manual by design. It is not invoked by `run-suite.sh` and does not replace the main suite.
+It reads the target's closed-loop throughput at the run's highest scan concurrency (`lib/openloop_rates.py`, the table 4 convention), and runs one cell per fraction of it in `OPENLOOP_FRACTIONS` (default `1.0 0.8`): at the plateau, where an open arrival process meets a saturated service, and below it. Each cell runs for `OPENLOOP_DURATION` (`2m`) with `OPENLOOP_PRE_ALLOCATED_VUS` (64) and `OPENLOOP_MAX_VUS` (128) on a freshly restarted stack warmed up at the target, with the suite's thermal guard between cells. `OPENLOOP_TARGET` (28), `OPENLOOP_RATES` (explicit requests per second, in place of fractions) and `OPENLOOP_PHASE` are overridable. k6 emits `dropped_iterations` when `MAX_VUS` cannot sustain the rate, which is itself diagnostic: the service cannot absorb that arrival rate.
 
-Output filenames must start with `openloop` (for example `openloop_28_rate32.json`) and go into the suite run directory being checked. `analyze-results.py` detects any such files in the run directory, and if present adds `table7_openloop_validity_check` and `figure7_openloop_validity_check` comparing open-loop P95/P99 against the closed-loop scan at the top two scanned concurrency levels for the same tier. If no `openloop_*` files are present, this step is skipped silently and the rest of the analysis is unaffected. `run-smoke-test.sh`'s own `RATE=5000` overload cell (`phase=smoke-openloop`) is always excluded from this table, whether or not its file happens to still be sitting in the run directory. Table 7 is grouped by tier *and* `RATE`, so a real check at a sane rate is never pooled with a leftover overload cell from a different one.
+Each cell is written into the suite run directory as `openloop_<target>_rate<R>.json.gz`, with the rates and their source in `openloop_log.txt` and per-cell thermal samples in `openloop_env_trace_log.txt`. `analyze-results.py` detects any `openloop_*` files in the run directory, and if present adds `table7_openloop_validity_check` and `figure7_openloop_validity_check` comparing open-loop P95/P99 against the closed-loop scan at the top two scanned concurrency levels for the same tier. If no `openloop_*` files are present, this step is skipped silently and the rest of the analysis is unaffected. `run-smoke-test.sh`'s own `RATE=5000` overload cell, run through `run-openloop.sh` with `phase=smoke-openloop`, is always excluded from this table, whether or not its file happens to still be sitting in the run directory. Table 7 is grouped by tier *and* `RATE`, so a real check at a sane rate is never pooled with a leftover overload cell from a different one.
 
 ---
 
@@ -385,8 +401,13 @@ Each invocation of `run-suite.sh` or `run-ablation.sh` writes one run directory,
 | `run_metadata.json` | Run ID, timestamp, hostname and machine-ID hash, Docker/Compose versions and k6 image digest, git commit and dirty flag, measurement fingerprint (SHA-256 over the tracked files that shape a measurement: the compose file, both services and the load-testing harness, excluding tests, probes and model training), CPU/RAM, CPU governor and frequency snapshot, host provenance (`isolcpus` live state and boot cmdline, AC/battery power source, `irqbalance` status, virtualization as reported by `systemd-detect-virt`), each service's cpuset, CPU quota and physical cores, and the run configuration including uvicorn workers and thread-limiter tokens |
 | `cpu_pin_check_log.txt` | Per-repetition requested-vs-live cpuset, including the `smt_check` lines |
 | `env_trace_log.txt` | `env_sample` lines at both ends of every rep (governor, per-core frequency, temperature, throttle counters); `cell_start`/`cell_end` lines around every measured cell (temperature and the package and per-core thermal-throttle counters, `na` where the host does not expose them); and a `thermal_check` line for every safety check with the time it paused. Per-core values are `cpuN=value` pairs in core-index order, so each is attributable to a specific core |
+| `connection_placement_log.txt` | For every measured cell, the number of inbound connections each python-service worker process held: a `placement` line at the cell's start and at every change (sampled every 200 ms from the host's procfs by `lib/placement.py`), then `placement_end`. `placement_unavailable` with a reason where the container's processes cannot be read; the cell runs regardless |
 | `run_failures_log.txt` | Empty on a valid run; any entry makes `analyze-results.py` reject the run |
 | `gc-logs/gc_<phase>_rep<N>.log` | JVM GC events for that rep, from its last pin-check probe to the service JVM's exit |
+
+`run-openloop.sh` adds to the suite run it checks: `openloop_<target>_rate<R>.json.gz` per rate, `openloop_log.txt` (target, plateau, fractions and rates of each invocation), `openloop_env_trace_log.txt` (its per-cell thermal samples) and `gc-logs/gc_openloop_<timestamp>.log`.
+
+`run-all.sh` writes each step's console output to `results/logs/run-all_<timestamp>/`: `run-all.log` (one line per step), `suite.log`, `openloop.log`, `ablation.log`, `analysis_suite.log` and `analysis_ablation.log`. The analysis scripts never read `logs/`.
 
 `run-ablation.sh` writes the same shapes into `results/ablation_<host>_<timestamp>/` under `ablation_` prefixes: `ablation_<arm>_<value>_rep<N>.json.gz` plus `ablation_warmup_*`, `ablation_calib_*` (the calibration pass's measurement and warm-up per cell), `ablation_calibration_log.txt`, `ablation_run_order_log.txt`, `ablation_run_metadata.json` (the same host and toolchain fields as `run_metadata.json`, plus the control value of each arm), `ablation_cpu_pin_check_log.txt`, `ablation_env_trace_log.txt`, and `ablation_run_failures_log.txt`.
 
@@ -396,8 +417,8 @@ k6 writes its full unfiltered trail to the run directory's `raw/` first; `finali
 
 | | |
 |---|---|
-| Main suite | `table0_warmup_convergence_check`, `table1_baseline_e2e_latency_pooled`, `table1b_baseline_between_run_consistency`, `table1c_baseline_error_rates`, `table1d_baseline_client_diagnostics`, `table1e_measurement_floor_violations`, `table2_baseline_python_decomposition_mean_ms`, `table3_dataframe_share_of_computation`, `table4_concurrency_scan_summary_pooled`, `table4b_scan_between_run_consistency`, `table4c_scan_error_rates`, `table4d_scan_client_diagnostics`, `table4e_scan_within_cell_drift`, `table5_baseline_adjacent_tier_significance`, `table6_scan_adjacent_concurrency_significance`, `table_gc_overhead`, `table8a_thermal_by_group`, `table8b_thermal_pauses`, `table8c_thermal_latency_association`, and `table7_openloop_validity_check` when open-loop files are present |
-| Figures | `figure1_baseline_decomposition_stacked_bar`, `figure2_baseline_latency_distribution`, `figure3_p95_latency_vs_concurrency`, `figure4_throughput_vs_concurrency`, `figure5_decomposition_vs_concurrency_v<tier>`, `figure6_between_run_reproducibility_baseline`, `fig_gc_overhead`, `figure8_thermal_timeline`, and `figure7_openloop_validity_check` when applicable |
+| Main suite | `table0_warmup_convergence_check`, `table1_baseline_e2e_latency_pooled`, `table1b_baseline_between_run_consistency`, `table1c_baseline_error_rates`, `table1d_baseline_client_diagnostics`, `table1e_measurement_floor_violations`, `table2_baseline_python_decomposition_mean_ms`, `table3_dataframe_share_of_computation`, `table4_concurrency_scan_summary_pooled`, `table4b_scan_between_run_consistency`, `table4c_scan_error_rates`, `table4d_scan_client_diagnostics`, `table4e_scan_within_cell_drift`, `table5_baseline_adjacent_tier_significance`, `table6_scan_adjacent_concurrency_significance`, `table_gc_overhead`, `table8a_thermal_by_group`, `table8b_thermal_pauses`, `table8c_thermal_latency_association`, `table4f_scan_outlier_cells` when any scan cell is flagged, `table4g_scan_connection_placement` when the run recorded placement, and `table7_openloop_validity_check` when open-loop files are present |
+| Figures | `figure1_baseline_decomposition_stacked_bar`, `figure2_baseline_latency_distribution`, `figure3_p95_latency_vs_concurrency`, `figure4_throughput_vs_concurrency`, `figure5_decomposition_vs_concurrency_v<tier>`, `figure6_between_run_reproducibility_baseline`, `fig_gc_overhead`, `figure8_thermal_timeline`, and `figure7_openloop_validity_check` and `figure9_scan_connection_placement` when applicable |
 | Ablation | `table0_ablation_warmup_convergence_check`, `table_ablation_error_rates`, `table_ablation_decomposition`, `table_ablation_control_agreement`, `table_ablation_control_vs_extreme`, `table_ablation_thermal_by_cell`, `table_ablation_thermal_pauses`, `table_ablation_thermal_association`, `figure_ablation_mechanisms`, `figure_ablation_thermal_timeline` |
 
 The tables added to make the run's own conditions visible, and how to read them:
@@ -407,6 +428,8 @@ The tables added to make the run's own conditions visible, and how to read them:
 | `table0*` | One row per warm-up pass and target, including targets that never reached three windows or never returned HTTP 200, with the gate's own status. A `no` means that target entered its measured phase still moving |
 | `table4_concurrency_scan_summary_pooled` | N jumps by orders of magnitude between rows -- the `Sampling` column says why: `Iteration-based` levels run a fixed request count per virtual user, `Duration-calibrated` levels (`CALIB_AFFECTED_LEVELS`, read from the run's own `run_metadata.json`) run to a fixed wall-clock target instead, which produces far more requests at the same VUS |
 | `table4e_scan_within_cell_drift` | Mean change from the first to the second half of each scan cell, with a t-interval across reps. A change of the same sign in every rep means the cell mean depends on the cell's duration, which calibration holds near 60s at VUS 8 and above |
+| `table4f_scan_outlier_cells` | Scan cells whose mean latency sits far above their design cell's other reps: modified z-score above 3.5 and at least 5% above the median rep. A median shift as large as the deviation means the whole cell moved rather than its start; compute stall above the other reps' means Python threads waited off-CPU; `Placement` is the cell's connections per python-service worker, busiest first |
+| `table4g_scan_connection_placement`, `figure9_scan_connection_placement` | Scan cells per concurrency level, grouped by how many more connections the busiest worker held than the most even split would give it, with their latency deviation and extra compute stall, and a Mann-Whitney test of each uneven group against the even cells, cells as units. Uneven cells running slower with raised compute stall means that level's between-rep spread follows connection placement |
 | `table8a_thermal_by_group`, `table_ablation_thermal_by_cell` | Temperature at both edges of each cell and whether any service's cores were throttled during it, per design group. `not exposed` means the host publishes no throttle counters, so throttling is unmeasured rather than absent |
 | `table8b_thermal_pauses`, `table_ablation_thermal_pauses` | How often each phase paused for heat, and the wall-clock minutes it cost |
 | `table8c_thermal_latency_association`, `table_ablation_thermal_association` | Spearman correlation between a cell's temperature or throttling and its latency, taken as the deviation from its own design cell's mean across reps so the manipulated factor cannot register as heat. A near-zero correlation means thermal state does not explain the between-rep spread |
@@ -501,15 +524,16 @@ automatically on first `./mvnw test`, so there is nothing to pre-install there.
 cd services/fraud-ml-service
 .venv/bin/python3 -m pytest tests/ -q
 
-# Analysis pipeline and the harness's Python libraries (163 tests): cell-value
+# Analysis pipeline and the harness's Python libraries (178 tests): cell-value
 # parsing, throughput measurement, cluster bootstrap, effect size, GC log
 # parsing, k6 JSON loading, reservoir sampling and its non-200 exemption, true
 # request counts, extremes and throughput under subsampling, the warm-up gate
 # (lib/warmup_gate.py) and table 0, the k6 result filter (lib/k6_filter.py),
 # thermal telemetry and its tables, the ablation's outcome tally and planned
 # comparison, low-rep significance floor, open-loop cell identity, the
-# silent-success-on-empty-input guards, run-directory discovery, and the
-# cross-host environment gate and statistics
+# silent-success-on-empty-input guards, run-directory discovery, scan outlier
+# flagging and connection placement, the placement sampler, open-loop rate
+# derivation, and the cross-host environment gate and statistics
 cd analysis
 venv/bin/python3 -m pytest tests/ -q
 
@@ -520,11 +544,12 @@ venv/bin/python3 -m pytest tests/ -q
 cd services/transaction-service
 ./mvnw test
 
-# Load-testing harness (116 tests, bats-core): CPU-topology expansion and
+# Load-testing harness (122 tests, bats-core): CPU-topology expansion and
 # formatting, SMT-sibling and cpuset-quota guards, JVM flag-origin parsing, the
 # helpers both harness scripts duplicate, the warm-up convergence gate, the
 # throughput calibration and its once-per-run pass, the thermal guard and
-# telemetry, and run directories, archiving and the measurement fingerprint
+# telemetry, run directories, archiving and the measurement fingerprint, and
+# the input checks and placement wiring of run-all.sh, run-openloop.sh and run-suite.sh
 cd load-testing
 bats tests/
 ```
@@ -547,7 +572,9 @@ What they guard, and why it matters for the results:
 | `test_calibration.bats` | The per-target iteration derivation scales inversely with concurrency, clamps at one iteration per VU, fails loudly rather than carrying a previous target's counts forward when a calibration yields nothing, and matches `analyze-results.py`'s own `(N-1)/span` throughput convention in both scripts; the calibration pass prepares the stack like a rep, measures each target or cell once, and every rep reads back those counts |
 | `test_thermal.bats` | Temperature and throttle counters are read from the hottest zone and in core order, `na` rather than zero where the host exposes nothing; the safety check pauses, logs the pause, and aborts only when still critical after its cooldowns; neither harness script runs against a synthetic sysfs tree |
 | `test_run_layout.bats` | Run directories are named per kind and host, a new run archives only the same host's earlier run of its kind, the flat-layout sweep takes only its own kind's files, `RESULTS_DIR_OVERRIDE` archives nothing, and the measurement fingerprint changes with measured code but not with tests, docs or commit state |
-| `test_harness_libs.py` | `lib/warmup_gate.py` orders Go-trimmed timestamps numerically, sizes the window by time, reports every status, and takes true medians; `lib/k6_filter.py`'s fast path keeps exactly the lines a full JSON parse would |
+| `test_harness_libs.py` | `lib/warmup_gate.py` orders Go-trimmed timestamps numerically, sizes the window by time, reports every status, and takes true medians; `lib/k6_filter.py`'s fast path keeps exactly the lines a full JSON parse would; `lib/placement.py`, on a synthetic procfs, counts connections for the uvicorn workers only, not the supervisor or its resource tracker, reports namespace PIDs, logs only changes, stops on SIGTERM, and reports `placement_unavailable` rather than failing; `lib/openloop_rates.py` derives the plateau from HTTP 200 scan completions with table 4's `(N-1)/span` |
+| `test_scan_outliers.py` | Only a rep far above its design cell is flagged, and a spread under 5% is not whatever its z-score; a cell's placement is the state it held longest with a connection open; uneven placements are tested against even ones at the same level; table 4g and figure 9 are written only when the run recorded placement |
+| `test_orchestration.bats` | `run-all.sh` and `run-openloop.sh` reject bad input before touching the stack; every measured suite cell runs under the placement sampler, stopped on both the success and the k6-failure path; the smoke test's overload cell goes through `run-openloop.sh` |
 | `test_analysis.py` table 0 tests | Table 0 judges each warm-up file with the live gate at the run's recorded parameters and keeps a row for every expected target, including ones that never converged, in both analysis scripts |
 | `test_analysis.py` reservoir-sampling tests | Non-200 `http_req_duration` points are retained in full regardless of file size, so the error-count cross-check is never degraded by random subsampling; a truncated gzip keeps what decompressed |
 | `test_analysis.py` true-count tests | Table 1/4/7's reported N, extremes and throughput reflect every request seen, not the reservoir's sampled subset -- including the cross-metric case where no single metric individually neared the cap but the file's combined point count still did -- and open-loop cells at different rates for the same tier are kept separate rather than summed |
@@ -627,7 +654,7 @@ are covered by the unit tests above instead.
 
 - **7 repetitions per cell.** Each rep is a full clean-slate restart, so the count is a wall-clock tradeoff against statistical power. At n=7 vs 7 the smallest achievable two-sided Mann-Whitney p-value is `2/C(14,7) = 0.00058`, which still clears α=0.05 after Holm correction across the five adjacent-tier comparisons (0.0029). At n=5 the floor is 0.0079, or 0.0397 corrected: significant, but with no margin for one noisy rep. Achieved N is printed with every result. Below 7 reps, `pairwise_mannwhitney` checks the minimum p-value actually achievable at the realized rep count against alpha and prints a `[!]` when even perfect separation could not clear it (at 2 reps/side the floor is 0.333), so "Significant: No" on a short or smoke run is never misread as an actual null result rather than an underpowered test.
 - **Rep-level statistics, not request-level.** Requests within a rep share a JVM, a page cache and a thermal state, so they are not independent. All significance tests rank per-rep means and all CIs are cluster bootstraps that resample whole reps. Pooled request-level p-values appear in table 5 marked *diagnostic only* precisely because they are pseudoreplicated and would overstate significance.
-- **Closed-loop load model for the main suite.** `per-vu-iterations` fixes the number of in-flight requests, which is the model that matches a bounded caller pool and avoids unbounded queue growth invalidating high-concurrency cells. Its known cost is coordinated omission, so `run-target-openloop.js` runs a `constant-arrival-rate` check at the top cells and table 7 reports both side by side. Read the open-loop figure as the validity check on the closed-loop tail, not as a competing result.
+- **Closed-loop load model for the main suite.** `per-vu-iterations` fixes the number of in-flight requests, which is the model that matches a bounded caller pool and avoids unbounded queue growth invalidating high-concurrency cells. Its known cost is coordinated omission, so `run-openloop.sh` runs a `constant-arrival-rate` check at and below the top cell's throughput and table 7 reports both side by side. Read the open-loop figure as the validity check on the closed-loop tail, not as a competing result.
 - **Cells are calibrated to a fixed duration, not a fixed iteration count.** Throughput differs by a large factor between targets, so a flat `ITERATIONS_PER_VU` would make a trivial target's cell span seconds and an AI tier's span minutes at the same nominal setting. `calibrate_target()` measures each target's real throughput and derives the count that makes every cell at VUS 8 and above span about 60s. VUS 1, 2 and 4 keep the flat `SCAN_ITERATIONS_PER_VU` default. Measured throughput is `(N-1)/span`, not `N/span`: N completion timestamps bound N-1 inter-completion intervals, the same convention `analyze-results.py`'s own throughput figures (table 4, figure 4) use, so a calibration cell's derived iteration count and a reported throughput number are the same quantity.
 - **Calibration runs once, in its own pass, before the reps it serves.** The pass restarts and warms the stack exactly as a rep does and then measures every target (every cell, in the ablation) without running a measured cell. Every rep of a cell therefore runs the same workload after the same load history: calibrating inside the first rep would give that rep an extra load period the others lack, and calibrating in every rep would let the workload itself vary between reps. Rep-to-rep throughput drift only moves a cell's duration around its 60s target, and table 4e shows how much the cell mean depends on duration at all.
 - **Order randomization.** Targets and concurrency levels are shuffled independently per rep, so thermal drift or a background daemon cannot systematically favour whichever target would otherwise always run first.
@@ -663,6 +690,7 @@ are covered by the unit tests above instead.
 - **GC pause overhead is measured, not eliminated.** `table_gc_overhead` reports per-rep GC pause time as a percentage of wall clock. A rep above about 1%, or with a single pause near the P99, is a candidate confound for that rep's tail rather than inference cost.
 - **k6 is pinned to its own cpuset and capped at 4 CPUs.** That stops direct cgroup-level contention with the services under test, but does not isolate any of the three from the Docker daemon or the rest of the host OS, which remain unpinned. `http_req_blocked` (tables 1d and 4d) is a partial diagnostic only; it cannot independently prove k6 never became the bottleneck at high concurrency.
 - **The Java outbound connection pool is sized at 2x the run's peak VUS** by both harness scripts, so pool queueing cannot masquerade as network or Python cost. A hand-started stack falls back to the 128 default.
+- **Connection-to-worker placement differs between reps.** python-service runs three uvicorn worker processes sharing one listening socket, and each new connection goes to whichever worker accepts it. transaction-service's pool opens its connections to python-service anew in every cell, since uvicorn closes a connection after 5s idle and cells are 10s apart, so at low concurrency two connections can share a worker in one rep and not in the next; requests on a shared worker contend for its GIL, which shows as a whole-cell shift with raised compute stall. `connection_placement_log.txt` records every cell's placement, and tables 4f and 4g test whether it explains a level's between-rep spread. It is recorded rather than controlled, since assigning connections to workers would change the service under test.
 - **OOM kills abort the suite** per cell rather than being logged and skipped, as do cpu-pin, tier and thread-env failures. There are no partial runs.
 
 ### External validity: how far do the results generalize?
@@ -694,23 +722,26 @@ are covered by the unit tests above instead.
 │   ├── lib/
 │   │   ├── warmup_check.py       # table 0 for both scripts, judged by load-testing/lib/warmup_gate.py
 │   │   ├── thermal.py            # per-cell thermal state, pauses, thermal-latency association
+│   │   ├── scan_outliers.py      # scan outlier cells and latency by connection-to-worker placement
 │   │   ├── run_dirs.py           # run-directory discovery and identity, output folders
 │   │   ├── report.py             # table (.csv/.md/.tex) and figure (.png/.pdf) writers
 │   │   └── hostvariance.py       # environment gate and cross-run statistics
 │   ├── probing/
 │   │   └── plot_warmup_curve.py  # thermal diagnostic: latency vs VUs, temp and core frequency
 │   ├── output/                   # generated: tables/<run>/, figures/<run>/, hostvariance/{tables,figures}/
-│   ├── tests/                    # pytest (163): analysis pipeline, warm-up gate, k6 filter, thermal, host variance
+│   ├── tests/                    # pytest (178): analysis pipeline, harness libraries, thermal, outliers, host variance
 │   ├── requirements.txt
 │   └── requirements-dev.txt      # test-only: pytest, kept off analyze-*.py's real runtime deps
 ├── load-testing/
 │   ├── run-suite.sh              # full baseline + concurrency-scan orchestrator
 │   ├── run-ablation.sh           # four-arm thread-dispatch mechanism sweep
+│   ├── run-openloop.sh           # open-loop validity check against one suite run
+│   ├── run-all.sh                # suite, open-loop check, ablation and both analyses in sequence
 │   ├── run-smoke-test.sh         # small pipeline-check pass before the full suite
 │   ├── recommend-cpusets.sh      # prints cpuset values fitting this host's topology
 │   ├── warm-up.js                # per-target sequential JIT/pool warm-up
 │   ├── run-target.js             # single (target, concurrency, rep) cell runner (closed-loop)
-│   ├── run-target-openloop.js    # manual constant-arrival-rate check, top concurrency cells only
+│   ├── run-target-openloop.js    # constant-arrival-rate cell runner, driven by run-openloop.sh
 │   ├── lib/
 │   │   ├── common.js             # shared sendTransaction()/TARGETS + telemetry Trends
 │   │   ├── topology.sh           # cpuset to physical-core resolution; SMT-overlap/cpuset-quota guards
@@ -719,6 +750,8 @@ are covered by the unit tests above instead.
 │   │   ├── run-layout.sh         # per-run results directory, archiving, measurement fingerprint
 │   │   ├── thermal.sh            # thermal guard, per-cell temperature and throttle telemetry
 │   │   ├── warmup_gate.py        # warm-up convergence criterion shared by the gate, probes and table 0
+│   │   ├── placement.py          # per-cell connection-to-worker placement, read from the host's procfs
+│   │   ├── openloop_rates.py     # a suite run's plateau throughput, for run-openloop.sh's rates
 │   │   └── k6_filter.py          # keeps the metrics the analysis reads and gzips each result
 │   ├── probing/                  # standalone diagnostics, not wired into the suite
 │   │   ├── probe_warmup_joint.sh         # all six targets, past the chunk cap, per-target tail drift
@@ -727,7 +760,7 @@ are covered by the unit tests above instead.
 │   │   ├── probe_calibration_drift.sh    # checks calibrated throughput actually holds across reps
 │   │   ├── probe_ablation_taper.sh       # per-arm cell-duration check
 │   │   └── probe_telemetry_completeness.sh  # per-target telemetry field presence, build-freshness check
-│   └── tests/                    # bats-core (116): topology, JVM pins, shared helpers, warm-up gate, calibration, thermal, run layout
+│   └── tests/                    # bats-core (122): topology, JVM pins, shared helpers, warm-up gate, calibration, thermal, run layout, orchestration
 ├── fault-injection/
 │   ├── verify-guards.sh          # runs each case, records whether the expected guard fired
 │   ├── cases/*.case              # 9 cases: 00 unmodified as control, 01-08 each misconfigure one pinned setting
@@ -735,6 +768,7 @@ are covered by the unit tests above instead.
 ├── results/                       # generated, gitignored except .gitkeep
 │   ├── suite_<host>_<timestamp>/  # one run-suite.sh run: *.json.gz, run_metadata.json, logs, gc-logs/
 │   ├── ablation_<host>_<timestamp>/  # one run-ablation.sh run: ablation_* files
+│   ├── logs/run-all_<timestamp>/  # run-all.sh's per-step console output
 │   └── archive/                   # superseded runs of the same kind and host
 └── services/
     ├── fraud-ml-service/            # Python FastAPI inference service
