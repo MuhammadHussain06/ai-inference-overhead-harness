@@ -1,6 +1,7 @@
 """Guards the Python halves of the load-testing harness: lib/warmup_gate.py, the
-warm-up criterion the live gate and table0 share, and lib/k6_filter.py, which
-decides what every result file keeps."""
+warm-up criterion the live gate and table0 share; lib/k6_filter.py, which decides
+what every result file keeps; lib/placement.py, which records connection-to-worker
+placement; and lib/openloop_rates.py, which sets the open-loop arrival rates."""
 
 import gzip
 import importlib.util
@@ -8,6 +9,7 @@ import json
 import statistics
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,8 +25,11 @@ def _load(name):
     return module
 
 
+sys.path.insert(0, str(LIB_DIR))
 gate = _load("warmup_gate")
 k6_filter = _load("k6_filter")
+placement = _load("placement")
+openloop_rates = _load("openloop_rates")
 
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -242,3 +247,104 @@ def test_gzip_mode_compresses_byte_for_byte(tmp_path):
     _run_filter("gzip", str(plain), str(tmp_path / "out.json.gz"))
     with gzip.open(tmp_path / "out.json.gz", "rb") as f:
         assert f.read() == plain.read_bytes()
+
+
+# lib/placement.py
+
+def _fake_proc(root, established_by_pid, extra_listen_holders=()):
+    """A procfs tree like a uvicorn container's: sh (100) -> supervisor (101) ->
+    workers 102-104 plus a resource tracker (105). Every uvicorn process holds the
+    listening socket (inode 900); established_by_pid gives each process's accepted
+    connections as socket inodes."""
+    tree = {100: (1, "sh"), 101: (100, "uvicorn app"), 102: (101, "python (w)"), 103: (101, "python"),
+            104: (101, "python"), 105: (101, "python"), 999: (1, "unrelated")}
+    listen_holders = {101, 102, 103, 104, *extra_listen_holders}
+    lines = ["  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"]
+    lines.append("   0: 00000000:1F40 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000 0 900")
+    for pid, inodes in established_by_pid.items():
+        for inode in inodes:
+            lines.append(f"   1: 0200000A:1F40 0300000A:D431 01 00000000:00000000 00:00000000 00000000  1000 0 {inode}")
+    lines.append("   2: 0200000A:9C40 0300000A:1F90 01 00000000:00000000 00:00000000 00000000  1000 0 950")
+    for pid, (ppid, comm) in tree.items():
+        d = root / str(pid)
+        (d / "fd").mkdir(parents=True)
+        (d / "stat").write_text(f"{pid} ({comm}) S {ppid} {pid} {pid} 0 -1\n")
+        (d / "status").write_text(f"Name:\tx\nNSpid:\t{pid}\t{pid - 93}\n")
+        sockets = (["900"] if pid in listen_holders else []) + list(established_by_pid.get(pid, []))
+        for fd, inode in enumerate(sockets, start=3):
+            (d / "fd" / str(fd)).symlink_to(f"socket:[{inode}]")
+        (d / "fd" / "0").symlink_to("/dev/null")
+    (root / "100" / "net").mkdir()
+    (root / "100" / "net" / "tcp").write_text("\n".join(lines) + "\n")
+    return root
+
+
+def test_placement_finds_the_workers_not_the_supervisor_or_tracker(tmp_path):
+    root = _fake_proc(tmp_path, {})
+    assert placement.find_workers(str(root), 100, 8000) == [102, 103, 104]
+
+
+def test_placement_counts_connections_per_worker_by_namespace_pid(tmp_path):
+    root = _fake_proc(tmp_path, {102: ["901", "902"], 104: ["903"]})
+    workers = placement.find_workers(str(root), 100, 8000)
+    assert placement.snapshot(str(root), 100, 8000, workers) == (3, {9: 2, 10: 0, 11: 1})
+
+
+def test_placement_single_process_server_is_its_own_worker(tmp_path):
+    root = _fake_proc(tmp_path, {101: ["901"]})
+    for pid in (102, 103, 104):
+        for link in (root / str(pid) / "fd").iterdir():
+            link.unlink()
+    assert placement.find_workers(str(root), 100, 8000) == [101]
+
+
+def test_placement_sampler_logs_changes_and_stops_on_sigterm(tmp_path):
+    root = _fake_proc(tmp_path, {102: ["901", "902"]})
+    proc = subprocess.Popen([sys.executable, str(LIB_DIR / "placement.py"), "--container-pid", "100",
+                             "--cell", "scan_10_vus2_rep4", "--proc-root", str(root), "--interval", "0.05"],
+                            stdout=subprocess.PIPE, text=True)
+    time.sleep(0.5)
+    proc.terminate()
+    out = proc.communicate(timeout=5)[0].splitlines()
+    assert proc.returncode == 0
+    assert len(out) == 2
+    assert out[0].startswith("placement cell=scan_10_vus2_rep4 ts=")
+    assert out[0].endswith("established=2 workers=9:2,10:0,11:0")
+    assert out[1].startswith("placement_end cell=scan_10_vus2_rep4 ts=")
+
+
+def test_placement_reports_unavailable_instead_of_failing(tmp_path):
+    proc = subprocess.run([sys.executable, str(LIB_DIR / "placement.py"), "--container-pid", "4242",
+                           "--cell", "c", "--proc-root", str(tmp_path)], capture_output=True, text=True, timeout=10)
+    assert proc.returncode == 0
+    assert proc.stdout.startswith("placement_unavailable cell=c ")
+
+
+# lib/openloop_rates.py
+
+def _scan_cell(path, completions_s, extra=()):
+    lines = []
+    for i, t in enumerate(completions_s):
+        tags = {"tier": "28", "status": "200", "phase": "scan", "vus": "64"}
+        lines.append(json.dumps({"metric": "http_req_duration", "type": "Point",
+                                 "data": {"time": _ts(t * 1000), "value": 5.0, "tags": tags}}))
+    lines.extend(extra)
+    with gzip.open(path, "wt") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def test_openloop_plateau_is_the_top_levels_mean_within_rep_throughput(tmp_path):
+    _scan_cell(tmp_path / "scan_28_vus64_rep1.json.gz", [i * 0.01 for i in range(101)])   # 100 req/s
+    _scan_cell(tmp_path / "scan_28_vus64_rep2.json.gz", [i * 0.02 for i in range(101)])   # 50 req/s
+    _scan_cell(tmp_path / "scan_28_vus32_rep1.json.gz", [i * 0.001 for i in range(101)])  # lower level, ignored
+    assert openloop_rates.plateau(str(tmp_path), "28") == (64, pytest.approx(75.0))
+
+
+def test_openloop_plateau_ignores_errors_and_other_phases(tmp_path):
+    noise = [json.dumps({"metric": "http_req_duration", "type": "Point",
+                         "data": {"time": _ts(50_000), "value": 1.0,
+                                  "tags": {"tier": "28", "status": status, "phase": phase}}})
+             for status, phase in (("500", "scan"), ("200", "warmup"))]
+    _scan_cell(tmp_path / "scan_28_vus64_rep1.json.gz", [i * 0.01 for i in range(101)], extra=noise)
+    assert openloop_rates.plateau(str(tmp_path), "28") == (64, pytest.approx(100.0))
+    assert openloop_rates.plateau(str(tmp_path), "5") is None
