@@ -6,7 +6,7 @@ set -euo pipefail
 exec < /dev/null
 
 # Orchestrates clean-slate stack restarts, randomized execution order, system provenance logging,
-# and verification of CPU pinning, thread caps (n_jobs, BLAS/OpenMP), and CPU governor frequencies.
+# and verification of CPU pinning, thread caps (n_jobs, BLAS/OpenMP), and the CPU power state.
 
 # Anchor execution directory to the script's location for path stability.
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -22,32 +22,45 @@ for _req_cmd in docker curl shuf python3; do
   fi
 done
 
-for _req_lib in lib/host-provenance.sh lib/jvm-pins.sh lib/topology.sh lib/thermal.sh \
-  lib/run-layout.sh lib/warmup_gate.py lib/k6_filter.py lib/placement.py; do
+for _req_lib in lib/host-provenance.sh lib/power-state.sh lib/jvm-pins.sh lib/topology.sh lib/thermal.sh \
+  lib/run-layout.sh lib/warmup_gate.py lib/k6_filter.py lib/placement.py lib/cpufreq_sampler.py; do
   if [ ! -r "$_req_lib" ]; then
     echo "[!] Required helper not found: ${_req_lib}. Aborting before touching any containers." >&2
     exit 1
   fi
 done
 
-# Host-state provenance for run_metadata.json, the JVM collector/thread-pool guards, the
-# topology checks that decide whether this host's cpusets mean what they say, the
-# thermal guard and telemetry, and the per-run results directory.
+# Host-state provenance for run_metadata.json, the CPU power state every cell is checked
+# against, the JVM collector/thread-pool guards, the topology checks that decide whether
+# this host's cpusets mean what they say, the thermal guard and telemetry, and the per-run
+# results directory.
 . lib/host-provenance.sh
+. lib/power-state.sh
 . lib/jvm-pins.sh
 . lib/topology.sh
 . lib/thermal.sh
 . lib/run-layout.sh
 
-# Reading topology or temperatures from anywhere but the live tree would verify core
-# placement, or guard heat, on a host that is not the one running the containers.
-for _sysfs_var in TOPO_SYSFS_ROOT THERMAL_SYSFS_ROOT; do
+# Reading topology, temperatures or the power state from anywhere but the live tree would
+# verify core placement, guard heat or check clocks on a host that is not the one running
+# the containers.
+for _sysfs_var in TOPO_SYSFS_ROOT THERMAL_SYSFS_ROOT POWER_SYSFS_ROOT; do
   if [ "${!_sysfs_var:-/sys}" != "/sys" ]; then
     echo "[!] ${_sysfs_var} is set to '${!_sysfs_var}'. The suite reads the live host only;" >&2
     echo "    unset it before running." >&2
     exit 1
   fi
 done
+
+# Turbo is a fixed run parameter: with it on, a laptop's clock follows its temperature
+# history, so a cell's speed would depend on the cells before it. Checked before the run
+# directory is created, so a refused start leaves results/ untouched.
+REQUIRED_TURBO="${REQUIRED_TURBO_OVERRIDE:-off}"
+case "$REQUIRED_TURBO" in
+  on|off) ;;
+  *) echo "[!] REQUIRED_TURBO_OVERRIDE must be on or off, got '${REQUIRED_TURBO}'." >&2; exit 1 ;;
+esac
+require_prepared_host "$REQUIRED_TURBO"
 
 # On WSL2 the cgroup cpuset checks pass but Hyper-V host core migration is
 # unobservable, so pinning cannot actually be confirmed. Non-blocking; recorded
@@ -99,8 +112,9 @@ trap _log_uncaught_exit EXIT
 CPU_PIN_LOG="${RESULTS_DIR}/cpu_pin_check_log.txt"
 : > "$CPU_PIN_LOG"   # truncate/create fresh each suite run
 # Governor, frequency, temperature and throttle counters at both ends of every rep,
-# temperature and throttle counters at both edges of every measured cell, and every
-# thermal check with the time it paused for (see lib/thermal.sh).
+# temperature and throttle counters at both edges of every measured cell, each cell's
+# service-core clock (lib/cpufreq_sampler.py), and every thermal check with the time it
+# paused for (see lib/thermal.sh).
 ENV_TRACE_LOG="${RESULTS_DIR}/env_trace_log.txt"
 : > "$ENV_TRACE_LOG"   # truncate/create fresh each suite run
 # The iteration counts every scan rep runs each calibrated target with.
@@ -381,6 +395,7 @@ capture_run_metadata() {
   "cpu_freq_khz_at_start": "$(json_escape "$cpu_freq_khz")",
   "total_mem_kb": "$(json_escape "$total_mem_kb")",
   "host_provenance": $(host_provenance_json),
+  "power_state": $(power_state_json "$REQUIRED_TURBO" "$POWER_STATE_AT_START"),
   "jvm_pinned_options": "$(json_escape "$(jvm_pinned_options)")",
   "cores_used_by_suite": {
     "python_service_cpuset": "$(json_escape "${py_cpuset:-unknown}")",
@@ -1074,6 +1089,7 @@ calibrate_scan_targets() {
 
   echo "[*] E2 calibration: each target's throughput at VUS=${CALIB_VUS}, measured once for every scan rep"
   record_env_sample "scan_calibration_start"
+  check_power_state "scan calibration"
   restart_stack
   wait_for_ready
   verify_cpu_pinning "scan calibration"
@@ -1174,30 +1190,38 @@ stop_placement_sampler() {
 }
 
 # Runs one measured cell, named by its result file's stem, between two thermal
-# samples and under the placement sampler. Aborts the suite on a k6 failure -- no
-# benefit to continuing once analyze-results.py will reject the whole run anyway.
+# samples and power-state checks, under the placement and clock samplers. Aborts the
+# suite on a k6 failure -- no benefit to continuing once analyze-results.py will reject
+# the whole run anyway.
 run_cell() {
   local label="$1" cell="$2"
   shift 2
+  check_power_state "$label"
   start_placement_sampler "$cell"
+  start_freq_sampler "$cell" "$SERVICE_CPUSETS" "$PINNED_CPUS"
   record_cell_thermal start "$cell"
   if ! "$@"; then
     stop_placement_sampler
+    stop_freq_sampler "$label"
     abort_suite "[cell] ${label}" "k6 exited non-zero."
   fi
   record_cell_thermal end "$cell"
+  stop_freq_sampler "$label"
   stop_placement_sampler
+  check_power_state "$label"
   check_oom_killed "$label"
   check_thermal_safety "$label"
 }
 
 capture_run_metadata
+SERVICE_CPUSETS="python=$(compose_service_value python-service cpuset) java=$(compose_service_value transaction-service cpuset) k6=$(compose_service_value k6 cpuset)"
 PINNED_CPUS="$(compose_service_value python-service cpuset),$(compose_service_value transaction-service cpuset),$(compose_service_value k6 cpuset)"
 
 echo "[*] E1: baseline decomposition x ${REPS_BASELINE} independent repetitions"
 for rep in $(seq 1 "$REPS_BASELINE"); do
   echo "[*] --- Baseline repetition ${rep}/${REPS_BASELINE} ---"
   record_env_sample "baseline_rep${rep}_start"
+  check_power_state "baseline rep=${rep}"
   restart_stack
   wait_for_ready
   verify_cpu_pinning "baseline rep=${rep}"
@@ -1233,6 +1257,7 @@ echo "[*] E2: concurrency scan x ${REPS_SCAN} independent repetitions"
 for rep in $(seq 1 "$REPS_SCAN"); do
   echo "[*] --- Scan repetition ${rep}/${REPS_SCAN} ---"
   record_env_sample "scan_rep${rep}_start"
+  check_power_state "scan rep=${rep}"
   restart_stack
   wait_for_ready
   verify_cpu_pinning "scan rep=${rep}"
@@ -1284,7 +1309,8 @@ echo "    Per-rep cell order logged to ${ORDER_LOG}"
 echo "    Connection-to-worker placement per cell logged to ${PLACEMENT_LOG}"
 echo "    Host/toolchain fingerprint (incl. physical-core isolation) logged to ${METADATA_FILE}"
 echo "    CPU pinning, SMT topology and thread-env checks logged to ${CPU_PIN_LOG}"
-echo "    Per-rep governor/frequency/temperature and per-cell thermal samples logged to ${ENV_TRACE_LOG}"
+echo "    Per-rep governor/frequency/temperature and per-cell thermal and clock samples logged to ${ENV_TRACE_LOG}"
+echo "    CPU power state (checked at every cell edge) recorded in ${METADATA_FILE}"
 echo "    Warm-up JSON output (for post-hoc convergence check) saved as warmup_baseline_rep*.json.gz,"
 echo "    warmup_scan_rep*.json.gz (default VUS), and warmup_scan_maxvus_rep*.json.gz (VUS=${MAX_VUS})"
 echo "    'calibration' target included alongside mock/5/10/20/28 -- isolates instrumentation overhead"

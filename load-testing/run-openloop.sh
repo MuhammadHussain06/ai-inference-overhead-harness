@@ -7,8 +7,9 @@
 #
 # Rates are fractions of the target's closed-loop throughput at the run's highest scan
 # concurrency (OPENLOOP_FRACTIONS, default "1.0 0.8"), or explicit via OPENLOOP_RATES.
-# Each cell runs on a freshly restarted, warmed-up stack with the suite's thermal guard
-# and per-cell thermal samples (openloop_env_trace_log.txt).
+# Each cell runs on a freshly restarted, warmed-up stack with the suite's thermal guard,
+# per-cell thermal and clock samples (openloop_env_trace_log.txt), and the CPU power state
+# the suite run recorded, checked at every cell edge.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -20,14 +21,25 @@ for _req_cmd in docker curl python3; do
     exit 1
   fi
 done
-for _req_lib in lib/thermal.sh lib/run-layout.sh lib/k6_filter.py lib/openloop_rates.py lib/warmup_gate.py; do
+for _req_lib in lib/host-provenance.sh lib/power-state.sh lib/thermal.sh lib/run-layout.sh lib/k6_filter.py \
+  lib/openloop_rates.py lib/warmup_gate.py lib/placement.py lib/cpufreq_sampler.py; do
   if [ ! -r "$_req_lib" ]; then
     echo "[!] Required helper not found: ${_req_lib}." >&2
     exit 1
   fi
 done
+. lib/host-provenance.sh
+. lib/power-state.sh
 . lib/thermal.sh
 . lib/run-layout.sh
+
+for _sysfs_var in THERMAL_SYSFS_ROOT POWER_SYSFS_ROOT; do
+  if [ "${!_sysfs_var:-/sys}" != "/sys" ]; then
+    echo "[!] ${_sysfs_var} is set to '${!_sysfs_var}'. Open-loop cells read the live host only;" >&2
+    echo "    unset it before running." >&2
+    exit 1
+  fi
+done
 
 OPENLOOP_TARGET="${OPENLOOP_TARGET:-28}"
 OPENLOOP_FRACTIONS="${OPENLOOP_FRACTIONS:-1.0 0.8}"
@@ -57,6 +69,18 @@ if [ ! -f "${RUN_DIR}/run_metadata.json" ]; then
   exit 1
 fi
 RUN_DIR=$(cd "$RUN_DIR" && pwd)
+
+# One field of the suite run's metadata by dotted path, empty when absent.
+suite_metadata() {
+  python3 - "${RUN_DIR}/run_metadata.json" "$1" <<'PYEOF'
+import json, sys
+value = json.load(open(sys.argv[1]))
+for key in sys.argv[2].split("."):
+    value = value.get(key) if isinstance(value, dict) else None
+print("" if value is None else value)
+PYEOF
+}
+
 RAW_DIR="${RUN_DIR}/raw"
 ENV_TRACE_LOG="${RUN_DIR}/openloop_env_trace_log.txt"
 OPENLOOP_LOG="${RUN_DIR}/openloop_log.txt"
@@ -66,7 +90,7 @@ compose() {
     docker compose -f "$COMPOSE_FILE" "$@"
 }
 
-# Called by lib/thermal.sh when a host stays critically hot.
+# Called by lib/thermal.sh and lib/power-state.sh when the run must stop.
 abort_suite() {
   echo "  [FATAL] $1: ${*:2}" >&2
   compose down || true
@@ -94,6 +118,25 @@ for r in "${RATES[@]}"; do
     exit 1
   fi
 done
+
+# The open-loop cells are compared with this run's scan, so they must run in the power
+# state it recorded.
+SUITE_POWER_STATE=$(suite_metadata power_state.snapshot)
+if [ -z "$SUITE_POWER_STATE" ]; then
+  echo "[!] ${RUN_DIR} recorded no CPU power state, so open-loop cells cannot be matched to it." >&2
+  exit 1
+fi
+require_prepared_host "$(suite_metadata power_state.turbo_required)"
+if [ "$POWER_STATE_AT_START" != "$SUITE_POWER_STATE" ]; then
+  echo "[!] The CPU power state differs from the one ${RUN_DIR} ran in:" >&2
+  echo "      suite run: ${SUITE_POWER_STATE}" >&2
+  echo "      now:       ${POWER_STATE_AT_START}" >&2
+  exit 1
+fi
+SERVICE_CPUSETS="python=$(suite_metadata cores_used_by_suite.python_service_cpuset)"
+SERVICE_CPUSETS+=" java=$(suite_metadata cores_used_by_suite.transaction_service_cpuset)"
+SERVICE_CPUSETS+=" k6=$(suite_metadata cores_used_by_suite.k6_cpuset)"
+PINNED_CPUS=$(tr ' ' '\n' <<< "$SERVICE_CPUSETS" | cut -d= -f2 | paste -sd, -)
 
 echo "openloop ts=$(thermal_ts) target=${OPENLOOP_TARGET} plateau_vus_rps=${PLATEAU// /:}" \
      "fractions=${FRACTIONS} rates=$(IFS=,; echo "${RATES[*]}")" \
@@ -128,16 +171,21 @@ sleep "$OPENLOOP_COOLDOWN_S"
 for rate in "${RATES[@]}"; do
   cell="openloop_${OPENLOOP_TARGET}_rate${rate}"
   check_thermal_safety "openloop rate=${rate}"
+  check_power_state "openloop rate=${rate}"
   echo "  -> ${cell}: ${rate} req/s for ${OPENLOOP_DURATION}"
+  start_freq_sampler "$cell" "$SERVICE_CPUSETS" "$PINNED_CPUS"
   record_cell_thermal start "$cell"
   if ! compose --profile loadgen run --rm -T \
       -e TARGET="$OPENLOOP_TARGET" -e RATE="$rate" -e TIME_UNIT=1s -e DURATION="$OPENLOOP_DURATION" \
       -e PRE_ALLOCATED_VUS="$OPENLOOP_PRE_ALLOCATED_VUS" -e MAX_VUS="$OPENLOOP_MAX_VUS" \
       -e PHASE="$OPENLOOP_PHASE" -e REP=1 \
       k6 run /scripts/run-target-openloop.js --out "json=/results/raw/${cell}.json" < /dev/null; then
+    stop_freq_sampler "openloop rate=${rate}"
     abort_suite "[openloop] ${cell}" "k6 exited non-zero."
   fi
   record_cell_thermal end "$cell"
+  stop_freq_sampler "openloop rate=${rate}"
+  check_power_state "openloop rate=${rate}"
   python3 "${LIB_DIR}/k6_filter.py" finalize "${RAW_DIR}/${cell}.json" "${RUN_DIR}/${cell}.json.gz" "$KEEP_METRICS"
   rm -f "${RAW_DIR}/${cell}.json"
   sleep "$OPENLOOP_COOLDOWN_S"

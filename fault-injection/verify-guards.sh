@@ -25,6 +25,12 @@ for _req_cmd in docker python3 timeout; do
   fi
 done
 
+# Every case runs run-suite.sh, which refuses an unprepared host; without this check each
+# case would read as aborting through the wrong guard.
+. ../load-testing/lib/host-provenance.sh
+. ../load-testing/lib/power-state.sh
+require_prepared_host "${REQUIRED_TURBO_OVERRIDE:-off}"
+
 REPO_ROOT=$(cd .. && pwd)
 SCRATCH="$(pwd)/scratch"
 REPORT_DIR="$(pwd)/results"

@@ -6,11 +6,14 @@
 #
 # A suite failure stops the chain. A failed open-loop step is reported and the ablation
 # still runs; a failed ablation skips its analysis. The exit status is non-zero if any
-# step failed. Each step's output goes to results/logs/run-all_<UTC timestamp>/.
+# step failed. Each step's output goes to results/logs/run-all_<UTC timestamp>/. An
+# unprepared host (see prepare-host.sh) is refused before any step starts.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 . lib/run-layout.sh
+. lib/host-provenance.sh
+. lib/power-state.sh
 
 STEPS=(suite openloop ablation analysis)
 START_AT="${START_AT:-suite}"
@@ -32,6 +35,13 @@ export PYTHONUNBUFFERED=1
 
 step() { echo "[$(date -u +%FT%TZ)] $*" | tee -a "${LOG_DIR}/run-all.log"; }
 
+# Each step checks the power state itself; checking here too stops an unattended chain at
+# launch, with the reason in run-all.log, rather than after its first step fails.
+if [ "$START_AT" != "analysis" ] && ! power_check=$(require_prepared_host "${REQUIRED_TURBO_OVERRIDE:-off}" 2>&1); then
+  echo "$power_check" | tee -a "${LOG_DIR}/run-all.log" >&2
+  exit 1
+fi
+
 runs() {
   local i
   for i in "${!STEPS[@]}"; do
@@ -45,11 +55,9 @@ latest_run() {
   if [ -d "${dirs[-1]}" ]; then (cd "${dirs[-1]}" && pwd); fi
 }
 
-# Recorded, not enforced, as in the harness itself: the chain is often started unattended,
-# where a wrong governor or a battery would otherwise go unnoticed until the analysis.
-governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unexposed")
 step "run-all from ${START_AT}, commit $(git -C .. rev-parse --short HEAD 2>/dev/null || echo unknown)," \
-     "governor ${governor}, power $(. lib/host-provenance.sh && power_source_state), logs in ${LOG_DIR}"
+     "logs in ${LOG_DIR}"
+step "power state: $(power_state_snapshot)"
 
 failed=0
 if runs suite; then

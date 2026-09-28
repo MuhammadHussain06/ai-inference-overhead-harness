@@ -4,7 +4,8 @@ set -euo pipefail
 # First-pass pipeline check, not a real data run. Runs a small slice of run-suite.sh,
 # one deliberately over-rate open-loop check to confirm dropped_iterations fires, a
 # two-cell ablation slice, and both analysis scripts. Confirms every path executes end
-# to end before committing to the full multi-day suite.
+# to end before committing to the full multi-day suite. Needs a prepared host, as every
+# harness script does (see prepare-host.sh).
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 . lib/run-layout.sh
@@ -82,8 +83,9 @@ echo "[*] Smoke test 4/4: both analysis scripts, on this smoke test's two runs o
 echo "[+] Smoke test complete. Before trusting this run, check, in ${SUITE_DIR} and ${ABLATION_DIR}:"
 echo "    run_failures_log.txt and ablation_run_failures_log.txt (both empty)"
 echo "    cpu_pin_check_log.txt and ablation_cpu_pin_check_log.txt, incl. the smt_check lines"
-echo "    env_trace_log.txt and ablation_env_trace_log.txt (cell_start/cell_end and"
+echo "    env_trace_log.txt and ablation_env_trace_log.txt (cell_start/cell_end, cell_freq and"
 echo "    thermal_check lines for every cell), and both *calibration_log.txt files"
+echo "    power_state in both metadata files: the state prepare-host.sh set, turbo as required"
 echo "    connection_placement_log.txt: placement lines for every cell, not placement_unavailable"
 echo "    the [+]/[!] smoke-openloop line printed above (dropped_iterations at RATE=5000);"
 echo "    table7 itself will not show this cell -- it excludes phase=smoke-openloop on purpose"

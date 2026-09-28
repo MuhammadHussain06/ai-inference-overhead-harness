@@ -19,32 +19,42 @@ for _req_cmd in docker curl shuf python3; do
   fi
 done
 
-for _req_lib in lib/host-provenance.sh lib/jvm-pins.sh lib/topology.sh lib/thermal.sh \
-  lib/run-layout.sh lib/warmup_gate.py lib/k6_filter.py; do
+for _req_lib in lib/host-provenance.sh lib/power-state.sh lib/jvm-pins.sh lib/topology.sh lib/thermal.sh \
+  lib/run-layout.sh lib/warmup_gate.py lib/k6_filter.py lib/placement.py lib/cpufreq_sampler.py; do
   if [ ! -r "$_req_lib" ]; then
     echo "[!] Required helper not found: ${_req_lib}. Aborting before touching any containers." >&2
     exit 1
   fi
 done
 
-# Host-state provenance for ablation_run_metadata.json, the CPU-topology and JVM
-# collector/thread-pool guards every cell is gated on, the thermal guard and telemetry, and
-# the per-run results directory.
+# Host-state provenance for ablation_run_metadata.json, the CPU power state, CPU-topology
+# and JVM collector/thread-pool guards every cell is gated on, the thermal guard and
+# telemetry, and the per-run results directory.
 . lib/host-provenance.sh
+. lib/power-state.sh
 . lib/jvm-pins.sh
 . lib/topology.sh
 . lib/thermal.sh
 . lib/run-layout.sh
 
-# Reading topology or temperatures from anywhere but the live tree would verify core
-# placement, or guard heat, on a host that is not the one running the containers.
-for _sysfs_var in TOPO_SYSFS_ROOT THERMAL_SYSFS_ROOT; do
+# Reading topology, temperatures or the power state from anywhere but the live tree would
+# verify core placement, guard heat or check clocks on a host that is not the one running
+# the containers.
+for _sysfs_var in TOPO_SYSFS_ROOT THERMAL_SYSFS_ROOT POWER_SYSFS_ROOT; do
   if [ "${!_sysfs_var:-/sys}" != "/sys" ]; then
     echo "[!] ${_sysfs_var} is set to '${!_sysfs_var}'. The ablation reads the live host only;" >&2
     echo "    unset it before running." >&2
     exit 1
   fi
 done
+
+# Same turbo parameter and start check as run-suite.sh, before the run directory exists.
+REQUIRED_TURBO="${REQUIRED_TURBO_OVERRIDE:-off}"
+case "$REQUIRED_TURBO" in
+  on|off) ;;
+  *) echo "[!] REQUIRED_TURBO_OVERRIDE must be on or off, got '${REQUIRED_TURBO}'." >&2; exit 1 ;;
+esac
+require_prepared_host "$REQUIRED_TURBO"
 
 IS_WSL2="false"
 if grep -qi microsoft /proc/version 2>/dev/null; then
@@ -292,6 +302,7 @@ capture_run_metadata() {
   "cpu_freq_khz_at_start": "$(json_escape "$cpu_freq_khz")",
   "total_mem_kb": "${total_mem_kb}",
   "host_provenance": $(host_provenance_json),
+  "power_state": $(power_state_json "$REQUIRED_TURBO" "$POWER_STATE_AT_START"),
   "jvm_pinned_options": "$(json_escape "$(jvm_pinned_options)")",
   "cores_used_by_suite": {
     "python_service_cpuset": "${py_cpuset:-unknown}",
@@ -898,6 +909,7 @@ calibrate_ablation_cells() {
     label="calibration arm=${arm} value=${value}"
     echo "  -> ${label}"
     record_env_sample "calibration_${arm}_${value}_start"
+    check_power_state "$label"
     verify_smt_isolation "$label" "$cpuset"
     verify_service_cpuset "$label" "python-service" "$cpuset" "$cpus"
     restart_stack "$cpuset" "$cpus" "$workers" "$tokens"
@@ -944,6 +956,7 @@ for rep in $(seq 1 "$REPS_ABLATION"); do
     echo "  -> ${label}"
 
     record_env_sample "${arm}_${value}_rep${rep}_start"
+    check_power_state "$label"
     verify_smt_isolation "$label" "$cpuset"
     verify_service_cpuset "$label" "python-service" "$cpuset" "$cpus"
     restart_stack "$cpuset" "$cpus" "$workers" "$tokens"
@@ -962,15 +975,22 @@ for rep in $(seq 1 "$REPS_ABLATION"); do
     ABLATION_ITER_PER_VU="${ABLATION_CALIB_CACHE[${arm}:${value}]}"
 
     cell_name="ablation_${arm}_${value}_rep${rep}.json"
+    check_power_state "$label"
+    # The cell's own python-service cpuset: the cpuset arm moves it.
+    start_freq_sampler "${cell_name%.json}" "python=${cpuset} java=${JAVA_CPUSET} k6=${K6_CPUSET}" \
+      "${cpuset},${JAVA_CPUSET},${K6_CPUSET}"
     record_cell_thermal start "${cell_name%.json}"
     if ! k6_run run-target.js \
       TARGET="$ABLATION_TARGET" VUS="$ABLATION_VUS" ITERATIONS_PER_VU="$ABLATION_ITER_PER_VU" \
       PHASE=ablation REP="$rep" ARM="$arm" ARM_VALUE="$value" -- \
       --out "json=/results/raw/${cell_name}"
     then
+      stop_freq_sampler "$label"
       abort_suite "[cell] ${label}" "k6 exited non-zero."
     fi
     record_cell_thermal end "${cell_name%.json}"
+    stop_freq_sampler "$label"
+    check_power_state "$label"
     check_oom_killed "$label"
     check_thermal_safety "$label"
     finalize_result "$cell_name"
@@ -993,6 +1013,7 @@ fi
 
 echo "[+] Ablation complete. Results in ${RESULTS_DIR}/"
 echo "    SMT topology and pinning checks logged to ${CPU_PIN_LOG}"
-echo "    Per-cell governor/frequency/temperature and thermal samples logged to ${ENV_TRACE_LOG}"
+echo "    Per-cell governor/frequency/temperature, thermal and clock samples logged to ${ENV_TRACE_LOG}"
+echo "    CPU power state (checked at every cell edge) recorded in ${METADATA_FILE}"
 echo "    The iteration count every cell ran with logged to ${CALIB_LOG}"
 echo "    Run: ../analysis/venv/bin/python3 ../analysis/analyze-ablation.py"
