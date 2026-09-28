@@ -4,9 +4,9 @@
 # in the harness's own configuration, so without them two runs look comparable when they
 # are not.
 #
-# Recorded, never enforced: each setting has a defensible value either way on a given
-# host, so the operator decides. Only conditions that invalidate a measurement outright
-# abort a run.
+# Recorded, not enforced here: isolcpus, IRQ balancing and virtualization each have a
+# defensible value either way on a given host, so the operator decides. The power source
+# is also part of the power state lib/power-state.sh enforces.
 
 # Reports the kernel's live view of isolated CPUs alongside the boot parameter that
 # requested them. The two disagree when isolcpus names CPUs that do not exist, so
@@ -25,11 +25,12 @@ isolcpus_state() {
 }
 
 # Distinguishes mains power from battery. Laptops throttle sustained clocks on battery
-# regardless of the governor, and the env trace's governor/frequency samples alone
-# attribute the resulting mid-suite drift to the wrong cause.
+# regardless of the governor. A host that exposes no mains supply but a discharging
+# battery is on battery; one exposing neither (a desktop or server) reads as
+# no_mains_supply_exposed. POWER_SYSFS_ROOT is lib/power-state.sh's test root.
 power_source_state() {
-  local type_file supply online
-  for type_file in /sys/class/power_supply/*/type; do
+  local root="${POWER_SYSFS_ROOT:-/sys}" type_file supply online type
+  for type_file in "${root}"/class/power_supply/*/type; do
     [ -r "$type_file" ] || continue
     [ "$(cat "$type_file" 2>/dev/null)" = "Mains" ] || continue
     supply=$(dirname "$type_file")
@@ -38,6 +39,15 @@ power_source_state() {
       1) printf 'ac' ; return 0 ;;
       0) printf 'battery' ; return 0 ;;
     esac
+  done
+  for type_file in "${root}"/class/power_supply/*/type; do
+    [ -r "$type_file" ] || continue
+    type=$(cat "$type_file" 2>/dev/null || echo "")
+    supply=$(dirname "$type_file")
+    if [ "$type" = "Battery" ] && [ "$(cat "${supply}/status" 2>/dev/null || echo "")" = "Discharging" ]; then
+      printf 'battery'
+      return 0
+    fi
   done
   printf 'no_mains_supply_exposed'
 }
