@@ -58,6 +58,10 @@ def _meta(host, kind="suite", python="0-1,4-5,8-9", java="2-3,6-7", k6="10-11,14
             "jvm_pinned_options": "-Xms1536m -Xmx1536m -XX:+UseG1GC",
             "host_provenance": {"isolcpus_live": "none", "isolcpus_cmdline": "none", "power_source": "ac",
                                 "irqbalance": "inactive", "virtualization": "none"},
+            "power_state": {"turbo_required": "off", "turbo": "off", "power_source": "ac",
+                            "governor": "performance", "energy_preference": "performance",
+                            "power_profile": "performance", "thermald": "stopped",
+                            "power_limits": "msr_pl1=100W,msr_pl2=250W"},
             "cores_used_by_suite": cores}
     if kind == "suite":
         meta["suite_config"] = {"targets": ["calibration", "28"], "concurrency_levels": [1, 8], "reps_baseline": 3}
@@ -260,6 +264,25 @@ def test_gate_flags_a_different_core_count_isolation_level_or_governor():
     assert "Service CPUs (logical)" in _gate(a, fewer)[1]
     assert "Physical-core isolation" in _gate(a, unverifiable)[1]
     assert _gate(a, powersave)[1] == ["CPU governor"]
+
+
+def test_gate_flags_a_different_turbo_setting_and_leaves_older_runs_unverified():
+    a, b = _meta("a"), _meta("b", power_state__turbo="on")
+    assert _gate(a, b)[1] == ["Turbo"]
+    older = _meta("c")
+    del older["power_state"]
+    status, mismatched, unverified = _gate(a, older)
+    assert status["Turbo"] == "unverified" and "Turbo" in unverified and mismatched == []
+
+
+def test_power_limits_are_gated_only_between_runs_of_one_machine():
+    a = _meta("a")
+    other_host = _meta("b", power_state__power_limits="msr_pl1=65W,msr_pl2=115W")
+    status, mismatched, _ = _gate(a, other_host)
+    assert status["CPU power limits"] == "differs between machines" and mismatched == []
+    capped = _meta("a", power_state__power_limits="msr_pl1=30W,msr_pl2=35W")
+    status, mismatched, _ = _gate(a, capped)
+    assert status["CPU power limits"] == "MISMATCH" and mismatched == ["CPU power limits"]
 
 
 def test_gate_flags_a_different_cpu_quota():

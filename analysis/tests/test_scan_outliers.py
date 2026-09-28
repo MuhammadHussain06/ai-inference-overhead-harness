@@ -79,9 +79,16 @@ def test_placement_log_takes_the_longest_held_connected_state(tmp_path):
     ])
     p = so.parse_placement_log(str(tmp_path)).set_index("cell")
     assert p.loc["scan_10_vus2_rep4", "placement"] == "2-0-0"
-    assert p.loc["scan_10_vus2_rep4", "excess"] == 1
+    assert p.loc["scan_10_vus2_rep4", "crowding"] == 2.0
+    assert p.loc["scan_10_vus2_rep4", "crowding_above_even"] == 1.0
     assert p.loc["scan_10_vus2_rep5", "placement"] == "unrecorded"
     assert p.loc["scan_10_vus2_rep6", "placement"] == "unavailable (container_pid_unresolved)"
+
+
+@pytest.mark.parametrize("counts,above", [((1, 1, 0), 0.0), ((2, 0, 0), 1.0), ((2, 1, 1), 0.0), ((2, 2, 0), 0.5),
+                                          ((3, 1, 0), 1.0), ((4, 0, 0), 2.5), ((3, 3, 2), 0.0), ((5, 3, 0), 1.5)])
+def test_crowding_above_even_ranks_every_shared_worker_above_the_even_split(counts, above):
+    assert so.crowding(counts) - so.even_crowding(sum(counts), len(counts)) == pytest.approx(above)
 
 
 def test_placement_log_absent_is_none(tmp_path):
@@ -96,8 +103,8 @@ def test_placement_table_separates_uneven_from_even_cells():
         rows.append({"cell": f"c{i}", "tier": "10", "vus": 2, "rep": str(i),
                      "deviation_pct": (40 if uneven else 0) + rng.normal(0, 2),
                      "stall_ms": 0.8 if uneven else 0.001, "dispatch_ms": 0.2,
-                     "placement": "2-0-0" if uneven else "1-1-0", "excess": 1 if uneven else 0})
-    table = so.placement_table(pd.DataFrame(rows)).set_index("Busiest worker's excess connections")
+                     "placement": "2-0-0" if uneven else "1-1-0", "crowding_above_even": 1.0 if uneven else 0.0})
+    table = so.placement_table(pd.DataFrame(rows)).set_index("Crowding above even split")
     assert table.loc[1, "Cells"] == 4 and table.loc[0, "Cells"] == 8
     assert table.loc[1, "Median extra compute stall (ms)"] == pytest.approx(0.8 - 0.001, abs=1e-3)
     assert table.loc[1, "Mann-Whitney p vs even"] < 0.01

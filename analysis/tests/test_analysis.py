@@ -1106,6 +1106,47 @@ def test_cell_throttle_is_the_most_throttled_cpu_of_each_service(tmp_path):
     assert np.isnan(cells.loc["baseline_28_rep1", "pkg_throttle_ms"])
 
 
+def _clock_line(cell, python_mhz, java_mhz):
+    """A cell_freq line in the exact format lib/cpufreq_sampler.py prints."""
+    sys.path.insert(0, str(LOAD_TESTING_DIR / "lib"))
+    spec = importlib.util.spec_from_file_location("cpufreq_sampler", LOAD_TESTING_DIR / "lib" / "cpufreq_sampler.py")
+    sampler = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sampler)
+    acc = {name: {"weighted": mhz * 10.0, "weight": 10, "busy": 10, "total": 20}
+           for name, mhz in (("python", python_mhz), ("java", java_mhz))}
+    return sampler.summary(cell, ["python", "java"], acc, 5, 0)
+
+
+def test_cell_clock_reaches_the_cell_row_the_group_table_and_the_association(tmp_path):
+    trace_path = _shell_trace(tmp_path)
+    with open(trace_path, "a") as f:
+        f.write(_clock_line("baseline_28_rep1", 2200, 2100) + "\n")
+        f.write(_clock_line("scan_28_vus64_rep1", 1900, 2100) + "\n")
+    trace = thermal.parse_env_trace(str(trace_path))
+    assert trace.loc[trace["kind"] == "cell_freq", "name"].tolist() == ["baseline_28_rep1", "scan_28_vus64_rep1"]
+    cells = thermal.cell_thermal(trace, lambda cell: {"python": "0-1", "java": "2-3"})
+    indexed = cells.set_index("cell")
+    assert indexed.loc["baseline_28_rep1", "python_mhz"] == 2200
+    assert indexed.loc["scan_28_vus64_rep1", "java_mhz"] == 2100
+    by_group = thermal.thermal_by_group(cells, results._cell_tier_group, ["python", "java"],
+                                        label_of=results._tier_group_label).set_index("Group")
+    assert by_group.loc["scan v28", "Median python clock (MHz)"] == 1900
+    assert by_group.loc["scan v28", "Lowest python clock (MHz)"] == 1900
+    assert "Lowest java clock (MHz)" not in by_group.columns
+    latency = pd.DataFrame({"cell": ["baseline_28_rep1", "scan_28_vus64_rep1"], "group": ["a", "a"],
+                            "mean_ms": [5.0, 6.0]})
+    association = thermal.thermal_latency_association(cells, latency).set_index("Thermal variable")
+    assert "python core clock during cell (MHz)" in association.index
+
+
+def test_a_trace_without_clock_lines_adds_no_clock_columns(tmp_path):
+    cells = thermal.cell_thermal(thermal.parse_env_trace(str(_shell_trace(tmp_path))),
+                                 lambda cell: {"python": "0-1", "java": "2-3"})
+    assert not any(c.endswith("_mhz") for c in cells.columns)
+    table = thermal.thermal_by_group(cells, results._cell_tier_group, ["python", "java"])
+    assert not any("clock" in c for c in table.columns)
+
+
 def test_thermal_tables_by_group_and_phase(tmp_path):
     trace = thermal.parse_env_trace(str(_shell_trace(tmp_path)))
     cells = thermal.cell_thermal(trace, lambda cell: {"python": "0-1", "java": "2-3"})

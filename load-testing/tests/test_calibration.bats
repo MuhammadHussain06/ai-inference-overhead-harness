@@ -67,8 +67,8 @@ EOF
     for fn in calibrate_scan_targets use_calibration shuffled; do
       awk -v name="$fn" '$0 ~ "^" name "\\(\\) \\{" { f = 1 } f { print } f && /^}/ { exit }' "$1"
     done
-    for fn in record_env_sample restart_stack wait_for_ready verify_cpu_pinning verify_jvm_flag_pins \
-              verify_tiers verify_tiers_runtime verify_jvm_thread_pins check_thermal_safety; do
+    for fn in record_env_sample check_power_state restart_stack wait_for_ready verify_cpu_pinning \
+              verify_jvm_flag_pins verify_tiers verify_tiers_runtime verify_jvm_thread_pins check_thermal_safety; do
       echo "${fn}() { echo \"step ${fn} \$*\"; }"
     done
     echo 'converge_warmup() { echo "step converge_warmup $1"; }'
@@ -80,8 +80,8 @@ EOF
     extract_ablation_calib "$1"
     grep -E '^declare -A ABLATION_CALIB_CACHE$' "$1"
     awk '/^calibrate_ablation_cells\(\) \{/ { f = 1 } f { print } f && /^}/ { exit }' "$1"
-    for fn in record_env_sample verify_smt_isolation verify_service_cpuset restart_stack wait_for_ready \
-              verify_cpu_pinning verify_jvm_flag_pins verify_tiers_and_limiter verify_tiers_runtime \
+    for fn in record_env_sample check_power_state verify_smt_isolation verify_service_cpuset restart_stack \
+              wait_for_ready verify_cpu_pinning verify_jvm_flag_pins verify_tiers_and_limiter verify_tiers_runtime \
               verify_jvm_thread_pins check_thermal_safety; do
       echo "${fn}() { echo \"step ${fn} \$*\"; }"
     done
@@ -274,7 +274,7 @@ harness() {
   run bash "${WORKDIR}/pass.sh"
   [ "$status" -eq 0 ]
   steps=$(grep -o '^step [a-z_]*' <<< "$output" | cut -d' ' -f2 | paste -sd' ' -)
-  [ "$steps" = "record_env_sample restart_stack wait_for_ready verify_cpu_pinning verify_jvm_flag_pins verify_tiers converge_warmup verify_tiers_runtime verify_jvm_thread_pins converge_warmup check_thermal_safety record_env_sample" ]
+  [ "$steps" = "record_env_sample check_power_state restart_stack wait_for_ready verify_cpu_pinning verify_jvm_flag_pins verify_tiers converge_warmup verify_tiers_runtime verify_jvm_thread_pins converge_warmup check_thermal_safety record_env_sample" ]
   [[ "$output" == *"step converge_warmup calib_warmup_scan"* ]]
   [[ "$output" == *"step converge_warmup calib_warmup_scan_maxvus"* ]]
   [ "$(cat "${RESULTS_DIR}/calibration_log.txt")" = "calibration target=28 VUS8=160 VUS16=80 VUS32=40 VUS64=20" ]

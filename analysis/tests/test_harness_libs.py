@@ -1,7 +1,9 @@
 """Guards the Python halves of the load-testing harness: lib/warmup_gate.py, the
 warm-up criterion the live gate and table0 share; lib/k6_filter.py, which decides
 what every result file keeps; lib/placement.py, which records connection-to-worker
-placement; and lib/openloop_rates.py, which sets the open-loop arrival rates."""
+placement; lib/cpufreq_sampler.py, which records each cell's service-core clock and
+catches a loss of mains power; and lib/openloop_rates.py, which sets the open-loop
+arrival rates."""
 
 import gzip
 import importlib.util
@@ -30,6 +32,7 @@ gate = _load("warmup_gate")
 k6_filter = _load("k6_filter")
 placement = _load("placement")
 openloop_rates = _load("openloop_rates")
+cpufreq_sampler = _load("cpufreq_sampler")
 
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -318,6 +321,81 @@ def test_placement_reports_unavailable_instead_of_failing(tmp_path):
                            "--cell", "c", "--proc-root", str(tmp_path)], capture_output=True, text=True, timeout=10)
     assert proc.returncode == 0
     assert proc.stdout.startswith("placement_unavailable cell=c ")
+
+
+# lib/cpufreq_sampler.py
+
+def _clock_host(tmp_path, busy, khz, mains="1", ticks=1000):
+    """A sysfs and procfs pair: per-CPU busy jiffies (out of ticks total) and clocks."""
+    sysfs, proc = tmp_path / "sys", tmp_path / "proc"
+    (sysfs / "class/power_supply/ADP1").mkdir(parents=True, exist_ok=True)
+    (sysfs / "class/power_supply/ADP1/type").write_text("Mains\n")
+    (sysfs / "class/power_supply/ADP1/online").write_text(mains + "\n")
+    proc.mkdir(exist_ok=True)
+    for cpu, value in enumerate(khz):
+        freq = sysfs / f"devices/system/cpu/cpu{cpu}/cpufreq"
+        freq.mkdir(parents=True, exist_ok=True)
+        (freq / "scaling_cur_freq").write_text(f"{value}\n")
+    stat = ["cpu  0 0 0 0 0 0 0 0"] + [f"cpu{c} {b} 0 0 {ticks - b} 0 0 0 0" for c, b in enumerate(busy)]
+    (proc / "stat").write_text("\n".join(stat) + "\n")
+    return sysfs, proc
+
+
+def _start_clock_sampler(sysfs, proc, *cpus):
+    args = [sys.executable, str(LIB_DIR / "cpufreq_sampler.py"), "--cell", "scan_28_vus64_rep1",
+            "--interval", "0.05", "--sysfs-root", str(sysfs), "--proc-root", str(proc)]
+    for pair in cpus:
+        args += ["--cpus", pair]
+    return subprocess.Popen(args, stdout=subprocess.PIPE, text=True)
+
+
+def _fields(line):
+    return dict(tok.split("=", 1) for tok in line.split() if "=" in tok)
+
+
+def test_clock_sampler_weights_each_cpu_by_its_busy_time(tmp_path):
+    sysfs, proc = _clock_host(tmp_path, busy=[0, 0, 0], khz=[800000, 800000, 800000])
+    sampler = _start_clock_sampler(sysfs, proc, "python=0-1", "k6=2")
+    time.sleep(0.2)
+    # Over 1000 jiffies: cpu0 busy 300 at 1000 MHz, cpu1 busy 100 at 2200 MHz, cpu2 idle.
+    _clock_host(tmp_path, busy=[300, 100, 0], khz=[1000000, 2200000, 800000], ticks=2000)
+    time.sleep(0.3)
+    sampler.terminate()
+    line = sampler.communicate(timeout=5)[0].strip()
+    assert sampler.returncode == 0
+    assert line.startswith("cell_freq ts=") and line.endswith(" cell=scan_28_vus64_rep1")
+    fields = _fields(line)
+    assert fields["python_mhz"] == "1300" and fields["python_busy_pct"] == "20.0"
+    assert fields["k6_mhz"] == "na" and fields["k6_busy_pct"] == "0.0"
+    assert fields["mains_offline_samples"] == "0"
+
+
+def test_clock_sampler_exits_3_when_mains_power_is_lost(tmp_path):
+    sysfs, proc = _clock_host(tmp_path, busy=[0], khz=[800000])
+    sampler = _start_clock_sampler(sysfs, proc, "python=0")
+    time.sleep(0.15)
+    (sysfs / "class/power_supply/ADP1/online").write_text("0\n")
+    time.sleep(0.2)
+    (sysfs / "class/power_supply/ADP1/online").write_text("1\n")
+    time.sleep(0.1)
+    sampler.terminate()
+    line = sampler.communicate(timeout=5)[0].strip()
+    assert sampler.returncode == 3
+    assert int(_fields(line)["mains_offline_samples"]) >= 1
+
+
+def test_clock_sampler_battery_rule_matches_the_shell(tmp_path):
+    sysfs = tmp_path / "sys"
+    bat = sysfs / "class/power_supply/BAT1"
+    bat.mkdir(parents=True)
+    (bat / "type").write_text("Battery\n")
+    (bat / "status").write_text("Discharging\n")
+    assert cpufreq_sampler.on_battery(str(sysfs))
+    mains = sysfs / "class/power_supply/ADP1"
+    mains.mkdir()
+    (mains / "type").write_text("Mains\n")
+    (mains / "online").write_text("1\n")
+    assert not cpufreq_sampler.on_battery(str(sysfs))
 
 
 # lib/openloop_rates.py
