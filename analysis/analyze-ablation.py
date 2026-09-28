@@ -480,8 +480,8 @@ def _cell_key(cell):
 
 
 def analyze_thermal(results_dir, output_dir, metadata, df):
-    """Temperature and throttling per ablation cell, the time thermal pauses cost,
-    and whether either tracks a cell's thread-dispatch time."""
+    """Temperature, throttling and service-core clock per ablation cell, the time
+    thermal pauses cost, and whether any of them tracks a cell's thread-dispatch time."""
     path = os.path.join(results_dir, "ablation_env_trace_log.txt")
     if not os.path.isfile(path):
         print("[thermal] No ablation_env_trace_log.txt found -- skipping thermal analysis.")
@@ -512,8 +512,9 @@ def analyze_thermal(results_dir, output_dir, metadata, df):
                "table_ablation_thermal_by_cell", output_dir,
                caption="Highest thermal-zone temperature at the start and end of each measured ablation "
                        "cell, and the thermal throttling accrued during it (Intel therm_throt counters, "
-                       "differenced across the cell), per arm value. python's core throttle is read on "
-                       "the cpuset that cell ran python-service on.",
+                       "differenced across the cell), per arm value. python's core throttle and clock "
+                       "are read on the cpuset that cell ran python-service on; clocks, where the run "
+                       "sampled them, are CPU frequency during the cell weighted by busy time.",
                label="tab:ablation-thermal")
     save_table(thermal.thermal_pauses(trace, _ablation_phase), "table_ablation_thermal_pauses", output_dir,
                caption="Thermal safety checks per phase of the ablation run: how many paused it to let "
@@ -527,9 +528,10 @@ def analyze_thermal(results_dir, output_dir, metadata, df):
     latency["group"] = latency["arm"] + ":" + latency["arm_value"]
     save_table(thermal.thermal_latency_association(cells, latency[["cell", "group", "mean_ms"]]),
                "table_ablation_thermal_association", output_dir,
-               caption="Spearman correlation between a cell's thermal state and its mean thread-dispatch "
-                       "time, taken as its percent deviation from the same arm value's mean across "
-                       "repetitions, so the manipulated factor does not register as a thermal effect.",
+               caption="Spearman correlation between a cell's thermal state or service-core clock and "
+                       "its mean thread-dispatch time, taken as its percent deviation from the same arm "
+                       "value's mean across repetitions, so the manipulated factor does not register as "
+                       "a thermal effect.",
                label="tab:ablation-thermal-association")
 
     fig = thermal.timeline_figure(trace, _ablation_phase, "Host temperature across the ablation run")

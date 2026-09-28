@@ -7,11 +7,15 @@ above the median rep. Each cell carries the features that tell the candidate cau
 apart: whether the whole distribution moved (median shift) or only its start (first
 tenth of requests against the rest), Python compute stall and thread dispatch, thermal
 throttling, and, from lib/placement.py's log, how its connections were spread across
-the python-service workers. A placement's excess is how many more connections its
-busiest worker held than the most even split of the same connections would give.
+the python-service workers.
+
+A placement's crowding is the number of connections on the worker serving a connection,
+itself included, averaged over connections: sum(c_i^2) / sum(c_i) for worker counts c_i.
+Requests on one worker contend for its GIL, so crowding is what a request experiences.
+The most even split of a cell's connections has the lowest crowding possible for its
+connection and worker counts; a placement is compared by its crowding above that.
 """
 
-import math
 import os
 import re
 
@@ -80,9 +84,22 @@ def flag_outliers(cells):
     return cells
 
 
+def crowding(counts):
+    """sum(c^2) / sum(c): connections on the worker serving a connection, itself included."""
+    total = sum(counts)
+    return sum(c * c for c in counts) / total if total else float("nan")
+
+
+def even_crowding(connections, workers):
+    """Crowding of the most even split of connections across workers."""
+    q, extra = divmod(connections, workers)
+    return crowding([q + 1] * extra + [q] * (workers - extra))
+
+
 def parse_placement_log(results_dir):
     """Per cell, its placement from the log: the state it held longest while at least
-    one connection was open. Returns None when the run has no log."""
+    one connection was open, with its crowding above the most even split. Returns None
+    when the run has no log."""
     path = os.path.join(results_dir, PLACEMENT_LOG)
     if not os.path.isfile(path):
         return None
@@ -96,7 +113,7 @@ def parse_placement_log(results_dir):
     rows = []
     for cell, evs in events.items():
         row = {"cell": cell, "placement": "unrecorded", "established": np.nan, "workers": np.nan,
-               "max_per_worker": np.nan, "excess": np.nan}
+               "crowding": np.nan, "crowding_above_even": np.nan}
         unavailable = [f.get("reason", "") for k, f in evs if k == "placement_unavailable"]
         if unavailable:
             row["placement"] = f"unavailable ({unavailable[0]})"
@@ -113,9 +130,10 @@ def parse_placement_log(results_dir):
         if held:
             counts = max(held, key=held.get)
             total, n_workers = sum(counts), len(counts)
-            row.update(placement="-".join(map(str, counts)), established=total, workers=n_workers,
-                       max_per_worker=counts[0],
-                       excess=counts[0] - math.ceil(total / n_workers) if n_workers else np.nan)
+            row.update(placement="-".join(map(str, counts)), established=total, workers=n_workers)
+            if total and n_workers:
+                row.update(crowding=round(crowding(counts), 3),
+                           crowding_above_even=round(crowding(counts) - even_crowding(total, n_workers), 3))
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -126,7 +144,7 @@ def outlier_table(cells, thermal_cells=None):
     if flagged.empty:
         return pd.DataFrame()
     if thermal_cells is not None and not thermal_cells.empty:
-        keep = [c for c in ("cell", "temp_start_c", "python_throttle_ms") if c in thermal_cells]
+        keep = [c for c in ("cell", "temp_start_c", "python_throttle_ms", "python_mhz") if c in thermal_cells]
         flagged = flagged.merge(thermal_cells[keep], on="cell", how="left")
     flagged = flagged.sort_values(["vus", "tier", "rep"])
     out = pd.DataFrame({
@@ -141,19 +159,19 @@ def outlier_table(cells, thermal_cells=None):
         "Thread dispatch (ms)": flagged["dispatch_ms"].round(3).to_numpy(),
         "Thread dispatch, other reps (ms)": flagged["dispatch_ms_others"].round(3).to_numpy(),
     })
-    for src, col in (("python_throttle_ms", "Python core throttle (ms)"), ("temp_start_c", "Start temp (C)"),
-                     ("placement", "Placement")):
+    for src, col in (("python_throttle_ms", "Python core throttle (ms)"), ("python_mhz", "Python clock (MHz)"),
+                     ("temp_start_c", "Start temp (C)"), ("placement", "Placement")):
         if src in flagged:
             out[col] = flagged[src].to_numpy()
     return out
 
 
 def placement_table(cells):
-    """Per VUS level and placement excess: the cells' median latency deviation, their
-    compute stall and thread dispatch above their design cell's median, and a
-    Mann-Whitney test, with cells as units, of each uneven placement's deviations
+    """Per VUS level and crowding above the even split: the cells' median latency
+    deviation, their compute stall and thread dispatch above their design cell's median,
+    and a Mann-Whitney test, with cells as units, of each uneven group's deviations
     against the even placements' at the same level."""
-    data = cells.dropna(subset=["excess"])
+    data = cells.dropna(subset=["crowding_above_even"])
     if data.empty:
         return pd.DataFrame()
     data = data.assign(
@@ -162,16 +180,16 @@ def placement_table(cells):
     )
     rows = []
     for vus, level in data.groupby("vus"):
-        even = level.loc[level["excess"] == 0, "deviation_pct"]
-        for excess, part in level.groupby("excess"):
-            row = {"Concurrency (VUS)": int(vus), "Busiest worker's excess connections": int(excess),
+        even = level.loc[level["crowding_above_even"] == 0, "deviation_pct"]
+        for above, part in level.groupby("crowding_above_even"):
+            row = {"Concurrency (VUS)": int(vus), "Crowding above even split": float(above),
                    "Example placement": part["placement"].mode().iloc[0], "Cells": len(part),
                    "Share of the level's cells (%)": round(100 * len(part) / len(level), 1),
                    "Median latency deviation (%)": round(float(part["deviation_pct"].median()), 1) + 0.0,
                    "Median extra compute stall (ms)": round(float(part["extra_stall"].median()), 3) + 0.0,
                    "Median extra thread dispatch (ms)": round(float(part["extra_dispatch"].median()), 3) + 0.0,
                    "Mann-Whitney p vs even": np.nan, "Rank-biserial r vs even": np.nan}
-            if excess > 0 and len(even) >= 2 and len(part) >= 2:
+            if above > 0 and len(even) >= 2 and len(part) >= 2:
                 u, p = mannwhitneyu(part["deviation_pct"], even, alternative="two-sided")
                 row["Mann-Whitney p vs even"] = float(f"{p:.3g}")
                 row["Rank-biserial r vs even"] = round(2 * u / (len(part) * len(even)) - 1, 3)
@@ -180,10 +198,11 @@ def placement_table(cells):
 
 
 def placement_figure(cells):
-    """Latency deviation by placement excess at each VUS level where both even and
-    uneven placements occurred. None when no level has both."""
-    data = cells.dropna(subset=["excess"])
-    levels = [v for v, g in data.groupby("vus") if (g["excess"] == 0).any() and (g["excess"] > 0).any()]
+    """Latency deviation by crowding above the even split at each VUS level where both
+    even and uneven placements occurred. None when no level has both."""
+    data = cells.dropna(subset=["crowding_above_even"])
+    levels = [v for v, g in data.groupby("vus")
+              if (g["crowding_above_even"] == 0).any() and (g["crowding_above_even"] > 0).any()]
     if not levels:
         return None
     fig, axes = plt.subplots(1, len(levels), figsize=(3.6 * len(levels), 3.6), dpi=300, squeeze=False, sharey=True)
@@ -194,12 +213,12 @@ def placement_figure(cells):
         level = data[data["vus"] == vus]
         for tier in tiers:
             part = level[level["tier"] == tier]
-            ax.scatter(part["excess"] + rng.uniform(-0.12, 0.12, len(part)), part["deviation_pct"], s=14,
+            jitter = rng.uniform(-0.04, 0.04, len(part)) * max(1.0, float(level["crowding_above_even"].max()))
+            ax.scatter(part["crowding_above_even"] + jitter, part["deviation_pct"], s=14,
                        color=colors[tier], label=_tier(tier), alpha=0.85)
         ax.axhline(0, color="#333333", linewidth=0.8)
-        ax.set_xticks(sorted(level["excess"].unique().astype(int)))
         ax.set_title(f"VUS={vus}", fontsize=9)
-        ax.set_xlabel("Busiest worker's excess connections")
+        ax.set_xlabel("Crowding above even split")
         ax.grid(True, axis="y", linestyle="--", alpha=0.4)
     axes[0][0].set_ylabel("Latency deviation from median rep (%)")
     axes[0][-1].legend(fontsize=6, loc="upper left")

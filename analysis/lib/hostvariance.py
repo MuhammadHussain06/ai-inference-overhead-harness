@@ -35,13 +35,15 @@ SERVICES = (("python", "python_service"), ("java", "transaction_service"), ("k6"
 IRQBALANCE = {"active": "on", "running_no_systemd_unit": "on",
               "inactive": "off", "failed": "off", "not_present": "off"}
 POWER = {"ac": "mains", "no_mains_supply_exposed": "mains", "battery": "battery"}
+TURBO = {"on": "on", "off": "off"}
 # Longer values are shown abbreviated in the environment table and in full on the console.
 MAX_DISPLAY_CHARS = 40
 SHA256_RE = re.compile(r"(?:sha256:)?([0-9a-f]{12})[0-9a-f]{52}$")
 ENV_CAPTION = ("Environment of each compared run. Gated fields must match for the runs to be compared; "
                "reported fields describe hardware and toolchain, which may differ. Service CPUs are "
-               "compared by count and isolation level, not by CPU number. Values over 40 characters "
-               "are abbreviated.")
+               "compared by count and isolation level, not by CPU number; CPU power limits only between "
+               "runs of one machine, since they are hardware-specific. Values over 40 characters are "
+               "abbreviated.")
 COLORS = ["#2b5c8f", "#c0392b", "#27ae60", "#8e44ad", "#e67e22", "#16a085"]
 
 
@@ -53,11 +55,14 @@ def run_labels(runs):
     return [r.host if hosts.count(r.host) == 1 else f"{r.host}-{r.timestamp}" for r in runs]
 
 
+def same_machine(a, b):
+    """The same host label, and the same machine ID unless either run lacks one."""
+    return a.host == b.host and (a.machine is None or b.machine is None or a.machine == b.machine)
+
+
 def shares_machine(runs):
-    """Whether two runs came from one machine: the same host label, and the same machine ID
-    unless either run lacks one."""
-    return any(a.host == b.host and (a.machine is None or b.machine is None or a.machine == b.machine)
-               for a, b in combinations(runs, 2))
+    """Whether two of the runs came from one machine."""
+    return any(same_machine(a, b) for a, b in combinations(runs, 2))
 
 
 # Environment gate
@@ -96,6 +101,10 @@ def _cores(run):
 
 def _provenance(run):
     return run.metadata.get("host_provenance") or {}
+
+
+def _power(run):
+    return run.metadata.get("power_state") or {}
 
 
 def _isolation_cores(run):
@@ -194,8 +203,8 @@ def _canonical(obj):
 def environment_table(runs, labels, config_of):
     """Every gated and reported environment field per run. Gated fields must agree:
     "MISMATCH" where two runs recorded different values, "unverified" or "unrecorded"
-    where some or all runs recorded none. Reported fields describe the hardware and
-    toolchain, which may differ. config_of(run) returns the run's design configuration
+    where some or all runs recorded none. Per-machine fields must agree only between runs
+    of one machine. Reported fields describe the hardware and toolchain, which may differ. config_of(run) returns the run's design configuration
     with host-specific CPU numbers normalized away. Returns (table, mismatched fields,
     unverified fields)."""
     fingerprints = [_known(r.metadata.get("measurement_fingerprint")) for r in runs]
@@ -217,8 +226,13 @@ def environment_table(runs, labels, config_of):
         ("IRQ balancing", lambda r: IRQBALANCE.get(_provenance(r).get("irqbalance"))),
         ("Power source", lambda r: POWER.get(_provenance(r).get("power_source"))),
         ("CPU governor", governor),
+        ("Turbo", lambda r: TURBO.get(_power(r).get("turbo"))),
         ("WSL2", lambda r: _known(r.metadata.get("wsl2_detected"))),
         ("Virtualization", lambda r: _known(_provenance(r).get("virtualization"))),
+    ]
+    # Hardware-specific values that must still agree between runs of one machine.
+    per_machine = [
+        ("CPU power limits", lambda r: _known(_power(r).get("power_limits"))),
     ]
     reported = [
         ("Hostname", lambda r: r.metadata.get("hostname") or r.host),
@@ -232,18 +246,34 @@ def environment_table(runs, labels, config_of):
         ("Docker Compose", lambda r: _version(r.metadata.get("docker_compose_version"))),
         ("git commit", lambda r: (_known(r.metadata.get("git_commit")) or "")[:12] or None),
         ("git dirty", lambda r: _known(r.metadata.get("git_dirty"))),
+        ("Energy preference", lambda r: _known(_power(r).get("energy_preference"))),
+        ("Power profile", lambda r: _known(_power(r).get("power_profile"))),
+        ("thermald", lambda r: _known(_power(r).get("thermald"))),
     ]
 
     rows, mismatched, unverified = [], [], []
-    for is_gated, (field, extract) in [(True, f) for f in gated] + [(False, f) for f in reported]:
+    entries = ([(True, False, f) for f in gated] + [(True, True, f) for f in per_machine]
+               + [(False, False, f) for f in reported])
+    for is_gated, machine_scoped, (field, extract) in entries:
         values = [extract(r) for r in runs]
         known = {str(v) for v in values if v is not None}
+        clash = machine_scoped and any(
+            same_machine(a, b) and va is not None and vb is not None and str(va) != str(vb)
+            for (a, va), (b, vb) in combinations(zip(runs, values), 2))
         if not known:
             status = "unrecorded"
             if is_gated:
                 unverified.append(field)
         elif not is_gated:
             status = "same" if len(known) == 1 else "differs"
+        elif clash:
+            status = "MISMATCH"
+            mismatched.append((field, values))
+        elif machine_scoped and any(v is None for v in values):
+            status = "unverified"
+            unverified.append(field)
+        elif machine_scoped:
+            status = "match" if len(known) == 1 else "differs between machines"
         elif len(known) > 1:
             status = "MISMATCH"
             mismatched.append((field, values))

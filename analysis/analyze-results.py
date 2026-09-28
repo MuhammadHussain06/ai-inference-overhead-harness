@@ -1631,8 +1631,9 @@ def cell_mean_latency(df, phase):
 
 
 def analyze_thermal(results_dir, output_dir, metadata, latency):
-    """Tables 8a-8c and figure 8: host temperature and thermal throttling per measured
-    cell, the time thermal pauses cost, and whether either tracks a cell's latency."""
+    """Tables 8a-8c and figure 8: host temperature, thermal throttling and service-core
+    clock per measured cell, the time thermal pauses cost, and whether any of them
+    tracks a cell's latency."""
     path = os.path.join(results_dir, "env_trace_log.txt")
     if not os.path.isfile(path):
         print("[thermal] No env_trace_log.txt found -- skipping thermal analysis.")
@@ -1652,7 +1653,9 @@ def analyze_thermal(results_dir, output_dir, metadata, latency):
                        "and the thermal throttling accrued during it (Intel therm_throt counters, "
                        "differenced across the cell), per phase and tier. A service's core throttle is "
                        "the most-throttled CPU in its cpuset; 'not exposed' means the host does not "
-                       "publish the counters, so throttling is unmeasured rather than absent.",
+                       "publish the counters, so throttling is unmeasured rather than absent. Clock "
+                       "columns, where the run sampled them, give each service's CPU frequency during "
+                       "the cell weighted by busy time: the median across cells, and python's lowest.",
                label="tab:thermal-by-group")
     save_table(thermal.thermal_pauses(trace, _suite_phase), "table8b_thermal_pauses", output_dir,
                caption="Thermal safety checks per run phase: how many paused the run to let the host "
@@ -1669,11 +1672,11 @@ def analyze_thermal(results_dir, output_dir, metadata, latency):
             parts.append(part)
     save_table(pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(),
                "table8c_thermal_latency_association", output_dir,
-               caption="Spearman correlation between a cell's thermal state and its mean latency, "
-                       "taken as its percent deviation from its design cell's mean across "
-                       "repetitions, so the latency differences the design manipulates do not "
-                       "register as a thermal effect. A near-zero correlation means temperature and "
-                       "throttling do not explain the between-repetition spread.",
+               caption="Spearman correlation between a cell's thermal state or service-core clock "
+                       "and its mean latency, taken as its percent deviation from its design cell's "
+                       "mean across repetitions, so the latency differences the design manipulates do "
+                       "not register as a thermal effect. A near-zero correlation means temperature, "
+                       "throttling and clock speed do not explain the between-repetition spread.",
                label="tab:thermal-latency")
 
     throttle_cols = [c for c in cells.columns if c.endswith("_throttle_ms") and c != "pkg_throttle_ms"]
@@ -1728,12 +1731,13 @@ def analyze_scan_outliers(results_dir, output_dir, metadata, df):
               "placement.")
         return
     save_table(scan_outliers.placement_table(cells), "table4g_scan_connection_placement", output_dir,
-               caption="Scan cells by how evenly their connections were spread across the python-service "
-                       "workers: the busiest worker's connections beyond the most even split (0 = even). "
-                       "Latency deviation is from the cell's design-cell median rep; extra stall and dispatch "
-                       "are above that median. Mann-Whitney compares each uneven class's deviations with the "
-                       "even cells' at the same level, cells as units; a positive rank-biserial r means the "
-                       "uneven cells ran slower.",
+               caption="Scan cells by how their connections were spread across the python-service "
+                       "workers: crowding, the connections on the worker serving a connection averaged "
+                       "over connections, above that of the most even split (0 = even). Latency deviation "
+                       "is from the cell's design-cell median rep; extra stall and dispatch are above that "
+                       "median. Mann-Whitney compares each uneven group's deviations with the even cells' at "
+                       "the same level, cells as units; a positive rank-biserial r means the uneven cells "
+                       "ran slower.",
                label="tab:scan-placement")
     fig = scan_outliers.placement_figure(cells)
     if fig is not None:

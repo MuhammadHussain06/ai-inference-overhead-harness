@@ -2,10 +2,11 @@
 analyze-ablation.py.
 
 Reads the env trace both harness scripts write through load-testing/lib/thermal.sh:
-temperature and throttle counters at both edges of every measured cell, every
-thermal check with the time it paused for, and per-rep environment samples. The
-tables built here answer whether temperature or thermal throttling can explain a
-latency difference, rather than leaving that as an unexamined threat.
+temperature and throttle counters at both edges of every measured cell, each cell's
+service-core clock (load-testing/lib/cpufreq_sampler.py), every thermal check with the
+time it paused for, and per-rep environment samples. The tables built here answer
+whether temperature, thermal throttling or clock speed can explain a latency
+difference, rather than leaving that as an unexamined threat.
 """
 
 import numpy as np
@@ -13,7 +14,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy import stats
 
-THERMAL_KINDS = ("env_sample", "cell_start", "cell_end", "thermal_check")
+THERMAL_KINDS = ("env_sample", "cell_start", "cell_end", "cell_freq", "thermal_check")
+CELL_KINDS = ("thermal_check", "cell_start", "cell_end", "cell_freq")
 
 
 def _expand_cpuset(cpuset):
@@ -51,10 +53,10 @@ def _core_counters(field):
 
 def parse_env_trace(path):
     """One row per trace line of a known kind: kind, ts (UTC), temp_c, pkg_throttle_ms,
-    core_throttle (dict), and the line's own name -- label for env_sample and
-    thermal_check, cell for cell_start/cell_end -- plus paused_s for thermal checks.
-    Fields a line does not carry are NaN, which is how a trace written before
-    temperatures were recorded reads."""
+    core_throttle (dict), mhz ({service: MHz}, cell_freq lines), and the line's own
+    name -- label for env_sample and thermal_check, cell for the cell lines -- plus
+    paused_s for thermal checks. Fields a line does not carry are NaN, which is how a
+    trace written before temperatures were recorded reads."""
     rows = []
     with open(path, errors="replace") as f:
         for line in f:
@@ -66,7 +68,7 @@ def parse_env_trace(path):
             name = None
             for tail_key in (" label=", " cell="):
                 head, sep, tail = (" " + rest).partition(tail_key)
-                if sep and kind in ("thermal_check", "cell_start", "cell_end"):
+                if sep and kind in CELL_KINDS:
                     name, rest = tail, head
                     break
             fields = dict(tok.split("=", 1) for tok in rest.split() if "=" in tok)
@@ -79,19 +81,22 @@ def parse_env_trace(path):
                 "paused_s": _number(fields.get("paused_s")),
                 "pkg_throttle_ms": _number(fields.get("pkg_throttle_ms")),
                 "core_throttle": _core_counters(fields.get("core_throttle_ms")),
+                "mhz": {k[:-4]: _number(v) for k, v in fields.items() if k.endswith("_mhz")},
             })
     return pd.DataFrame(rows)
 
 
 def cell_thermal(trace, service_cpusets):
-    """Per measured cell: its duration, temperature at both edges, and the throttling
+    """Per measured cell: its duration, temperature at both edges, the throttling
     accrued during it -- package-level, and per service the most-throttled of its
     CPUs (SMT siblings report one shared core counter, so a sum would count a core
-    twice). service_cpusets(cell) -> {service: cpuset string}."""
+    twice) -- and each service's busy-weighted clock (<service>_mhz) where the run
+    sampled it. service_cpusets(cell) -> {service: cpuset string}."""
     if trace is None or trace.empty:
         return pd.DataFrame()
     starts = trace[trace["kind"] == "cell_start"].drop_duplicates("name", keep="last").set_index("name")
     ends = trace[trace["kind"] == "cell_end"].drop_duplicates("name", keep="last").set_index("name")
+    freqs = trace[trace["kind"] == "cell_freq"].drop_duplicates("name", keep="last").set_index("name")
     rows = []
     for cell in (c for c in ends.index if c in starts.index):
         s, e = starts.loc[cell], ends.loc[cell]
@@ -106,13 +111,18 @@ def cell_thermal(trace, service_cpusets):
             deltas = [e["core_throttle"][c] - s["core_throttle"][c] for c in _expand_cpuset(cpuset)
                       if c in e["core_throttle"] and c in s["core_throttle"]]
             row[f"{service}_throttle_ms"] = max(deltas) if deltas else np.nan
+        if cell in freqs.index:
+            for service, mhz in freqs.loc[cell, "mhz"].items():
+                row[f"{service}_mhz"] = mhz
         rows.append(row)
     return pd.DataFrame(rows)
 
 
 def thermal_by_group(cells, group_of, services, label_of=str, sort_key=None):
     """Summarizes cell_thermal() rows per group_of(cell) (None drops the cell), labelled
-    by label_of(group) and ordered by sort_key(group), or in first-seen order."""
+    by label_of(group) and ordered by sort_key(group), or in first-seen order. Where the
+    run sampled clocks, adds each service's median cell clock and the first service's
+    lowest."""
     if cells is None or cells.empty:
         return pd.DataFrame()
     groups = {}
@@ -139,6 +149,12 @@ def thermal_by_group(cells, group_of, services, label_of=str, sort_key=None):
             label = col.replace("_throttle_ms", "")
             row[f"Max {label} core throttle (ms)"] = _round(g[col].max())
         row["Max package throttle (ms)"] = _round(g["pkg_throttle_ms"].max())
+        for service in services:
+            col = f"{service}_mhz"
+            if col in g and g[col].notna().any():
+                row[f"Median {service} clock (MHz)"] = _whole(g[col].median())
+                if service == services[0]:
+                    row[f"Lowest {service} clock (MHz)"] = _whole(g[col].min())
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -181,6 +197,7 @@ def thermal_latency_association(cells, latency):
                   ("Package throttle during cell (ms)", "pkg_throttle_ms")]
     candidates += [(f"{c.replace('_throttle_ms', '')} core throttle during cell (ms)", c)
                    for c in merged.columns if c.endswith("_throttle_ms") and c != "pkg_throttle_ms"]
+    candidates += [(f"{c[:-4]} core clock during cell (MHz)", c) for c in merged.columns if c.endswith("_mhz")]
     rows = []
     for label, col in candidates:
         pair = merged[[col, "deviation_pct"]].dropna()
@@ -259,6 +276,10 @@ def timeline_figure(trace, phase_of, title):
 
 def _round(v, digits=1):
     return round(float(v), digits) if pd.notna(v) else np.nan
+
+
+def _whole(v):
+    return int(round(float(v))) if pd.notna(v) else np.nan
 
 
 def _fmt_p(p):
