@@ -56,6 +56,7 @@ STAGES = (("python_thread_dispatch_time_ms", "Thread dispatch"),
           ("python_dataframe_construction_time_ms", "DataFrame construction"),
           ("python_model_inference_time_ms", "predict_proba()"))
 TOTAL = "python_total_time_ms"
+COMPUTE = "python_computation_time_ms"
 AI_TIERS = ("5", "10", "20", "28")
 
 
@@ -81,7 +82,7 @@ def cell_summary(run_path, filename, phase, tier, vus):
         "p95": float(np.percentile(ok["value"], 95)),
         "throughput": results._throughput_reqs_per_s(ok, true_counts=true_counts, **filters),
     }
-    for metric in [m for m, _ in STAGES] + [TOTAL]:
+    for metric in [m for m, _ in STAGES] + [TOTAL, COMPUTE]:
         values = df.loc[(df["metric"] == metric) & (df["phase"] == phase), "value"]
         summary[metric] = float(values.mean()) if not values.empty else np.nan
     return summary
@@ -130,6 +131,9 @@ def build_metrics(data, tiers, levels):
     def add(family, metric, series):
         metrics.append({"family": family, "metric": metric, "series": series})
 
+    for t in ai:
+        add("Model computation / end-to-end latency (VUS=1)", results._tier_label(t),
+            [(_series(b, (t,), COMPUTE), _series(b, (t,), "mean")) for b, _ in data])
     if "calibration" in tiers:
         for t in (t for t in tiers if t != "calibration"):
             add("Baseline latency / calibration (VUS=1)", results._tier_label(t),
@@ -331,9 +335,16 @@ def main():
                caption="Lowest concurrency level at which each run reaches 95% of its own peak "
                        "throughput, per tier." + note,
                label="tab:hv-saturation")
+    p_floor = hv.kendalls_w_p_floor(len(data), len(tiers))
+    floor_note = ""
+    if p_floor > hv.ALPHA:
+        floor_note = (f" With {len(data)} runs of {len(tiers)} targets the p-value cannot fall below "
+                      f"{p_floor:.3f}, even for identical orderings; W and the identical-order column carry "
+                      f"the agreement.")
+        print(f"[!] Kendall's W:{floor_note}")
     save_table(concordance_table(data, tiers, levels), "table_hv4_order_concordance", out,
                caption="Agreement between runs on the ordering of targets, as Kendall's coefficient "
-                       "of concordance W (1 = identical ranking) with its chi-square test." + note,
+                       "of concordance W (1 = identical ranking) with its chi-square test." + floor_note + note,
                label="tab:hv-concordance")
     save_table(context_table(runs, labels, data, tiers, levels), "table_hv5_host_context", out,
                caption="Absolute figures per run. They differ with hardware by construction and are "

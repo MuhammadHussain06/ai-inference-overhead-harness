@@ -62,7 +62,7 @@ Each tier is its own XGBoost model, loaded once at startup and held in memory. D
 
 ### Scope
 
-**Answers**, for a synchronous, single-node, single-request microservice call at a fixed CPU clock:
+**Answers**, for a synchronous, single-node, single-request microservice call with turbo off:
 
 - how much of end-to-end latency is model compute versus everything else (network, framework, serialization, queueing);
 - how that ratio shifts with feature tier and concurrency;
@@ -358,7 +358,7 @@ Tables that report the run's own conditions:
 | `table4e_scan_within_cell_drift` | Mean change from the first to the second half of each scan cell, with a t-interval across reps. The same sign in every rep means the cell mean depends on its duration, which calibration holds near 60s at VUS 8 and above |
 | `table4f_scan_outlier_cells` | Scan cells whose mean latency sits far above their design cell's other reps: modified z-score above 3.5 and at least 5% above the median rep. A median shift as large as the deviation: the whole cell moved, not just its start. Compute stall above the other reps': Python threads waited off-CPU. `Placement`: connections per python-service worker, busiest first. `Python clock`: its service-core clock |
 | `table4g_scan_connection_placement`, `figure9_scan_connection_placement` | Scan cells per concurrency level, grouped by crowding above the even split. Crowding is the number of connections on the worker serving a connection, itself included, averaged over connections (sum of squared per-worker counts over the total); the most even split has the lowest. Per group: latency deviation, extra compute stall, and a Mann-Whitney test against the even cells, cells as units. Uneven cells running slower with raised compute stall: that level's between-rep spread follows placement |
-| `table8a_thermal_by_group`, `table_ablation_thermal_by_cell` | Per design group: temperature at both cell edges, whether any service's cores were throttled, and each service's median CPU clock. `not exposed`: the host publishes no throttle counters, so throttling is unmeasured, not absent. A clock below the group's usual value marks cells that ran on slower hardware, whatever their latency |
+| `table8a_thermal_by_group`, `table_ablation_thermal_by_cell` | Per design group: temperature at both cell edges, whether any service's cores were throttled, and each service's median CPU clock. `not exposed`: the host publishes no throttle counters, so throttling is unmeasured, not absent. In loaded cells, a clock below the group's usual value marks cells that ran on slower hardware, whatever their latency; at light load the reading runs low ([Measurement controls](#measurement-controls)) |
 | `table8b_thermal_pauses`, `table_ablation_thermal_pauses` | How often each phase paused for heat, and the wall-clock minutes it cost |
 | `table8c_thermal_latency_association`, `table_ablation_thermal_association` | Spearman correlation of a cell's temperature, throttling or service-core clock with its latency, as the deviation from its design cell's mean across reps so the manipulated factor cannot register as heat. Near zero: thermal state does not explain the between-rep spread |
 | `table_ablation_error_rates` | Every ablation request's outcome and the iterations k6 dropped, counted before sampling, since the ablation's latency tables cover HTTP 200s only |
@@ -398,7 +398,7 @@ An abort (`abort_suite`) stops the run at once and writes a tagged entry to `run
 - **Stage timing** in every response ([API](#api)). Java: preprocessing, network, DB write, response build. Python: parsing, thread dispatch, DataFrame construction, model inference, compute stall, serialization. WebFlux's serialization of the Java response body is not captured on either side.
 - **Client-side errors and contention.** Timeouts and connection errors (`status=0`) are counted apart from HTTP errors. `http_req_blocked` (client connection contention) is reported so a throughput plateau can be checked against the load generator.
 - **Connection-to-worker placement**, every measured cell: which python-service worker holds each inbound connection, read from the host's procfs by `lib/placement.py` (what `ss -tnp` reports), on CPUs outside every service's cpuset, executing nothing in the measured container. At low concurrency it decides whether two in-flight requests contend for one worker's GIL.
-- **Thermal state and clock** (`env_trace_log.txt`, [Suite run files](#suite-run-files)), reported per cell with pause costs and a test against latency (tables 8a to 8c).
+- **Thermal state and clock** (`env_trace_log.txt`, [Suite run files](#suite-run-files)), reported per cell with pause costs and a test against latency (tables 8a to 8c). The clock is `scaling_cur_freq` sampled every 0.5 s and weighted by busy time; on cores busy only part of the time it can read below the clock the work ran at, so it is informative for loaded cells, not light ones.
 - **Host provenance** (`lib/host-provenance.sh`), at the start of every run: kernel `isolcpus`, whether `irqbalance` is migrating interrupts across pinned cores, and virtualization. They can shift latency without appearing in this project's configuration, but none has one correct value for every host, so they are recorded, not enforced. The cross-host analysis gates on all three.
 - **JVM GC events**, one log per rep (`gc-logs/gc_<phase>_rep<N>.log`), to cross-check tail spikes against GC pauses. The rep's pin-check probe JVMs share the container's `JAVA_TOOL_OPTIONS`, and the last of them reopens `gc.log` before warm-up, so each log spans the rep from its verification to the service JVM's exit; the GC table measures that window by the records' wall-clock timestamps. Unified JVM logging has negligible overhead and is off the request path.
 
@@ -420,7 +420,7 @@ An abort (`abort_suite`) stops the run at once and writes a tagged entry to `run
 - **Turbo off, as a fixed run parameter.**
   - With turbo on, a cell's clock depends on how many cores are busy (one busy core boosts higher than many sharing the power budget), so the concurrency scan would vary clock speed along with concurrency.
   - On a laptop it also depends on heat: the host runs at full power until near its thermal limit, then the firmware cuts power, so a cell's clock depends on heat left by earlier cells. Randomized order spreads that dependence but does not remove it.
-  - At base clock every cell runs at the same operating point, the heat that would pause or throttle a run does not arise, and the setting is available on other hosts, where turbo behavior depends on each machine's cooling.
+  - With turbo off, busy cores run at base clock whatever the concurrency level, the heat that would pause or throttle a run does not arise, and the setting is available on other hosts, where turbo behavior depends on each machine's cooling.
   - `REQUIRED_TURBO_OVERRIDE=on` runs the design with turbo; the setting is recorded and gated.
 - **Order randomization.** Targets and concurrency levels are shuffled independently per rep, so thermal drift or a background daemon cannot systematically favour one target.
 - **Fixed model hyperparameters.** `max_depth=4`, `learning_rate=0.1`, untuned. Accuracy is not an outcome; tuning would change latency without making any claim more valid.
@@ -445,7 +445,7 @@ An abort (`abort_suite`) stops the run at once and writes a tagged entry to `run
 - **`estimatedBridgeOverheadMs` is Docker bridge-network overhead, derived across two independent clocks.** It covers the bridge and NAT path between two containers on one host plus the serialization-estimate error, not a WAN hop, and is constant across strategies, so it cancels in differential comparisons. It can be negative and is not clamped: table 2 reports the negative rate and minimum per tier. A small, tier-consistent rate is inter-process timer noise; a large or tier-clustered rate would be a measurement fault.
 - **Requests can complete below the physical floor.** Table 1e counts model-inference requests faster than the fastest `calibration` request: timing artifacts, so the affected tier's minimum is not a real latency. `mock` is not checked, since its distribution coincides with calibration's and about half its fastest requests fall below calibration's single fastest by sampling alone.
 - **Single-threading is a strong, not absolute, guarantee** ([Measurement controls](#measurement-controls)).
-- **The zero-compute baselines are noisier in relative terms.** `mock` and `calibration` have no compute term to dilute scheduling and queueing jitter, so their coefficient of variation and tail-to-median ratio run well above the AI tiers'. This is a property of what they measure, not harness instability, and is why the warm-up window is defined by time rather than request count.
+- **The zero-compute baselines are noisier in relative terms.** `mock` and `calibration` have no compute term to dilute scheduling and queueing jitter, so their coefficient of variation and tail-to-median ratio run well above the AI tiers'. This is a property of what they measure, not harness instability, and is why the warm-up window is defined by time rather than request count. At low concurrency their rep means, and thread dispatch at VUS 1, can vary by more than the cross-host equivalence margin, so ratios built on them can come out inconclusive even between runs of one host.
 
 ### Internal validity: could something other than the manipulated variable explain the result?
 
@@ -468,7 +468,7 @@ An abort (`abort_suite`) stops the run at once and writes a tagged entry to `run
 - **Synthetic, uniformly random feature vectors.** The licensed dataset cannot be bundled, so `randomFeatures()` draws in a roughly PCA-shaped range. The exposure is bounded: booster traversal is structure-dominated (flat at 0.04 to 0.05 ms across all four tiers for a depth-4, 100-tree model), and the dominant DataFrame-to-`DMatrix` conversion depends on dtype and shape, not values. The models were trained on real data, so their tree structure reflects it.
 - **Reduced feature space even at the largest tier.** `V1..V28` plus `Amount` is the full PCA set available, but the source dataset is itself a reduced, anonymized representation.
 - **Core pinning is host-specific.** Results are not comparable across core counts or SMT settings without re-picking `cpuset` values; the SMT check aborts rather than produce incomparable numbers.
-- **Results are measured at a fixed base clock.** Absolute latency and throughput are lower than on a turbo-enabled host, and the computation-to-overhead ratio shifts with clock speed: at base clock network, framework and scheduling overhead slow more than computation, so the overhead share of end-to-end latency is higher than a turbo-enabled deployment of the same hardware would show. Within-run comparisons (tier ordering, scaling with concurrency, the ablation's mechanisms) hold every factor but the manipulated one at the same clock. `REQUIRED_TURBO_OVERRIDE=on` measures the turbo case with the same harness.
+- **Results are measured with turbo off.** Absolute latency and throughput are lower than on a turbo-enabled host, and the computation-to-overhead ratio shifts with clock speed: at base clock network, framework and scheduling overhead slow more than computation, so the overhead share of end-to-end latency is higher than a turbo-enabled deployment of the same hardware would show. Within-run comparisons (tier ordering, scaling with concurrency, the ablation's mechanisms) hold every factor but the manipulated one at the same clock. `REQUIRED_TURBO_OVERRIDE=on` measures the turbo case with the same harness.
 - **Absolute figures describe one host.** The cross-host analysis tests only within-run ratios; agreement across a few hosts bounds, but does not establish, how far a ratio generalizes.
 - **Concurrency-scan P99s are not uniformly powered.** VUS 8 and above are duration-calibrated, so N varies by target; VUS 1, 2 and 4 use the flat `SCAN_ITERATIONS_PER_VU`. P99 CIs therefore differ in width across a row; the achieved N is printed with every result.
 - **Mock and calibration are latency baselines only**, never real fraud checks. `--synthetic` training data is a smoke test, not a benchmark source.
@@ -493,7 +493,7 @@ Absolute latency and throughput scale with hardware, so they are reported as con
 
 | Script | Compared metrics |
 |---|---|
-| `analyze-host-variance.py` | Each target's baseline latency relative to `calibration`; each pipeline stage's share of Python time per AI tier at VUS 1, and thread dispatch's share at the highest VUS; throughput relative to `calibration` at the highest VUS; P95 at the highest VUS relative to the lowest. Also reported: the lowest concurrency at which each target reaches 95% of its own peak throughput, and agreement between runs on the ordering of targets (Kendall's W, tie-corrected, with its chi-square test) |
+| `analyze-host-variance.py` | Each AI tier's model computation time relative to its end-to-end latency at VUS 1; each target's baseline latency relative to `calibration`; each pipeline stage's share of Python time per AI tier at VUS 1, and thread dispatch's share at the highest VUS; throughput relative to `calibration` at the highest VUS; P95 at the highest VUS relative to the lowest. Also reported: the lowest concurrency at which each target reaches 95% of its own peak throughput, and agreement between runs on the ordering of targets (Kendall's W, tie-corrected, with its chi-square test; with few runs the p-value cannot reach 0.05, and the caption states its floor) |
 | `analyze-ablation-host-variance.py` | Per arm, thread-dispatch and total Python time at the value farthest from control relative to control, and whether every run's effect points the same way |
 
 ### How it is judged
@@ -567,7 +567,7 @@ The measurement instruments are unit-tested, since every reported figure depends
 ```bash
 ./install-test-deps.sh                                                     # once
 (cd services/fraud-ml-service && .venv/bin/python3 -m pytest tests/ -q)    # Python service: 50 tests
-(cd analysis && venv/bin/python3 -m pytest tests/ -q)                      # analysis and harness Python libraries: 193 tests
+(cd analysis && venv/bin/python3 -m pytest tests/ -q)                      # analysis and harness Python libraries: 195 tests
 (cd services/transaction-service && ./mvnw test)                           # Java service: 34 tests
 (cd load-testing && bats tests/)                                           # load-testing harness (bats-core): 148 tests
 ```
@@ -604,7 +604,7 @@ What they guard:
 | `test_analysis.py` significance-floor test | `pairwise_mannwhitney` emits `[!]` when the rep count keeps even perfect separation from clearing alpha |
 | `test_analysis.py` open-loop cell-identity test | A cell with zero 200 responses still gets a table 7 row with its `dropped_iterations` count |
 | `test_analysis.py` silent-success guard tests | `crosscheck_error_counters`, `analyze_measurement_floor` and `analyze_gc_logs` warn on empty or unmeasurable input rather than returning as if the check had passed |
-| `test_host_variance.py` | Runs are found per kind and never in `archive/`; each run's outputs go to its own folder and a rejected run fails the invocation; the gate compares core counts and isolation rather than CPU numbers, gates turbo, compares power limits only within a machine, and stops on any gated difference; a uniformly slower host reads as equivalent, while a target or ablation effect that scales differently reads as different |
+| `test_host_variance.py` | Runs are found per kind and never in `archive/`; each run's outputs go to its own folder and a rejected run fails the invocation; the gate compares core counts and isolation rather than CPU numbers, gates turbo, compares power limits only within a machine, and stops on any gated difference; a uniformly slower host reads as equivalent, while a target, model-computation share or ablation effect that differs reads as different; Kendall's W reports the p-value floor of identical orderings |
 
 ---
 
@@ -783,7 +783,7 @@ training/train_model.py --n-features {5,10,20,28}   # one tier
 │   ├── probing/
 │   │   └── plot_warmup_curve.py  # thermal diagnostic: latency vs VUs, temp and core frequency
 │   ├── output/                   # generated: tables/<run>/, figures/<run>/, hostvariance/{tables,figures}/
-│   ├── tests/                    # pytest (193): analysis pipeline, harness libraries, thermal, outliers, host variance
+│   ├── tests/                    # pytest (195): analysis pipeline, harness libraries, thermal, outliers, host variance
 │   ├── requirements.txt
 │   └── requirements-dev.txt      # test-only: pytest, kept off analyze-*.py's real runtime deps
 ├── load-testing/

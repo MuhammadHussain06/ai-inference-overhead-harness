@@ -85,7 +85,7 @@ STAGE_SHARES = {"python_thread_dispatch_time_ms": 0.1, "python_dataframe_constru
                 "python_model_inference_time_ms": 0.75}
 
 
-def _suite_cell(path, phase, tier, rep, vus, latency_ms, spacing_ms, n=30):
+def _suite_cell(path, phase, tier, rep, vus, latency_ms, spacing_ms, compute_share=0.6, n=30):
     tags = {"tier": tier, "phase": phase, "rep": str(rep), "status": "200"}
     if vus is not None:
         tags["vus"] = str(vus)
@@ -95,14 +95,16 @@ def _suite_cell(path, phase, tier, rep, vus, latency_ms, spacing_ms, n=30):
         lines.append(_point("http_req_duration", latency_ms * (1 + 0.02 * (i % 3)), tags, ts))
         python_total = 0.8 * latency_ms
         lines.append(_point("python_total_time_ms", python_total, tags, ts))
+        lines.append(_point("python_computation_time_ms", compute_share * latency_ms, tags, ts))
         for metric, share in STAGE_SHARES.items():
             lines.append(_point(metric, share * python_total, tags, ts))
     _write(path, lines)
 
 
-def make_suite_run(root, host, speed=1.0, v28_extra=1.0, **meta_overrides):
+def make_suite_run(root, host, speed=1.0, v28_extra=1.0, compute_share=0.6, **meta_overrides):
     """A run-suite.sh run of calibration and v28 at VUS 1 and 8, three reps. speed scales
-    every absolute latency and inter-request gap; v28_extra scales v28 alone."""
+    every absolute latency and inter-request gap; v28_extra scales v28 alone; compute_share
+    is model computation's share of end-to-end latency."""
     run = Path(root) / f"suite_{host}_20260101T000000Z"
     run.mkdir(parents=True)
     (run / "run_metadata.json").write_text(json.dumps(_meta(host, **meta_overrides)))
@@ -110,11 +112,12 @@ def make_suite_run(root, host, speed=1.0, v28_extra=1.0, **meta_overrides):
         noise = 1 + 0.03 * rep
         for tier, base in (("calibration", 2.0), ("28", 5.0 * v28_extra)):
             lat = base * speed * noise
-            _suite_cell(run / f"baseline_{tier}_rep{rep}.json.gz", "baseline", tier, rep, None, lat, 10 * lat)
+            _suite_cell(run / f"baseline_{tier}_rep{rep}.json.gz", "baseline", tier, rep, None, lat, 10 * lat,
+                        compute_share)
             for vus in (1, 8):
                 load = 1.0 if vus == 1 else 3.0
                 _suite_cell(run / f"scan_{tier}_vus{vus}_rep{rep}.json.gz", "scan", tier, rep, vus,
-                            lat * load, 10 * lat * load / vus)
+                            lat * load, 10 * lat * load / vus, compute_share)
     return run
 
 
@@ -370,6 +373,12 @@ def test_kendalls_w_spans_agreement_to_disagreement():
     assert 0 < w < 1 and df == 2
 
 
+def test_kendalls_w_p_floor_is_that_of_identical_orderings():
+    assert hv.kendalls_w_p_floor(2, 6) == pytest.approx(hv.kendalls_w([[1, 2, 3, 4, 5, 6]] * 2)[3])
+    assert hv.kendalls_w_p_floor(2, 6) > hv.ALPHA > hv.kendalls_w_p_floor(10, 6)
+    assert np.isnan(hv.kendalls_w_p_floor(1, 6))
+
+
 def test_saturation_level_is_the_first_level_near_the_peak():
     assert hv.saturation_level([1, 2, 4, 8], [10, 50, 96, 100]) == 4
     assert hv.saturation_level([1, 2], [np.nan, np.nan]) is None
@@ -412,6 +421,9 @@ def test_suite_host_variance_finds_a_uniformly_slower_host_equivalent(two_hosts,
     lat = context.loc["Baseline mean latency, v28 (ms)"].astype(float)
     assert lat["hostb"] == pytest.approx(2 * lat["hosta"], rel=0.01)
     assert set(_table(tmp_path, "table_hv3_saturation_points")["Same on every run"]) == {"yes"}
+    assert "Model computation / end-to-end latency (VUS=1)" in set(summary["Family"])
+    [tex] = (tmp_path / "hostvariance" / "tables").glob("table_hv4_order_concordance_*.tex")
+    assert "cannot fall below" in tex.read_text()
     figures = os.listdir(tmp_path / "hostvariance" / "figures")
     assert any(f.startswith("figure_hv1_normalized_throughput_hosta_hostb_") for f in figures)
 
@@ -423,6 +435,17 @@ def test_suite_host_variance_detects_a_tier_that_scales_differently(tmp_path, mo
     assert _main(suite_hv, monkeypatch, root, "--output-dir", tmp_path / "out") == 0
     summary = _table(tmp_path / "out", "table_hv1_portable_metrics").set_index(["Family", "Metric"])
     assert summary.loc[("Baseline latency / calibration (VUS=1)", "v28"), "Verdict (10% margin)"] == "different"
+
+
+def test_suite_host_variance_detects_a_different_computation_share(tmp_path, monkeypatch):
+    root = tmp_path / "results"
+    make_suite_run(root, "hosta")
+    make_suite_run(root, "hostb", compute_share=0.4)
+    assert _main(suite_hv, monkeypatch, root, "--output-dir", tmp_path / "out") == 0
+    summary = _table(tmp_path / "out", "table_hv1_portable_metrics").set_index(["Family", "Metric"])
+    verdict = "Verdict (10% margin)"
+    assert summary.loc[("Model computation / end-to-end latency (VUS=1)", "v28"), verdict] == "different"
+    assert summary.loc[("Baseline latency / calibration (VUS=1)", "v28"), verdict] == "equivalent"
 
 
 def test_suite_host_variance_stops_on_a_gated_mismatch_unless_allowed(tmp_path, monkeypatch):

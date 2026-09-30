@@ -29,6 +29,7 @@ from run_dirs import METADATA_FILE
 N_BOOT = 2000
 SEED = 42
 DEFAULT_MARGIN_PCT = 10.0
+ALPHA = 0.05
 
 ENV_TRACE_FILE = {"suite": "env_trace_log.txt", "ablation": "ablation_env_trace_log.txt"}
 SERVICES = (("python", "python_service"), ("java", "transaction_service"), ("k6", "k6"))
@@ -457,6 +458,14 @@ def kendalls_w(matrix):
     w = 12 * s / denom
     chi2 = k * (n - 1) * w
     return w, chi2, n - 1, float(stats.chi2.sf(chi2, n - 1))
+
+
+def kendalls_w_p_floor(k, n):
+    """The smallest chi-square p-value k runs ranking n items can reach, that of identical
+    orderings. Above alpha, the test cannot register agreement however close it is."""
+    if k < 2 or n < 2:
+        return np.nan
+    return float(stats.chi2.sf(k * (n - 1), n - 1))
 
 
 def saturation_level(levels, means, fraction=0.95):
