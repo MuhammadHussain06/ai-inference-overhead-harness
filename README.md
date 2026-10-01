@@ -745,11 +745,12 @@ training/train_model.py --n-features {5,10,20,28}   # one tier
 
 | | python-service | transaction-service | k6 (load generator) |
 |---|---|---|---|
-| Image | `python:3.11-slim` | build `eclipse-temurin:21-jdk-alpine`, run `21-jre-alpine` | `grafana/k6:0.54.0` (pinned) |
+| Image | `python:3.11-slim` (pinned by digest) | build `eclipse-temurin:21.0.12_8-jdk-alpine`, run `21.0.12_8-jre-alpine` (both pinned by digest) | `grafana/k6:0.54.0` (pinned) |
 | Port | `8000` | `8080` | n/a |
 | Cores (`cpuset`) | `0-1,4-5,8-9` (physical 0, 2, 4) | `2-3,6-7` (physical 1, 3) | `10-11,14-15` (physical 5, 7) |
 | Limit / reserved | 6.0 CPU / 3G RAM (1G reserved) | 4.0 CPU / 3G RAM (1G reserved) | 4.0 CPU / 1G RAM |
 
+- **Reproducible builds:** the service base images are pinned by digest, and python-service installs `requirements.lock` (every direct and transitive package at an exact version) rather than resolving `requirements.txt`, so a rebuild reproduces the measured images.
 - **python-service:** `UVICORN_WORKERS=3` and `THREAD_LIMITER_TOKENS=40` at benchmark time. `n_jobs=1` and the BLAS variables keep each `predict_proba` call single-threaded, independent of the three workers.
 - **transaction-service:**
   - The outbound pool to Python is sized by `python.service.max-connections` (default `128`, set by the harness through `PYTHON_SERVICE_MAX_CONNECTIONS`). It must stay at or above the highest VUS in `run-suite.sh`'s `CONCURRENCY_LEVELS` (`64`), or queueing inflates `estimatedBridgeOverheadMs`. `python.service.pending-acquire-timeout-ms` (default `5000`) bounds the wait.
@@ -836,6 +837,8 @@ training/train_model.py --n-features {5,10,20,28}   # one tier
     │   │   ├── responses.py         # shared response/telemetry builder
     │   │   └── routers/predict.py (POST /predict/v{n}), mock.py, calibration.py
     │   ├── tests/                   # pytest (50): timing invariants, EWMA, telemetry symmetry
+    │   ├── requirements.txt         # direct dependencies
+    │   ├── requirements.lock        # full pinned environment the image installs
     │   ├── requirements-dev.txt     # test-only deps, kept out of the service image
     │   ├── models/fraud_model_v{5,10,20,28}.joblib   # pretrained, committed
     │   └── training/train_model.py  # --n-features {5,10,20,28}, omit for all four
