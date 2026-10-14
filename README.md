@@ -62,7 +62,7 @@ Each tier is its own XGBoost model, loaded once at startup and held in memory. D
 
 ### Scope
 
-**Answers**, for a synchronous, single-node, single-request microservice call with turbo off:
+**Answers**, for a synchronous, single-node microservice call with one row per request, measured with turbo off:
 
 - how much of end-to-end latency is model compute versus everything else (network, framework, serialization, queueing);
 - how that ratio shifts with feature tier and concurrency;
@@ -395,7 +395,7 @@ An abort (`abort_suite`) stops the run at once and writes a tagged entry to `run
 
 ### Recorded
 
-- **Stage timing** in every response ([API](#api)). Java: preprocessing, network, DB write, response build. Python: parsing, thread dispatch, DataFrame construction, model inference, compute stall, serialization. WebFlux's serialization of the Java response body is not captured on either side.
+- **Stage timing** in every response ([API](#api)). Java: preprocessing, AI-call round trip, bridge estimate, DB write, response build. Python: parsing, thread dispatch, DataFrame construction, model inference, compute stall, serialization. WebFlux's serialization of the Java response body is not captured on either side.
 - **Client-side errors and contention.** Timeouts and connection errors (`status=0`) are counted apart from HTTP errors. `http_req_blocked` (client connection contention) is reported so a throughput plateau can be checked against the load generator.
 - **Connection-to-worker placement**, every measured cell: which python-service worker holds each inbound connection, read from the host's procfs by `lib/placement.py` (what `ss -tnp` reports), on CPUs outside every service's cpuset, executing nothing in the measured container. At low concurrency it decides whether two in-flight requests contend for one worker's GIL.
 - **Thermal state and clock** (`env_trace_log.txt`, [Suite run files](#suite-run-files)), reported per cell with pause costs and a test against latency (tables 8a to 8c). The clock is `scaling_cur_freq` sampled every 0.5 s and weighted by busy time; on cores busy only part of the time it can read below the clock the work ran at, so it is informative for loaded cells, not light ones.
@@ -442,7 +442,7 @@ An abort (`abort_suite`) stops the run at once and writes a tagged entry to `run
 - **`calibration` is a floor, not subtracted.** Instrumentation overhead stays in the AI and mock numbers.
 - **`modelInferenceTimeMs` is the whole cost of obtaining a prediction**, and on this stack it is dominated by XGBoost's ingestion of the pandas DataFrame, not the booster. Micro-benchmarked against the committed models at the pinned dependency versions, tier 28: about 3.0 ms per `predict_proba` call, of which DataFrame-to-`DMatrix` conversion is about 2.9 ms (95%) and booster traversal about 0.05 ms (2%). The conversion is linear in column count, since XGBoost inspects dtypes per column per call, so this field's tier scaling is predominantly framework-level input marshalling. It is reported as measured: the service-level cost a service written this way pays, not model-evaluation cost.
 - **The serialization figure is a self-referential estimate.** `totalPythonExecutionTimeMs` includes an EWMA estimate of serializing the response that carries it; table 2's `Serialization (% of total)` column bounds its effect.
-- **`estimatedBridgeOverheadMs` is Docker bridge-network overhead, derived across two independent clocks.** It covers the bridge and NAT path between two containers on one host plus the serialization-estimate error, not a WAN hop, and is constant across strategies, so it cancels in differential comparisons. It can be negative and is not clamped: table 2 reports the negative rate and minimum per tier. A small, tier-consistent rate is inter-process timer noise; a large or tier-clustered rate would be a measurement fault.
+- **`estimatedBridgeOverheadMs` is more than the Docker bridge, and is derived across two independent clocks.** It is the round trip minus Python's self-reported total, so it holds everything between the two: bridge transit in both directions, Jackson encoding and decoding on the Java side, uvicorn's HTTP parsing and response writing, any wait on the Python event loop before `TimingMiddleware` stamps the request, and the serialization-estimate error. It is not a WAN hop. At VUS 1 the event-loop wait is near zero, so the estimate is close to transport and framing; at high concurrency that wait grows, so a rising bridge figure in the scan reads as pre-ASGI queueing in Python, not a slower network. It can be negative and is not clamped: table 2 reports the negative rate and minimum per tier. A small, tier-consistent rate is inter-process timer noise; a large or tier-clustered rate would be a measurement fault.
 - **Requests can complete below the physical floor.** Table 1e counts model-inference requests faster than the fastest `calibration` request: timing artifacts, so the affected tier's minimum is not a real latency. `mock` is not checked, since its distribution coincides with calibration's and about half its fastest requests fall below calibration's single fastest by sampling alone.
 - **Single-threading is a strong, not absolute, guarantee** ([Measurement controls](#measurement-controls)).
 - **The zero-compute baselines are noisier in relative terms.** `mock` and `calibration` have no compute term to dilute scheduling and queueing jitter, so their coefficient of variation and tail-to-median ratio run well above the AI tiers'. This is a property of what they measure, not harness instability, and is why the warm-up window is defined by time rather than request count. At low concurrency their rep means, and thread dispatch at VUS 1, can vary by more than the cross-host equivalence margin, so ratios built on them can come out inconclusive even between runs of one host.
@@ -670,7 +670,7 @@ Content-Type: application/json
 - `features` must contain at least `featureTier` values. Mock and calibration ignore it.
 - `transactionId` must be a UUID and `accountId` must match `ACC-\d{4,10}`, validated before the AI layer. Invalid requests get a `400` with per-field errors.
 
-Response:
+Response (illustrative values for one tier-10 request at VUS 1):
 
 ```json
 {
@@ -682,18 +682,18 @@ Response:
   "transactionStatus": "FLAGGED",
   "strategy": "DISTRIBUTED_AI_SYNCHRONOUS",
   "featureTier": 10,
-  "executionTimeMs": 14.7,
+  "executionTimeMs": 3.05,
   "requestPreprocessingTimeMs": 0.03,
-  "aiCallRoundTripTimeMs": 8.9,
-  "estimatedBridgeOverheadMs": 6.59,
-  "dbWriteTimeMs": 2.1,
+  "aiCallRoundTripTimeMs": 2.92,
+  "estimatedBridgeOverheadMs": 0.62,
+  "dbWriteTimeMs": 0.0,
   "responseObjectBuildTimeMs": 0.05,
   "pythonTelemetry": {
     "parsingRequestTimeMs": 0.21,
     "threadDispatchTimeMs": 0.15,
     "computationTimeMs": 1.85,
-    "dataframeConstructionTimeMs": 1.23,
-    "modelInferenceTimeMs": 0.62,
+    "dataframeConstructionTimeMs": 0.20,
+    "modelInferenceTimeMs": 1.60,
     "computeStallMs": 0.05,
     "serializationResponseTimeMs": 0.09,
     "totalPythonExecutionTimeMs": 2.30
@@ -705,25 +705,25 @@ Response:
 
 | Field | Meaning |
 |---|---|
-| `requestPreprocessingTimeMs` | From the `RequestTimingWebFilter` stamp, taken before WebFlux dispatch, to the start of the AI call: WebFlux dispatch, request body decode, bean validation (`@Valid`) and this service's strategy/feature-tier cross-field checks. Named "preprocessing" because it is more than deserialization |
-| `aiCallRoundTripTimeMs` | From just before the outbound request to `fraud-ml-service` is sent to just after its response is received. Timed inside a `Mono.defer`, so the clock starts at subscription rather than Mono assembly; the gap between building the call and WebFlux subscribing to it (handler return, the downstream `.map`, WebFlux's result-handler dispatch) counts as framework overhead, not network time |
-| `estimatedBridgeOverheadMs` | `aiCallRoundTripTimeMs` minus Python's `totalPythonExecutionTimeMs`: Docker bridge-network transit, FastAPI routing, queueing, outbound-pool wait. Not a real network hop ([Threats to validity](#threats-to-validity)) |
+| `requestPreprocessingTimeMs` | From the `RequestTimingWebFilter` stamp, taken before WebFlux dispatch, to the end of this service's request checks: WebFlux dispatch, request body decode, bean validation (`@Valid`) and this service's strategy/feature-tier cross-field checks. Named "preprocessing" because it is more than deserialization |
+| `aiCallRoundTripTimeMs` | From just before the outbound request to `fraud-ml-service` is sent to just after its response is received. Timed inside a `Mono.defer`, so the clock starts at subscription rather than Mono assembly; the gap between building the call and WebFlux subscribing to it (handler return, the downstream `.map`, WebFlux's result-handler dispatch) is not charged to the round trip and appears only in `executionTimeMs` |
+| `estimatedBridgeOverheadMs` | `aiCallRoundTripTimeMs` minus Python's `totalPythonExecutionTimeMs`, unclamped: Docker bridge transit both ways, Jackson encoding and decoding, uvicorn's HTTP parsing and writing, and any event-loop wait before Python's middleware stamp. FastAPI routing is not included; it falls in `parsingRequestTimeMs`. Not a real network hop ([Threats to validity](#threats-to-validity)) |
 | `dbWriteTimeMs` | `0.0` when `APP_DB_SAVE_ENABLED=false`, which benchmarks require |
 | `responseObjectBuildTimeMs` | Time to assemble the final `ResponseDto` |
-| `executionTimeMs` | Full Java-side duration from the `RequestTimingWebFilter` stamp, so it includes Netty and WebFlux routing |
+| `executionTimeMs` | Java-side duration from the `RequestTimingWebFilter` stamp to the start of response assembly: WebFlux dispatch, validation, the AI call and the gap before it. Excludes Netty's read before the stamp, building the `ResponseDto`, and encoding and writing the response, which only k6's `http_req_duration` sees |
 
 **Python-side fields (`pythonTelemetry`)**
 
 | Field | Meaning |
 |---|---|
-| `parsingRequestTimeMs` | Request parsing and validation |
-| `threadDispatchTimeMs` | Thread-pool queueing before the handler runs, measured for all three strategies |
+| `parsingRequestTimeMs` | From the `TimingMiddleware` stamp to the handler: FastAPI routing, body read and Pydantic validation. uvicorn's own HTTP parsing happens before the stamp and is not included |
+| `threadDispatchTimeMs` | The `run_in_threadpool` call minus the work's own computation time: waiting for a limiter token, handing the call to a worker thread, that thread acquiring the GIL, and the result returning to the event loop. Floored at 0; measured for all three strategies |
 | `computationTimeMs` | The whole worker-thread window: validation, the `log1p` transform, row build, DataFrame construction, inference and threshold comparison. A superset of `dataframeConstructionTimeMs` plus `modelInferenceTimeMs`; `0.0` for mock and calibration |
 | `dataframeConstructionTimeMs` | The `pd.DataFrame()` call only. XGBoost's later ingestion of that frame counts in `modelInferenceTimeMs` |
 | `modelInferenceTimeMs` | The complete `predict_proba` call: feature-name validation, conversion of the DataFrame into XGBoost's `DMatrix`, and booster tree traversal ([Threats to validity](#threats-to-validity) covers what dominates it) |
-| `computeStallMs` | The part of compute time the thread was off-CPU (GIL or OS scheduling) |
+| `computeStallMs` | Computation wall time minus the thread's CPU time: the part of computation the thread was off-CPU (GIL or OS scheduling). A subset of `computationTimeMs`, floored at 0 |
 | `serializationResponseTimeMs` | Estimated response-serialization cost |
-| `totalPythonExecutionTimeMs` | Total self-reported Python execution time |
+| `totalPythonExecutionTimeMs` | From the `TimingMiddleware` stamp to just before serialization, plus the serialization estimate. Excludes uvicorn's HTTP parsing and writing |
 
 `serializationResponseTimeMs` and `totalPythonExecutionTimeMs` are estimates: a response cannot report the cost of serializing itself without a prior serialization pass.
 
