@@ -1,24 +1,17 @@
 #!/usr/bin/env bash
-# Standalone probe -- NOT wired into run-suite.sh. Run by hand, stack already up.
+# Standalone probe, not called by run-suite.sh; run by hand with the stack up.
+# lib/common.js records ten telemetry values per HTTP 200: eight python_* Trends from the
+# nested pythonTelemetry object and the two java_* Trends from the top-level response. A
+# stale image, a renamed field or a code path that skips one shows up only as a missing
+# metric after a run. This sends requests to every target and checks each field first.
 #
-# common.js records ten telemetry values per successful request: eight
-# python_* Trends read off the nested pythonTelemetry object, plus
-# java_estimated_bridge_overhead_ms / java_execution_time_ms read off the
-# top-level Java response. Every one of these depends on the field actually
-# being present in the live response -- a stale container image, a renamed
-# field, or a Python-side code path that skips setting one is invisible until
-# someone notices a metric missing from analyze-results.py's output, hours
-# into a run. This probe hits every strategy directly and checks field
-# presence up front, before any of that time is spent.
+# common.js guards the two java_* fields with `!== undefined`, so a missing one is simply
+# not recorded. The python_* fields are guarded only by the parent object's presence, so a
+# missing field passes undefined to its Trend; this probe reports that case
+# (MISSING_FIELD) separately from an absent object (MISSING).
 #
-# Note on failure modes: the two java_* fields are read behind an
-# `!== undefined` guard in common.js, so a missing one is merely never
-# recorded (silent, but harmless). The eight python_* fields are not
-# individually guarded -- only the parent `pythonTelemetry` object's presence
-# is checked -- so a specific field going missing while the object itself
-# still exists passes `undefined` straight into that Trend's .add() call.
-# This probe flags that case distinctly ("field missing, object present")
-# from the object being absent entirely.
+# Start it once Java serves: under set -e, a curl connection failure on a request below
+# ends the probe with no message.
 #
 # Usage: ./probe_telemetry_completeness.sh [N_REQUESTS] [TARGET...]
 # TARGET is one or more of: mock calibration 5 10 20 28 (default: all six).
@@ -69,24 +62,20 @@ for svc in python-service transaction-service; do
   fi
 done
 
-# Build freshness is a cheap, direct signal for the most common cause of a
-# missing field: the running image predates a source change, silently, since
-# neither this probe's preflight nor run-suite.sh's ever rebuilds images --
-# `up -d --wait` only starts containers from whatever image already exists.
+# Build freshness: the most common cause of a missing field is an image older than its
+# source. Neither this probe nor run-suite.sh rebuilds images; `up -d --wait` starts
+# whatever image exists.
 echo "=== Build freshness ==="
-# Scoped to exactly what each Dockerfile COPYs into the image (src/main and
-# app/, respectively) -- src/test and fraud-ml-service/tests never reach the
-# running container, so a touched test file must not read as a stale image.
+# Scoped to the source that reaches the running image (src/main compiled into the jar;
+# app/), so an edited test file does not read as a stale image. models/ and the lockfile
+# are not checked.
 for pair in "transaction-service:../../services/transaction-service/src/main" "python-service:../../services/fraud-ml-service/app"; do
   svc="${pair%%:*}"
   src_dir="${pair##*:}"
   cid=$(docker compose -f "$COMPOSE_FILE" ps -q "$svc")
   image_created=$(docker inspect -f '{{.Created}}' "$(docker inspect -f '{{.Image}}' "$cid")" 2>/dev/null || echo "unknown")
-  # pipefail disabled inside this subshell only: `sort | head -1` is a classic
-  # SIGPIPE trap under pipefail -- once head takes its one line and exits, sort
-  # can get killed writing the rest of a large source tree's output, and
-  # pipefail then treats that as the whole pipeline failing even though the
-  # single line we wanted was already produced correctly.
+  # pipefail off in this subshell only: once head exits, sort can die of SIGPIPE, which
+  # pipefail would report as a failure although the wanted line was already produced.
   newest_src=$(
     set +o pipefail
     find "$src_dir" -type f \( -name '*.java' -o -name '*.py' \) -printf '%T@ %p\n' 2>/dev/null \
@@ -116,9 +105,9 @@ target_strategy() {
   esac
 }
 
-# One request in, one tab-separated report out: STATUS<TAB>FIELD<TAB>VALUE.
-# STATUS is OK, MISSING (key absent) or MISSING_FIELD (key absent but the
-# parent pythonTelemetry object is present -- see header note).
+# Reads the last response and prints STATUS<TAB>FIELD<TAB>VALUE per field. STATUS is OK,
+# MISSING (key or pythonTelemetry object absent) or MISSING_FIELD (key absent or null while
+# pythonTelemetry is present).
 check_response() {
   python3 << 'PYEOF'
 import json
