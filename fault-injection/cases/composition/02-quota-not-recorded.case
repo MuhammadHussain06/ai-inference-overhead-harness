@@ -1,0 +1,5 @@
+# The suite run carries no Python CPU quota, so the check could not run under the limit the
+# measured service ran with.
+DESCRIPTION="suite run recorded no Python CPU quota"
+EXPECT_REFUSAL="recorded no Python CPU quota"
+PATCH_METADATA="del cores_used_by_suite.python_service_cpus_quota"

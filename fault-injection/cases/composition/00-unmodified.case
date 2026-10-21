@@ -1,0 +1,3 @@
+# Control. The copy is the suite run as recorded and the measured stack is down, so the
+# one-rep check must complete and write a schema-2 predict_composition.json.
+DESCRIPTION="unmodified suite run, measured stack down"

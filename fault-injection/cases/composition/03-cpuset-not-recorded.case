@@ -1,0 +1,5 @@
+# The suite run carries no Python cpuset, so the check could not run on the cores the
+# measured service ran on.
+DESCRIPTION="suite run recorded no Python cpuset"
+EXPECT_REFUSAL="recorded no Python cpuset"
+PATCH_METADATA="del cores_used_by_suite.python_service_cpuset"

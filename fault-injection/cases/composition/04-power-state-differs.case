@@ -1,0 +1,5 @@
+# The host is prepared, but not in the state the suite run recorded, so the check would not
+# be comparable with that run's inference telemetry.
+DESCRIPTION="CPU power state differs from the one the suite run recorded"
+EXPECT_REFUSAL="The CPU power state differs"
+PATCH_METADATA="append power_state.snapshot fault=injected"

@@ -1,0 +1,5 @@
+# python-service is running when the check starts, so the check would share the host with
+# the measured stack.
+DESCRIPTION="measured stack running when the check starts"
+EXPECT_GUARD="[stack]"
+SETUP="stack-up"
