@@ -1,29 +1,26 @@
 #!/usr/bin/env bats
-# Unit tests for the throughput calibration in run-suite.sh (calibrate_target(),
+# Unit tests for duration-targeted cell sizing in run-suite.sh (calibrate_target(),
 # calibrate_scan_targets(), use_calibration()) and run-ablation.sh
-# (calibrate_ablation_cell(), calibrate_ablation_cells()). Calibration measures a
-# target's real throughput at a reference VUS and derives the ITERATIONS_PER_VU that
-# makes every concurrency level span the same wall-clock duration, once, before the
-# reps that reuse it. The derivation is what keeps the per-vu-iterations taper a small
-# tail rather than most of the cell, so an arithmetic slip there shortens or stretches
-# cells silently -- nothing downstream reports the intended duration.
+# (calibrate_ablation_cell(), calibrate_ablation_cells()). Each target's throughput is
+# measured once at a reference VUS, before the reps, and converted to the ITERATIONS_PER_VU
+# that gives each calibrated level (CALIB_AFFECTED_LEVELS) the same wall-clock duration.
+# That keeps the per-vu-iterations taper a small tail of the cell; an arithmetic slip
+# would shorten or stretch cells silently, since nothing downstream reports the intended
+# duration.
 #
-# The functions are embedded in their scripts rather than in lib/, so each is sourced
-# out of the live script text together with the constants it reads. k6_run and
-# finalize_result are stubbed: finalize_result writes the crafted measurement gzip the
-# derivation then reads back, standing in for the real filter-and-gzip step.
+# The functions live in their scripts, not lib/, so each is extracted from the live script
+# text with the constants it reads. k6_run and finalize_result are stubbed; finalize_result
+# writes the crafted measurement gzip the derivation reads back.
 
 setup_file() {
   export SUITE_SH="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)/run-suite.sh"
   export ABLATION_SH="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)/run-ablation.sh"
 
-  # n http_req_duration points spread evenly over duration_s, so the measured
-  # throughput is exactly (n-1)/duration_s (n timestamps bound n-1 intervals; see
-  # _throughput_reqs_per_s in analyze-results.py for the same convention). Extra
-  # non-scan and non-latency points are appended at the same timestamps: the
-  # derivation must ignore them rather than count them as completed requests.
-  # http_status defaults to "200"; a failed-request fixture passes "0" so tests
-  # can assert the derivation ignores points that never reached the service.
+  # n http_req_duration points spread evenly over duration_s, so measured throughput is
+  # exactly (n-1)/duration_s, the convention of analyze-results.py's
+  # _throughput_reqs_per_s. "noise" adds non-scan and non-latency points at the same
+  # timestamps, which the derivation must ignore. http_status defaults to "200"; a
+  # failed-request fixture passes "0".
   cat > "${BATS_FILE_TMPDIR}/gen_calib.py" <<'EOF'
 import sys
 
@@ -59,14 +56,15 @@ EOF
   }
   export -f extract_ablation_calib
 
-  # The calibration passes, with everything they call except the derivation stubbed
-  # to a log line, so a test sees the order the pass runs its steps in.
+  # The calibration passes, with every call except the derivation stubbed to a log line,
+  # so a test sees the order of the pass's steps.
   extract_suite_pass() {
     extract_calib "$1"
     grep -E '^declare -A CALIB_CACHE$' "$1"
-    for fn in calibrate_scan_targets use_calibration shuffled; do
+    for fn in calibrate_scan_targets use_calibration; do
       awk -v name="$fn" '$0 ~ "^" name "\\(\\) \\{" { f = 1 } f { print } f && /^}/ { exit }' "$1"
     done
+    awk '/^shuffled\(\) \{/ { f = 1 } f { print } f && /^}/ { exit }' "$(dirname "$1")/lib/suite-stack.sh"
     for fn in record_env_sample check_power_state restart_stack wait_for_ready verify_cpu_pinning \
               verify_jvm_flag_pins verify_tiers verify_tiers_runtime verify_jvm_thread_pins check_thermal_safety; do
       echo "${fn}() { echo \"step ${fn} \$*\"; }"
@@ -104,9 +102,8 @@ measurement() {
   python3 "${BATS_FILE_TMPDIR}/gen_calib.py" "$FIXTURE" "$1" "$2" "${3:-scan}" "${4:-clean}" "${5:-200}"
 }
 
-# Builds a runnable harness around one extracted function. The suite runs under
-# `set -euo pipefail`, so these do too -- a derivation that produces nothing must
-# be seen failing the way it would fail mid-run, not under looser shell options.
+# Builds a runnable harness around one extracted function, under the suite's own
+# `set -euo pipefail`, so a derivation that produces nothing fails as it would mid-run.
 harness() {
   local extractor="$1" script="$2" call="$3"
   {
@@ -114,8 +111,7 @@ harness() {
     echo 'k6_run() { :; }'
     # Same contract as the real one: report the reason, then stop the run.
     echo 'abort_suite() { local l="$1"; shift; echo "  [FATAL] ${l}: $*"; exit 1; }'
-    # Stands in for the real filter-and-gzip step, using the same gzip module it does
-    # rather than a gzip(1) the rest of the harness never requires.
+    # Uses Python's gzip module, as the real step does, rather than gzip(1).
     echo 'finalize_result() { python3 -c "import gzip,shutil,sys'
     echo 'shutil.copyfileobj(open(sys.argv[1],\"rb\"), gzip.open(sys.argv[2],\"wb\"))" \'
     echo '  "$FIXTURE" "${RESULTS_DIR}/${1}.gz"; }'
@@ -127,8 +123,8 @@ harness() {
 # --- calibrate_target: the derivation ---
 
 @test "iterations per VU are derived so every level spans the target duration" {
-  # 129 points span 128 intervals over 6s, 21.33 req/s; at CALIB_TARGET_DURATION_S=60
-  # a cell needs 1280 requests, split across each level's VUs.
+  # 129 points, 128 intervals over 6 s: 21.33 req/s, so a 60 s cell needs 1280 requests,
+  # split across each level's VUs.
   measurement 129 6.0 scan noise
   harness extract_calib "$SUITE_SH" 'calibrate_target 28'
   run bash "${WORKDIR}/harness.sh"
@@ -137,8 +133,7 @@ harness() {
 }
 
 @test "the derived counts scale inversely with concurrency, not with throughput alone" {
-  # Twice the throughput of the case above: every level's count doubles, and the
-  # 8:1 ratio between the lowest and highest level is unchanged.
+  # Twice the throughput: every count doubles and the 8:1 ratio across levels holds.
   measurement 257 6.0
   harness extract_calib "$SUITE_SH" 'calibrate_target 28'
   run bash "${WORKDIR}/harness.sh"
@@ -147,8 +142,8 @@ harness() {
 }
 
 @test "a target too slow to fill a cell still gets at least one iteration per VU" {
-  # 4 requests over 120s rounds to zero iterations at every level; a VU given zero
-  # iterations runs no requests at all and the cell produces nothing.
+  # 4 requests over 120 s rounds to zero at every level; a VU given zero iterations
+  # sends nothing and the cell is empty.
   measurement 4 120.0
   harness extract_calib "$SUITE_SH" 'calibrate_target 28'
   run bash "${WORKDIR}/harness.sh"
@@ -159,8 +154,8 @@ harness() {
 # --- calibrate_target: no usable measurement ---
 
 @test "a measurement with no scan points yields no iteration count and fails loudly" {
-  # Silently falling through would leave the scan loop on SCAN_ITERATIONS_PER_VU's
-  # flat fallback for a target whose throughput that value was never chosen for.
+  # Falling through silently would run the target on SCAN_ITERATIONS_PER_VU's flat
+  # fallback, which was not sized for its throughput.
   measurement 128 6.0 warmup
   harness extract_calib "$SUITE_SH" 'calibrate_target 28'
   run bash "${WORKDIR}/harness.sh"
@@ -171,13 +166,13 @@ harness() {
 }
 
 @test "a failed calibration does not inherit the previous target's counts" {
-  # CALIB_ITERATIONS_PER_VU is a global reused across targets. Carrying stale keys
-  # into a target whose throughput they were never measured for would size every one
-  # of its cells against another target, while the log reports them as calibrated.
+  # CALIB_ITERATIONS_PER_VU is a global reused across targets; stale keys would size this
+  # target's cells from another target's throughput while the log reports them as
+  # calibrated.
   measurement 129 6.0 scan
   harness extract_calib "$SUITE_SH" 'calibrate_target 5'
-  # Target 5 calibrates normally; the fixture is then replaced with one holding no
-  # scan points, so target 28's calibration derives nothing.
+  # Target 5 calibrates normally; the fixture is then replaced with one holding no scan
+  # points, so target 28 derives nothing.
   {
     cat "${WORKDIR}/harness.sh"
     echo 'python3 "${GEN}" "$FIXTURE" 129 6.0 warmup clean'
@@ -191,8 +186,7 @@ harness() {
 }
 
 @test "a measurement whose requests share one timestamp yields no iteration count" {
-  # Zero elapsed time is not zero throughput; deriving from it would divide by zero
-  # or report an unbounded rate.
+  # Zero elapsed time would divide by zero or report an unbounded rate.
   measurement 128 0.0
   harness extract_calib "$SUITE_SH" 'calibrate_target 28'
   run bash "${WORKDIR}/harness.sh"
@@ -201,10 +195,8 @@ harness() {
 }
 
 @test "a measurement whose points all failed yields no iteration count" {
-  # Every point present and phase=scan, but status!=200 (DNS/connection failure,
-  # timeout): the same "nothing usable" outcome as no scan points at all, not a
-  # throughput -- and iteration counts -- derived from traffic that never reached
-  # the service.
+  # All phase=scan points have status!=200 (connection failure, timeout): treated as no
+  # usable points, not as a throughput from traffic that never reached the service.
   measurement 129 6.0 scan clean 0
   harness extract_calib "$SUITE_SH" 'calibrate_target 28'
   run bash "${WORKDIR}/harness.sh"
@@ -217,10 +209,10 @@ harness() {
 # --- calibrate_ablation_cell: the same derivation at a single concurrency ---
 
 @test "the ablation derives the same count run-suite.sh derives for its VUS" {
-  # run-ablation.sh maintains its own copy of this arithmetic at ABLATION_VUS=64. 65
-  # points over 1s are 64 intervals, 64 req/s: 3840 requests per 60s cell, 60 per VU
-  # at VUS=64. A derivation using N/span instead would give 61, so both copies
-  # agreeing on 60 pins the shared (N-1)/span convention, not just the rounding.
+  # run-ablation.sh keeps its own copy of this arithmetic at ABLATION_VUS=64. 65 points
+  # over 1 s are 64 req/s: 3840 requests per 60 s cell, 60 per VU at VUS=64. N/span would
+  # give 61, so both copies yielding 60 pins the (N-1)/span convention, not only the
+  # rounding.
   measurement 65 1.0 scan
   harness extract_calib "$SUITE_SH" 'calibrate_target 28'
   run bash "${WORKDIR}/harness.sh"
