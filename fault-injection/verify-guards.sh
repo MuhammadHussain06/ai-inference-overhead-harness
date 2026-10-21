@@ -4,7 +4,9 @@ set -uo pipefail
 # Fault injection for the harness guards. Each case in cases/ misconfigures one pinned
 # setting, runs a minimal slice of run-suite.sh against it, and passes only if the run aborts
 # through the expected guard (its tag in the failures log). Case 00 is the unmodified control
-# and must run clean, so a harness that rejects everything is reported as a failure.
+# and must run clean, so a harness that rejects everything is reported as a failure. The
+# suite run case 00 leaves is then the fixture for verify-guards-openloop.sh and
+# verify-guards-composition.sh, which this script runs last.
 #
 # Nothing here touches ../results: each case runs against a generated compose configuration
 # whose bind mounts and results directory point into scratch/<case>/.
@@ -291,5 +293,20 @@ for r in csv.reader(sys.stdin):
 } > "$REPORT_MD"
 
 echo ""
-echo "[+] ${PASSED} passed, ${FAILED} failed, ${SKIPPED} skipped. Report: ${REPORT_MD}"
-[ "$FAILED" -eq 0 ]
+echo "[+] suite: ${PASSED} passed, ${FAILED} failed, ${SKIPPED} skipped. Report: ${REPORT_MD}"
+
+# The open-loop and composition cases copy the suite run the unmodified case left, so they
+# run only when that case passed.
+CHECKS_FAILED=0
+if grep -q '^00-unmodified,.*,PASS$' "$REPORT_CSV" && [ -f "${SCRATCH}/00-unmodified/results/run_metadata.json" ]; then
+  ./verify-guards-openloop.sh "${SCRATCH}/00-unmodified/results" || CHECKS_FAILED=$((CHECKS_FAILED + 1))
+  ./verify-guards-composition.sh "${SCRATCH}/00-unmodified/results" || CHECKS_FAILED=$((CHECKS_FAILED + 1))
+else
+  echo "[!] The unmodified case left no clean suite run, so the open-loop and composition cases did not run." >&2
+  CHECKS_FAILED=2
+fi
+
+echo ""
+echo "[+] All guard verification: suite ${FAILED} failed; open-loop and composition ${CHECKS_FAILED} check(s) failed."
+echo "    Reports: ${REPORT_DIR}/guard_verification_{report,openloop,composition}.md"
+[ "$FAILED" -eq 0 ] && [ "$CHECKS_FAILED" -eq 0 ]
