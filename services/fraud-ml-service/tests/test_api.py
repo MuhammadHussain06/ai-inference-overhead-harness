@@ -1,4 +1,4 @@
-"""Endpoint-level guards, including the telemetry symmetry the three-strategy design rests on."""
+"""Endpoint-level tests, including the telemetry symmetry the three-arm design rests on."""
 
 import os
 
@@ -38,8 +38,8 @@ def _telemetry(client, endpoint, body=None):
 
 
 def test_timing_middleware_is_the_outermost_user_middleware():
-    """A middleware added after this one would run before the stamp, and its cost
-    would leave totalPythonExecutionTimeMs for estimatedBridgeOverheadMs instead."""
+    """A middleware added after this one would run before the P0 stamp, and its cost
+    would move from totalPythonExecutionTimeMs into estimatedBridgeOverheadMs."""
     assert app.user_middleware[0].cls is TimingMiddleware
 
 
@@ -86,7 +86,7 @@ def test_no_strategy_reports_a_negative_timing(client, endpoint):
 
 @pytest.mark.parametrize("endpoint", [MOCK_ENDPOINT, CALIBRATION_ENDPOINT])
 def test_baseline_arms_report_zero_computation(client, endpoint):
-    """Both baselines must sit at the zero-work floor to bound AI inference cost."""
+    """Both baseline arms report zero compute, so arm differences isolate the model work."""
     telemetry = _telemetry(client, endpoint)
     assert telemetry["computationTimeMs"] == 0.0
     assert telemetry["dataframeConstructionTimeMs"] == 0.0
