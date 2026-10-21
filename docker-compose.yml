@@ -2,7 +2,7 @@ services:
     python-service:
         build: ./services/fraud-ml-service
         container_name: python
-        # No USER in the Dockerfile -- pins bind-mount writes to the host user (see setup.sh).
+        # The image sets no USER; run as the host user so bind-mount writes are owned by it (setup.sh writes .env).
         user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
         ports:
             - "8000:8000"
@@ -12,9 +12,8 @@ services:
             - FEATURE_TIERS=5,10,20,28
             - MODEL_DIR=models
             - PYTHONUNBUFFERED=1
-            # Both overridable by run-ablation.sh, which always passes its own explicit value
-            # per cell. THREAD_LIMITER_TOKENS is pinned here as an explicit experimental
-            # parameter rather than left to anyio's internal default.
+            # run-ablation.sh sets both explicitly per cell. THREAD_LIMITER_TOKENS is an
+            # explicit experimental parameter rather than anyio's internal default.
             - UVICORN_WORKERS=${UVICORN_WORKERS:-3}
             - THREAD_LIMITER_TOKENS=${THREAD_LIMITER_TOKENS:-40}
         healthcheck:
@@ -24,7 +23,7 @@ services:
             timeout: 3s
             retries: 10
             start_period: 10s
-        # Physical cores 0, 2, 4 (CPUs 0-1, 4-5, 8-9) -- disjoint from both Java and k6.
+        # Physical cores 0, 2, 4 on the reference host (CPUs 0-1, 4-5, 8-9), disjoint from Java and k6.
         cpuset: "${PYTHON_CPUSET:-0-1,4-5,8-9}"
         # Enforced by plain `docker compose up` (unlike deploy.resources.limits).
         mem_limit: 3g
@@ -43,15 +42,14 @@ services:
         environment:
             - PYTHON_SERVICE_URL=http://python:8000
             - APP_DB_SAVE_ENABLED=false
-            # Outbound pool to python-service. Both harness scripts export 2x their
-            # own peak VUS so the pool can never become the bottleneck being measured.
+            # Outbound pool to python-service. Each harness script exports 2x its own peak
+            # VUs so a wait for a free connection never lands inside the AI call round trip.
             - PYTHON_SERVICE_MAX_CONNECTIONS=${PYTHON_SERVICE_MAX_CONNECTIONS:-128}
-            # Fixed heap for reproducible sizing across hosts/reps. GC log lets
-            # tail-latency spikes be cross-checked against GC pauses.
-            # Collector, GC worker-thread counts, and Netty's event-loop size are pinned
-            # explicitly rather than left to JVM ergonomics, which derives them from cgroup
-            # CPU/memory detection and is not guaranteed to resolve identically across hosts
-            # or JDK builds. Values match this container's own cpus: 4.0 / 4-core cpuset.
+            # Fixed heap, so sizing is identical across hosts and reps; the GC log lets latency
+            # spikes be checked against GC pauses. Collector, GC thread counts and Netty's
+            # event-loop count are pinned rather than left to JVM ergonomics, which derives them
+            # from cgroup CPU/memory detection and may resolve differently across hosts or JDK
+            # builds. Values match this container's 4-CPU cpuset and cpus: 4.0.
             - JAVA_TOOL_OPTIONS=-Xms1536m -Xmx1536m -XX:+UseG1GC -XX:ParallelGCThreads=4 -XX:ConcGCThreads=1 -Dreactor.netty.ioWorkerCount=4 -Xlog:gc*:file=/gc-logs/gc.log:time,uptime,level,tags:filecount=0
         # RUN_RESULTS_DIR is the harness's per-run directory; a hand-started stack uses ./results.
         volumes:
@@ -59,11 +57,10 @@ services:
         depends_on:
             python-service:
                 condition: service_healthy
-        # Physical cores 1, 3 (CPUs 2-3, 6-7) -- interleaved with python-service's
-        # even-numbered cores so no physical core is shared between the two services.
-        # These numbers name whole physical cores on the host they were picked for and
-        # nowhere else; load-testing/recommend-cpusets.sh prints values for another host,
-        # and verify_service_cpuset() refuses a run whose cpusets split a core.
+        # Physical cores 1, 3 on the reference host (CPUs 2-3, 6-7), interleaved with
+        # python-service's even cores so the two services share no physical core. On another
+        # host, load-testing/recommend-cpusets.sh prints suitable values, and
+        # verify_service_cpuset() refuses a cpuset that splits a core.
         cpuset: "${JAVA_CPUSET:-2-3,6-7}"
         mem_limit: 3g
         mem_reservation: 1g
@@ -71,25 +68,23 @@ services:
         networks:
             - testbed-net
 
-    # Load generator, pinned to its own core range. Behind a profile so
-    # `docker compose up` doesn't start it; run-suite.sh invokes it per-cell
-    # via `docker compose run`.
+    # Load generator on its own cores. Behind a profile so `docker compose up` does not
+    # start it; the harness scripts run it per cell with `docker compose run`.
     k6:
-        # Pinned rather than :latest -- the only image not built from this tree, so a
-        # floating tag would be the one uncontrolled dependency in the measurement.
-        # run_metadata.json records the resolved digest for each run.
+        # Pinned tag: the only image not built from this tree, so a floating tag would be an
+        # uncontrolled dependency. run_metadata.json records the resolved digest.
         image: grafana/k6:0.54.0
         profiles: ["loadgen"]
         entrypoint: ["k6"]
         working_dir: /scripts
-        # Upstream image's own fixed non-root UID doesn't match the host either.
+        # The upstream image's fixed non-root UID does not match the host user either.
         user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
         volumes:
             - ./load-testing:/scripts
             - ${RUN_RESULTS_DIR:-./results}:/results
         environment:
             - BASE_URL=http://java:8080/api/v1/transactions
-        # Physical cores 5, 7 (CPUs 10-11, 14-15) -- disjoint from both services.
+        # Physical cores 5, 7 on the reference host (CPUs 10-11, 14-15), disjoint from both services.
         cpuset: "${K6_CPUSET:-10-11,14-15}"
         mem_limit: 1g
         cpus: ${K6_CPUS:-4.0}
