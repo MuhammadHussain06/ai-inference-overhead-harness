@@ -10,8 +10,8 @@
 # were picked for.
 #
 # Requires the caller to define abort_suite() and CPU_PIN_LOG. TOPO_SYSFS_ROOT points the
-# readers at a different tree, which is how the fault-injection suite exercises these
-# checks against topologies the running host does not have.
+# readers at a synthetic tree, which is how the bats tests and the fault-injection suite
+# exercise these checks against topologies the running host does not have.
 TOPO_SYSFS_ROOT="${TOPO_SYSFS_ROOT:-/sys}"
 
 # Expands a cpuset or sysfs CPU list ("0-2", "0,2,4", "0-1,4-5") to one CPU per line.
