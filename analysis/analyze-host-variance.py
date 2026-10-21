@@ -2,14 +2,15 @@
 Compares run-suite.sh runs from different hosts on metrics that do not scale with a
 host's raw speed: ratios measured inside each run, paired by repetition, each with a
 rep-level bootstrap CI, and each pair of runs tested for equivalence within a margin
-on their ratio (TOST on the 90% CI). Absolute latency and throughput are
-reported as host context only.
+on their ratio (TOST on the 90% CI). Absolute latency and throughput are reported as
+host context only.
 
-Runs are compared only when they agree on everything the harness or the operator
-controls: measured code, run configuration, JVM pins, k6 image, per-service core
-counts and CPU quotas, physical-core isolation, isolcpus coverage, IRQ balancing,
-power source, governor, WSL2 and virtualization. Hardware and toolchain are reported, not gated.
---allow-env-mismatch compares anyway and states the mismatch in every caption.
+Runs are compared only when the environment gate passes: measured code, run
+configuration, JVM pins, k6 image and digest, per-service CPU counts and quotas,
+physical-core isolation, isolcpus coverage, IRQ balancing, power source, governor,
+turbo, WSL2 and virtualization must match, and CPU power limits must match between runs
+of one machine. Hardware and toolchain are reported, not gated. --allow-env-mismatch
+compares anyway and states the mismatch in every caption.
 
 Usage:
     python3 analyze-host-variance.py [RUN_DIR ...] [--results-dir ../results]
