@@ -1,3 +1,4 @@
+# FastAPI app: timing middleware (P0), per-process startup, /health and the three arm routers.
 import os
 import time
 from contextlib import asynccontextmanager
@@ -13,9 +14,10 @@ from .routers import calibration, mock, predict
 
 
 class TimingMiddleware(BaseHTTPMiddleware):
-    # Stamps the earliest point the ASGI stack exposes, so totalPythonExecutionTimeMs
-    # covers framework ingress (routing, body read, validation) rather than starting
-    # at the route handler. Must stay the outermost user middleware.
+    # P0: the earliest point user code sees a request, so parsingRequestTimeMs and the
+    # Python total include routing, body read and validation. uvicorn's HTTP parsing and
+    # any event-loop wait before this stamp fall into the estimated bridge overhead.
+    # Must stay the outermost user middleware.
     async def dispatch(self, request, call_next):
         request.state.start_time = time.perf_counter()
         return await call_next(request)
@@ -23,9 +25,9 @@ class TimingMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Runs before the first request is served: model loading and estimator seeding
-    # must not land inside a measured request, and the thread limiter has to hold
-    # one value for the whole process lifetime.
+    # Runs once per worker process before it serves traffic, so model loading and
+    # estimator seeding never land inside a measured request. Each process sets its own
+    # thread limiter, so total token capacity scales with the worker count.
     model_registry.load_all()
     calibrate_serialization_estimate()
     if settings.THREAD_LIMITER_TOKENS is not None:
@@ -42,13 +44,13 @@ app.add_middleware(TimingMiddleware)
 async def health():
     return {
         "status": "ok",
-        # Uvicorn runs several worker processes, so this response describes only
-        # whichever one answered; workerPid tells them apart across polls.
+        # Describes only the worker process that answered; workerPid tells them apart
+        # across polls.
         "workerPid": os.getpid(),
         "loadedTiers": list(model_registry.tiers.keys()),
         "nJobsVerified": {n: tier.n_jobs_verified for n, tier in model_registry.tiers.items()},
-        # null until a tier has served its first request; the harness checks it
-        # after warm-up, when every tier has run.
+        # null until a tier has served its first request; the harness checks it after
+        # warm-up, when every tier has run.
         "nJobsRuntimeVerified": {n: tier.n_jobs_runtime_verified for n, tier in model_registry.tiers.items()},
         "numericThreadEnv": settings.numeric_thread_env(),
         "threadLimiterTokens": to_thread.current_default_thread_limiter().total_tokens,
