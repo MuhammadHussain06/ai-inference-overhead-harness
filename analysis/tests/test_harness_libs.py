@@ -1,9 +1,10 @@
-"""Guards the Python halves of the load-testing harness: lib/warmup_gate.py, the
-warm-up criterion the live gate and table0 share; lib/k6_filter.py, which decides
-what every result file keeps; lib/placement.py, which records connection-to-worker
-placement; lib/cpufreq_sampler.py, which records each cell's service-core clock and
-catches a loss of mains power; and lib/openloop_rates.py, which sets the open-loop
-arrival rates."""
+"""Guards the Python parts of the load-testing harness in load-testing/lib/:
+warmup_gate.py, the warm-up criterion the live gate and table0 share; k6_filter.py,
+which decides what every result file keeps; placement.py, which records
+connection-to-worker placement; cpufreq_sampler.py, which records each cell's
+service-core clock and catches a loss of mains power; openloop_rates.py, which
+sets the open-loop arrival rates; and predict_composition.py's summary, cgroup CPU-quota
+check and rep merge, behind table 9."""
 
 import gzip
 import importlib.util
@@ -33,6 +34,7 @@ k6_filter = _load("k6_filter")
 placement = _load("placement")
 openloop_rates = _load("openloop_rates")
 cpufreq_sampler = _load("cpufreq_sampler")
+predict_composition = _load("predict_composition")
 
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -426,3 +428,111 @@ def test_openloop_plateau_ignores_errors_and_other_phases(tmp_path):
     _scan_cell(tmp_path / "scan_28_vus64_rep1.json.gz", [i * 0.01 for i in range(101)], extra=noise)
     assert openloop_rates.plateau(str(tmp_path), "28") == (64, pytest.approx(100.0))
     assert openloop_rates.plateau(str(tmp_path), "5") is None
+
+
+# lib/predict_composition.py
+
+def test_composition_imports_without_the_model_libraries():
+    assert not {"xgboost", "pandas"} & set(vars(predict_composition))
+
+
+def test_composition_percentiles_match_numpys_linear_method():
+    values = [5.0, 1.0, 4.0, 2.0, 3.0, 10.0]
+    for q in (25, 50, 75):
+        expected = statistics.quantiles(values, n=4, method="inclusive")[q // 25 - 1]
+        assert predict_composition.percentile(values, q) == pytest.approx(expected)
+
+
+def test_composition_share_is_one_minus_the_ratio_of_medians():
+    samples = {"total": [1.0, 2.0, 3.0, 4.0, 5.0], "traversal": [0.5, 0.25, 0.75, 1.0, 0.5],
+               "inplace": [0.6] * 5}
+    out = predict_composition.summarize_tier(10, samples)
+    assert out["total_ms"]["median"] == 3.0 and out["traversal_ms"]["median"] == 0.5
+    assert out["total_ms"]["p25"] == 2.0 and out["total_ms"]["p75"] == 4.0
+    assert out["conversion_median_ms"] == pytest.approx(2.5)
+    assert out["conversion_share"] == pytest.approx(1 - 0.5 / 3.0)
+    assert out["n"] == 5 and out["inplace_ms"]["median"] == 0.6
+
+
+def test_composition_frame_matches_the_service_request_frame():
+    pd = pytest.importorskip("pandas")
+    np = pytest.importorskip("numpy")
+    features = predict_composition.representative_features()
+    assert features == predict_composition.representative_features()
+    assert len(features) == 28 and all(-2 <= x < 2 for x in features)
+    columns = [f"V{i}" for i in range(1, 6)] + ["Amount"]
+    df = predict_composition.build_frame(pd, np, columns, features, 100.0)
+    assert list(df.columns) == columns and df.shape == (1, 6)
+    assert df.iloc[0, -1] == pytest.approx(np.log1p(100.0))
+    assert list(df.iloc[0, :5]) == features[:5]
+
+
+def test_composition_cpuset_parsing_matches_the_compose_syntax():
+    assert predict_composition.parse_cpuset("0-1,4-5,8") == {0, 1, 4, 5, 8}
+    assert predict_composition.format_cpuset({8, 0, 1}) == "0,1,8"
+
+
+def test_composition_quota_reads_cgroup_v2_and_v1(tmp_path):
+    v2 = tmp_path / "v2"
+    v2.mkdir()
+    (v2 / "cpu.max").write_text("600000 100000\n")
+    assert predict_composition.read_cpu_quota(str(v2)) == {
+        "cpus": 6.0, "source": "cgroup v2 cpu.max", "raw": "600000 100000"}
+    (v2 / "cpu.max").write_text("max 100000\n")
+    assert predict_composition.read_cpu_quota(str(v2))["cpus"] is None
+    v1 = tmp_path / "v1" / "cpu,cpuacct"
+    v1.mkdir(parents=True)
+    (v1 / "cpu.cfs_quota_us").write_text("400000\n")
+    (v1 / "cpu.cfs_period_us").write_text("100000\n")
+    got = predict_composition.read_cpu_quota(str(tmp_path / "v1"))
+    assert (got["cpus"], got["source"]) == (4.0, "cgroup v1 cpu.cfs_quota_us")
+    assert predict_composition.read_cpu_quota(str(tmp_path / "absent")) is None
+
+
+def test_composition_quota_check_verifies_mismatches_and_records_unverifiable(tmp_path):
+    (tmp_path / "cpu.max").write_text("600000 100000\n")
+    assert predict_composition.check_cpu_quota(6.0, str(tmp_path))["status"] == "verified"
+    assert predict_composition.check_cpu_quota(4.0, str(tmp_path))["status"] == "mismatch"
+    (tmp_path / "cpu.max").write_text("max 100000\n")
+    unlimited = predict_composition.check_cpu_quota(6.0, str(tmp_path))
+    assert (unlimited["status"], unlimited["observed"]) == ("mismatch", "max")
+    absent = predict_composition.check_cpu_quota(6.0, str(tmp_path / "none"))
+    assert absent["status"] == "unverifiable" and absent["observed"] is None
+
+
+def test_composition_refuses_a_quota_mismatch_before_measuring(tmp_path, capsys):
+    (tmp_path / "cpu.max").write_text("200000 100000\n")
+    rc = predict_composition.main(["--out", str(tmp_path / "rep1.json"), "--expect-cpu-quota", "6.0",
+                                   "--cgroup-root", str(tmp_path)])
+    assert rc == 1 and "expected 6.0 from the suite run" in capsys.readouterr().err
+    assert not (tmp_path / "rep1.json").exists()
+
+
+def _rep_doc(rep, order, image="sha256:x", n=100):
+    return {"schema": 2, "kind": "rep", "rep": rep, "generated_utc": "t", "tier_order": order,
+            "image_id": image, "n_calls": n, "warmup_calls": 10, "feature_seed": 1, "amount": 100.0,
+            "clock": "time.perf_counter", "numeric_thread_env": {"OMP_NUM_THREADS": "1"},
+            "versions": {"xgboost": "2.1.1"}, "cpu_affinity": "0-1",
+            "cpu_quota": {"status": "verified", "expected": 6.0, "observed": 6.0},
+            "tiers": [{"tier": t, "n": n} for t in order]}
+
+
+def test_composition_merge_writes_schema_2_with_one_entry_per_rep(tmp_path):
+    for rep, order in ((2, [28, 5]), (1, [5, 28])):
+        (tmp_path / f"rep{rep}.json").write_text(json.dumps(_rep_doc(rep, order)))
+    out = tmp_path / "predict_composition.json"
+    rc = predict_composition.main(["--out", str(out), "--merge", str(tmp_path / "rep2.json"),
+                                   str(tmp_path / "rep1.json")])
+    report = json.loads(out.read_text())
+    assert rc == 0 and report["schema"] == 2 and report["n_reps"] == 2
+    assert [r["rep"] for r in report["reps"]] == [1, 2]
+    assert [r["tier_order"] for r in report["reps"]] == [[5, 28], [28, 5]]
+    assert report["reps"][0]["cpu_quota"]["status"] == "verified"
+    assert report["image_id"] == "sha256:x" and "tiers" not in report
+
+
+def test_composition_merge_refuses_reps_that_disagree(tmp_path):
+    with pytest.raises(ValueError, match="image_id"):
+        predict_composition.merge_reps([_rep_doc(1, [5]), _rep_doc(2, [5], image="sha256:y")])
+    with pytest.raises(ValueError, match="duplicate"):
+        predict_composition.merge_reps([_rep_doc(1, [5]), _rep_doc(1, [5])])
