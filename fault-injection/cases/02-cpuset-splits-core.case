@@ -1,7 +1,7 @@
-# One hyperthread of each core instead of both. The three cpusets stay disjoint, so the SMT
-# comparison passes; what is wrong is that the unclaimed siblings remain schedulable by the
-# rest of the host, leaving python-service sharing execution units with anything the kernel
-# puts there.
+# python-service pinned to one hyperthread of its first baseline core (FAULT_HALF_CORE). The
+# cpusets stay disjoint, so the SMT comparison passes; the unclaimed sibling stays schedulable
+# by the rest of the host, so python-service shares that core's execution units with whatever
+# the kernel places there.
 DESCRIPTION="python-service takes one hyperthread of each core, not both"
 STAGE="pre-container"
 EXPECT_GUARD="[cpuset]"
