@@ -55,8 +55,7 @@ def parse_env_trace(path):
     """One row per trace line of a known kind: kind, ts (UTC), temp_c, pkg_throttle_ms,
     core_throttle (dict), mhz ({service: MHz}, cell_freq lines), and the line's own
     name -- label for env_sample and thermal_check, cell for the cell lines -- plus
-    paused_s for thermal checks. Fields a line does not carry are NaN, which is how a
-    trace written before temperatures were recorded reads."""
+    paused_s and temp_after_c for thermal checks. Fields a line does not carry are NaN."""
     rows = []
     with open(path, errors="replace") as f:
         for line in f:
@@ -64,7 +63,8 @@ def parse_env_trace(path):
             kind, _, rest = line.partition(" ")
             if kind not in THERMAL_KINDS:
                 continue
-            # Free text (a thermal check's label) is always the last field.
+            # On check and cell lines the name (label= or cell=) is the last field and may
+            # contain spaces.
             name = None
             for tail_key in (" label=", " cell="):
                 head, sep, tail = (" " + rest).partition(tail_key)
