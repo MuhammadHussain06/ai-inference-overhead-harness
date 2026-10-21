@@ -1,3 +1,4 @@
+-- Persistence table (app.db.save.enabled); created at startup, never written in benchmarks.
 CREATE TABLE IF NOT EXISTS transactions (
     primary_id BIGINT AUTO_INCREMENT PRIMARY KEY,
     transaction_id VARCHAR(255),
