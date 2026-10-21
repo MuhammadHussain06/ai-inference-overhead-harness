@@ -4,16 +4,16 @@ from fastapi import Response
 
 from .schemas import PythonTelemetryDto, TransactionResponse
 
-# Serialization cost cannot be measured in the live path: the field reporting it sits
-# inside the object being serialized, so an EWMA over previous requests stands in.
-# build_response runs on the event loop with no await between the read and the update
-# below, so this global needs no lock.
+# Builds the telemetry response. A response cannot contain its own serialization time,
+# so an EWMA of past serialization times stands in. The estimate is per worker process;
+# build_response runs on the event loop with no await between the read and the update,
+# so the global needs no lock.
 _serialization_estimate_ms = None
 _EWMA_ALPHA = 0.1
 
 
 def calibrate_serialization_estimate(n_warmup: int = 20) -> float:
-    """Seeds the estimate by serializing a structurally identical template response."""
+    """Seeds the estimate with the mean of n_warmup serializations of a structurally identical template."""
     global _serialization_estimate_ms
 
     template = TransactionResponse(
@@ -63,9 +63,9 @@ def build_response(payload, is_fraud, risk_score, parsing_time_ms, comp_time_ms,
         pythonTelemetry=telemetry,
     )
 
-    # start_total is the middleware stamp, so this spans the full Python-side wall
-    # time. It must be assigned before the single serialize call below, whose output
-    # bytes are returned as-is -- a later write would not reach the client.
+    # P0 (middleware stamp) to now, plus the estimate. Assigned before the single
+    # serialize call below, whose bytes are returned as-is, so a later write would not
+    # reach the client.
     response_model.pythonTelemetry.totalPythonExecutionTimeMs = (
             (time.perf_counter() - start_total) * 1000 + _serialization_estimate_ms
     )
@@ -74,6 +74,7 @@ def build_response(payload, is_fraud, risk_score, parsing_time_ms, comp_time_ms,
     final_body = response_model.model_dump_json(by_alias=True).encode("utf-8")
     actual_serialization_ms = (time.perf_counter() - start_serial) * 1000
 
+    # EWMA update with alpha = 0.1 from this response's measured serialization time.
     _serialization_estimate_ms = (
             (1 - _EWMA_ALPHA) * _serialization_estimate_ms + _EWMA_ALPHA * actual_serialization_ms
     )
