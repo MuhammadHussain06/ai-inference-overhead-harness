@@ -319,7 +319,8 @@ analysis/venv/bin/python3 analysis/analyze-results.py --results-dir results/manu
 | `run-openloop.sh` | `OPENLOOP_TARGET` (28), `OPENLOOP_FRACTIONS` (`1.0 0.8`), `OPENLOOP_RATES`, `OPENLOOP_REPS` (7), `OPENLOOP_DURATION` (`2m`), `OPENLOOP_PRE_ALLOCATED_VUS` (64), `OPENLOOP_MAX_VUS` (128), `OPENLOOP_PHASE` (`openloop-check`), `OPENLOOP_COOLDOWN_S` (the suite run's `cooldown_s`); the suite's `WARMUP_*_OVERRIDE` variables, with the same effect |
 | `run-predict-composition.sh` | `COMPOSITION_REPS` (7), `COMPOSITION_N` (2000), `COMPOSITION_WARMUP` (200), `COMPOSITION_COOLDOWN_S` (the suite run's `cooldown_s`) |
 | `run-suite.sh`, `run-ablation.sh`, `run-openloop.sh`, `run-predict-composition.sh` | `THERMAL_WARN_C_OVERRIDE`, `THERMAL_CRIT_C_OVERRIDE`, `THERMAL_COOLDOWN_S_OVERRIDE`, `MAX_THERMAL_COOLDOWNS_OVERRIDE`, `THERMAL_MAX_COOLDOWNS_EXTENDED_OVERRIDE` |
-| `run-suite.sh`, `run-ablation.sh`, `run-all.sh`, `verify-guards.sh` | `REQUIRED_TURBO_OVERRIDE` (`on` or `off`, default `off`); `run-openloop.sh` and `run-predict-composition.sh` require the turbo their suite run recorded |
+| `run-suite.sh`, `run-ablation.sh`, `run-all.sh`, `verify-guards*.sh` | `REQUIRED_TURBO_OVERRIDE` (`on` or `off`, default `off`); `run-openloop.sh` and `run-predict-composition.sh` require the turbo their suite run recorded |
+| `verify-guards*.sh` | `CASE_TIMEOUT_S` (600), the time limit on each case's run |
 
 - `ABLATION_ITERATIONS_PER_VU_OVERRIDE` only sets a metadata fallback: a measured cell's count always comes from calibration, so the two `ABLATION_CALIB_*_OVERRIDE` variables are what shrink an ablation slice.
 - `run-smoke-test.sh` sets these variables to a small slice. Unset, each script runs its full default design.
@@ -629,7 +630,7 @@ The measurement instruments are unit-tested, since every reported figure depends
 (cd services/fraud-ml-service && .venv/bin/python3 -m pytest tests/ -q)    # Python service: 63 tests
 (cd analysis && venv/bin/python3 -m pytest tests/ -q)                      # analysis and harness Python libraries: 215 tests
 (cd services/transaction-service && ./mvnw test)                           # Java service: 37 tests
-(cd load-testing && bats tests/)                                           # load-testing harness (bats-core): 173 tests
+(cd load-testing && bats tests/)                                           # load-testing harness (bats-core): 187 tests
 ```
 
 What they guard:
@@ -655,6 +656,7 @@ What they guard:
 | `test_power_state.bats` | Turbo reads correctly through all three kernel interfaces, the power source through a mains supply or a discharging battery, and both RAPL interfaces' limits; each unprepared condition is reported, a control the host lacks is not; a changed state or lost mains supply aborts the run; `prepare-host.sh` refuses without root, sets the governor, turbo and `thermald`, and fails on battery; all four harness scripts that read the power state refuse a synthetic power tree |
 | `test_orchestration.bats` | `run-all.sh`, `run-openloop.sh` and `run-predict-composition.sh` reject bad input, and a suite run without a recorded power state, before touching the stack; `composition` runs between `openloop` and `ablation`, accepts `START_AT`, and its failure does not stop the chain; the composition container is pinned to the suite's Python cpuset; the power state is checked before a run directory exists and at both edges of every measured cell; every suite cell runs under both samplers and every ablation cell under the clock sampler, stopped on both the success and the k6-failure path; the smoke test's overload cell goes through `run-openloop.sh`; `install-test-deps.sh` rebuilds a venv with no usable `bin/python` or `bin/pip` and reuses a usable one |
 | `test_construct_checks.bats` | `run-openloop.sh` exports the suite run's recorded cpusets, quotas, worker count and tokens so the stack starts on them, refuses a setting the run did not record, and aborts when the resolved configuration or `JAVA_TOOL_OPTIONS` differs; startup runs the recorded-setting, topology and cpuset guards before the first rep; each rep restarts the stack and runs the suite's pin, JVM and tier checks, both gated warm-up passes (fixed-iteration only under the suite's override), the post-warm-up checks and the cooldowns, with every rate once in a per-rep shuffled order and rep-tagged file names; an abort writes one tagged line to `openloop_failures_log.txt` and none to `run_failures_log.txt`, and a new invocation archives only its own target's outputs. `run-predict-composition.sh` refuses a run without a recorded quota and a running measured stack, runs each rep in a fresh container with a shuffled tier order, the recorded cpuset and quota, a thermal check and power checks, merges the reps into schema 2, and on a failed rep logs it to `composition_failures_log.txt` and leaves no merged file; the smoke test runs one rep of each check and deletes their output; `run-all.sh` stops the stack before the composition check |
+| `test_guard_cases.bats` | Each open-loop and composition case set has one unmodified control, every case names at most one expectation, every expected refusal is text its script prints and every expected guard a tag its abort path logs, and every metadata patch applies to a suite run's metadata; the case runner, against a stub harness script, passes a control only on a clean exit, an empty failures log and its output check, a guard case only on its own tag, a refusal case only on its own text, runs each case on its own patched copy and leaves the fixture untouched, skips an SMT-only case without SMT, starts and stops the stack for a stack-up case, and stops without a fixture; `verify-guards.sh` runs both sets on its unmodified case's run only after that case passed |
 | `test_harness_libs.py` | `lib/warmup_gate.py` orders Go-trimmed timestamps numerically, sizes the window by time, reports every status and takes true medians; `lib/k6_filter.py`'s fast path keeps exactly the lines a full JSON parse would; `lib/placement.py`, on a synthetic procfs, counts connections for the uvicorn workers only (not the supervisor or its resource tracker), reports namespace PIDs, logs only changes, stops on SIGTERM and reports `placement_unavailable` rather than failing; `lib/cpufreq_sampler.py` weights each CPU's clock by its busy time, reports `na` for CPUs that never ran, and exits 3 when mains power drops, by the rule the shell applies; `lib/openloop_rates.py` derives the plateau from HTTP 200 scan completions with table 4's `(N-1)/span`; `lib/predict_composition.py` imports without XGBoost, builds the service's request frame, takes the conversion share from the medians, reads the cgroup v2 and v1 CPU limit (verified, mismatch including unlimited, or unverifiable), refuses a quota mismatch before measuring, and merges per-rep files into schema 2, refusing reps that disagree on image, workload or versions |
 | `test_scan_outliers.py` | Only a rep far above its design cell is flagged, and a spread under 5% is not, whatever its z-score; a cell's placement is the state it held longest with a connection open; crowding ranks every shared worker above the even split, including `2-2-0` at four connections; uneven placements are tested against even ones at the same level; table 4g and figure 9 are written only when the run recorded placement |
 | `test_analysis.py` core tests | Cell-value parsing and ordering, throughput within reps, cluster bootstrap, rank-biserial effect size, GC log parsing and k6 JSON loading |
@@ -679,14 +681,24 @@ The unit tests check each guard's logic in isolation; this checks that the guard
 
 ```bash
 sudo ./prepare-host.sh
+docker compose down
 cd fault-injection
 ./verify-guards.sh
 ```
 
+`verify-guards.sh` runs three sets of cases, one per harness script whose guards they test, and exits non-zero if any set fails:
+
+1. **Suite:** the cases in `cases/*.case`, each against a minimal slice of `run-suite.sh`.
+2. **Open-loop:** `verify-guards-openloop.sh`, the cases in `cases/openloop/`, against `run-openloop.sh`.
+3. **Composition:** `verify-guards-composition.sh`, the cases in `cases/composition/`, against `run-predict-composition.sh`.
+
+Every set has a case `00-unmodified` that changes nothing and must pass clean, so a set in which every case aborts is reported as a failure, not a pass. Each case passes only if its run aborts through the named guard, whose tag must appear in that script's own failures log, or, for a check that refuses before opening that log, if the run stops with the named refusal.
+
+### Suite cases
+
 - Each of the eight fault cases (`01` to `08`) misconfigures one pinned setting the suite enforces, runs a minimal slice of `run-suite.sh` against it, and records whether the expected guard rejected it.
-- Case `00-unmodified` changes nothing and must pass clean, so a suite in which every case aborts is reported as a failure, not a pass.
 - Everything runs against a generated copy of the compose configuration in `fault-injection/scratch/`, whose bind mounts and results directory point inside `fault-injection/`; the top-level `results/` is untouched.
-- The report goes to `fault-injection/results/guard_verification_report.{md,csv}`. Like `results/`, it is host- and run-specific regenerable evidence, so it is gitignored rather than committed.
+- The report goes to `fault-injection/results/guard_verification_report.{md,csv}`.
 
 | Case | Fault | Guard |
 |---|---|---|
@@ -700,11 +712,39 @@ cd fault-injection
 | `07-gc-threads-unpinned` | GC worker-thread count left to JVM ergonomics | `[jvm-pin]` |
 | `08-collector-swapped` | Collector swapped from G1 to Parallel | `[jvm-pin]` |
 
-- **Where to run:** on the host that will produce the dataset, after `sudo ./prepare-host.sh`. Every case runs `run-suite.sh`, so the script refuses an unprepared host rather than report every case as aborting through the wrong guard.
-- **SMT:** cases 01 and 02 need an SMT host and are reported as skipped, not passed, without one.
-- **Baselines:** cases 01 to 04 read their baseline cpusets from `docker-compose.yml`'s defaults when those fit the host, and from `recommend-cpusets.sh` otherwise, so a case that fails because the baseline does not fit the host is distinguished from one whose guard did not fire.
-- **Coverage:** config drift. Each case changes one compose-level setting and asserts a named guard rejects it. Measurement-methodology constants, such as the warm-up window or `gracefulStop`, have no abort path to assert against and are covered by the unit tests.
-- **Disclosed gap:** pinned options that are present in the compose file but never reach the JVM. No compose-level fault reproduces that, so the `[jvm-pin]` guard is checked only through the flag origin the JVM reports.
+### Open-loop and composition cases
+
+Both checks start from a finished suite run's `run_metadata.json`, so their faults are in what that run recorded. Each case copies a suite run's `run_metadata.json`, the fixture, into its own run directory under `fault-injection/scratch/<check>/<case>/`, patches one recorded setting in the copy, and runs the check against that directory, which receives everything the check writes. The metadata is all either check reads at the case slice, which uses explicit rates rather than the scan's plateau. `verify-guards.sh` uses the suite run its own unmodified case leaves in `scratch/00-unmodified/results/`, and runs these sets only when that case passed. Either script also runs alone, against that directory by default or a suite run directory given as its argument, which it copies and never modifies:
+
+```bash
+./verify-guards-openloop.sh       # after ./verify-guards.sh, or: ./verify-guards-openloop.sh ../results/suite_<host>_<timestamp>
+./verify-guards-composition.sh
+```
+
+The cases run at a small slice: the open-loop check one 10-second rep at 20 req/s on the `calibration` target with the fixed-iteration warm-up, the composition check one rep of 50 calls. Reports go to `fault-injection/results/guard_verification_{openloop,composition}.{md,csv}`.
+
+| Check | Case | Fault | Expected |
+|---|---|---|---|
+| open-loop | `00-unmodified` | Nothing changed | none, must complete and log its `recorded_setting` lines |
+| open-loop | `01-setting-not-recorded` | No thread-limiter token count recorded | refused: `recorded no suite_config.thread_limiter_tokens` |
+| open-loop | `02-jvm-options-differ` | Recorded JVM options differ from those `docker-compose.yml` now resolves to, as after a change to the file | `[recorded-settings]` |
+| open-loop | `03-smt-overlap` | Recorded cpusets put python-service on the other hyperthread of each of the Java service's cores | `[smt]` |
+| open-loop | `04-cpu-quota-exceeds-cpuset` | Recorded CPU quota larger than the recorded cpuset can supply | `[cpuset]` |
+| open-loop | `05-power-state-differs` | Host prepared, but not in the state the suite run recorded | refused: `The CPU power state differs` |
+| composition | `00-unmodified` | Nothing changed, measured stack down | none, must write a schema-2 `predict_composition.json` |
+| composition | `01-measured-stack-running` | python-service running when the check starts | `[stack]` |
+| composition | `02-quota-not-recorded` | No Python CPU quota recorded | refused: `recorded no Python CPU quota` |
+| composition | `03-cpuset-not-recorded` | No Python cpuset recorded | refused: `recorded no Python cpuset` |
+| composition | `04-power-state-differs` | Host prepared, but not in the state the suite run recorded | refused: `The CPU power state differs` |
+
+### Scope
+
+- **Where to run:** on the host that will produce the dataset, after `sudo ./prepare-host.sh`. Every case runs a harness script that refuses an unprepared host, so the scripts refuse one too, rather than report every case as aborting through the wrong guard.
+- **SMT:** suite cases 01 and 02 and open-loop case 03 need an SMT host and are reported as skipped, not passed, without one.
+- **Baselines:** suite cases 01 to 04 read their baseline cpusets from `docker-compose.yml`'s defaults when those fit the host, and from `recommend-cpusets.sh` otherwise, so a case that fails because the baseline does not fit the host is distinguished from one whose guard did not fire. Open-loop case 03 derives its cpusets from the fixture's recorded Java cpuset.
+- **Coverage:** config drift. Each case changes one compose-level or recorded setting and asserts a named guard rejects it. The open-loop check's per-rep guards are the suite's own functions, which the suite cases exercise; its control case shows they pass on its own stack. Measurement-methodology constants, such as the warm-up window or `gracefulStop`, have no abort path to assert against and are covered by the unit tests.
+- **Reports:** like `results/`, every report is host- and run-specific regenerable evidence, so `fault-injection/results/` and `fault-injection/scratch/` are gitignored rather than committed.
+- **Disclosed gaps:** pinned options that are present in the compose file but never reach the JVM; no compose-level fault reproduces that, so the `[jvm-pin]` guard is checked only through the flag origin the JVM reports. The composition container's own CPU-affinity and quota checks (`[composition]`), since the container is started on the recorded values and no case can make it run elsewhere without changing the script; and the `[image]` refusal, whose fault, a missing python-service image, would remove the image the rest of the run needs. Both are covered by the unit tests.
 
 ---
 
@@ -885,11 +925,16 @@ training/train_model.py --n-features {5,10,20,28}   # one tier
 │   │   ├── probe_calibration_drift.sh    # checks calibration-pass throughput holds across reps
 │   │   ├── probe_ablation_taper.sh       # per-arm cell-duration check
 │   │   └── probe_telemetry_completeness.sh  # per-target telemetry field presence, build-freshness check
-│   └── tests/                    # bats-core (173): topology, JVM pins, shared helpers, warm-up gate, calibration, thermal, power state, run layout, orchestration, construct-validity checks
+│   └── tests/                    # bats-core (187): topology, JVM pins, shared helpers, warm-up gate, calibration, thermal, power state, run layout, orchestration, construct-validity checks, guard cases
 ├── fault-injection/
-│   ├── verify-guards.sh          # runs each case, records whether the expected guard fired
-│   ├── cases/*.case              # 9 cases: 00 unmodified as control, 01-08 each misconfigure one pinned setting
-│   └── results/guard_verification_report.{md,csv}
+│   ├── verify-guards.sh          # runs the suite cases, then the two scripts below, records whether each expected guard fired
+│   ├── verify-guards-openloop.sh     # open-loop cases, against copies of a suite run's metadata
+│   ├── verify-guards-composition.sh  # composition cases, against copies of a suite run's metadata
+│   ├── lib/guard-cases.sh        # case runner shared by the two scripts above
+│   ├── cases/*.case              # 9 suite cases: 00 unmodified as control, 01-08 each misconfigure one pinned setting
+│   ├── cases/openloop/*.case     # 6 cases: 00 as control, 01-05 each fault one recorded setting or the power state
+│   ├── cases/composition/*.case  # 5 cases: 00 as control, 01-04 each a running stack, a missing setting or the power state
+│   └── results/guard_verification_{report,openloop,composition}.{md,csv}
 ├── results/                       # generated, gitignored except .gitkeep
 │   ├── suite_<host>_<timestamp>/  # one run-suite.sh run: *.json.gz, run_metadata.json, logs, gc-logs/
 │   ├── ablation_<host>_<timestamp>/  # one run-ablation.sh run: ablation_* files
