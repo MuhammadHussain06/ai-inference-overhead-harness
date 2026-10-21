@@ -1,15 +1,13 @@
 #!/usr/bin/env bats
-# Unit tests for lib/topology.sh. A real host only ever exposes one topology; these
-# build three synthetic /sys trees so every shape the guard must handle -- adjacent
-# SMT pairs, offset-numbered pairs, no SMT, and a hybrid P/E split -- is covered in
-# one run instead of only whatever hardware happens to be at hand.
+# Unit tests for lib/topology.sh. Three synthetic /sys trees (TOPO_SYSFS_ROOT) cover the
+# shapes the guard must handle on any host: adjacent SMT pairs with a hybrid P/E split,
+# offset-numbered pairs, and no SMT.
 
 setup_file() {
   export LIB="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)/lib/topology.sh"
 
-  # "<root> <n_cpus> <sibling_mode> [hybrid_perf_range]". sibling_mode "adjacent"
-  # pairs cpu 2k with 2k+1 (this host's actual scheme, confirmed against its
-  # recommend-cpusets.sh output); "offset" pairs cpu i with i+n/2; "none" gives
+  # "<root> <n_cpus> <sibling_mode> [hybrid_perf_range]". "adjacent" pairs cpu 2k with
+  # 2k+1 (the reference host's scheme); "offset" pairs cpu i with i+n/2; "none" gives
   # every cpu its own core.
   _build_sys_tree() {
     local root="$1" n="$2" mode="$3" hybrid="${4:-}"
@@ -31,12 +29,11 @@ setup_file() {
     fi
   }
 
-  # Mirrors the reference host: 8 performance cores as adjacent SMT pairs (cpus
-  # 0-15), 16 efficiency cores with no SMT (cpus 16-31).
+  # The reference host's layout: 8 performance cores as adjacent SMT pairs (cpus 0-15),
+  # 16 efficiency cores without SMT (cpus 16-31).
   export SYS_HYBRID="${BATS_FILE_TMPDIR}/sys-hybrid"
   _build_sys_tree "$SYS_HYBRID" 32 adjacent "0-15"
-  # A patched-in E-core range needs its own per-cpu dirs too, since "adjacent"
-  # above already wrote pair siblings for all 32; overwrite 16-31 as SMT-less.
+  # _build_sys_tree wrote adjacent pairs for all 32 CPUs; rewrite 16-31 as SMT-less.
   for ((c = 16; c < 32; c++)); do
     echo "$c" > "${SYS_HYBRID}/devices/system/cpu/cpu${c}/topology/thread_siblings_list"
   done
@@ -91,9 +88,8 @@ setup() {
 }
 
 @test "topo_performance_cpus reads the hybrid marker" {
-  # topo_performance_cpus yields one cpu per line, already expanded; join with
-  # commas before formatting -- topo_format_cpus expects cpuset notation, the
-  # same way recommend-cpusets.sh joins cores before calling it.
+  # topo_performance_cpus prints one cpu per line; topo_format_cpus expects a comma
+  # list, so join first, as recommend-cpusets.sh does.
   [ "$(topo_format_cpus "$(topo_performance_cpus | paste -sd, -)")" = "0-15" ]
 }
 
@@ -159,8 +155,8 @@ setup() {
 }
 
 @test "verify_service_cpuset rejects a disjoint-by-number pair that is one offset core" {
-  # 2 and 10 are siblings on the offset host (2 and 2+8) -- numerically adjacent-
-  # looking "2,3" is actually two different physical cores' first threads there.
+  # On the offset host CPU 2's sibling is 10 and CPU 3's is 11, so "2,3" takes one
+  # thread from each of two physical cores.
   TOPO_SYSFS_ROOT="$SYS_OFFSET"
   run verify_service_cpuset "test" "java" "2,3" "2"
   [ "$status" -eq 1 ]
