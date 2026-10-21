@@ -1,3 +1,4 @@
+# Service settings read from the environment at import time.
 import os
 
 
@@ -12,13 +13,13 @@ class Settings:
 
     FRAUD_THRESHOLD = float(os.getenv("FRAUD_THRESHOLD", "0.50"))
 
-    # docker-compose.yml sets this for every run (40, anyio's own default, unless the
-    # ablation overrides it). Unset leaves anyio's default capacity in place.
+    # Per-process anyio thread-limiter capacity. Compose always sets it (40, anyio's own
+    # default, unless the ablation overrides it); unset leaves anyio's default in place.
     _thread_limiter_env = os.getenv("THREAD_LIMITER_TOKENS", "").strip()
     THREAD_LIMITER_TOKENS = int(_thread_limiter_env) if _thread_limiter_env else None
 
-    # Reported on /health so the harness verifies single-threaded numeric libraries
-    # each rep. n_jobs alone does not constrain the BLAS/OpenMP layer beneath it.
+    # Reported on /health so the harness can check every rep that the numeric libraries
+    # are single-threaded; n_jobs alone does not constrain the BLAS/OpenMP layer.
     NUMERIC_THREAD_ENV_VARS = (
         "OMP_NUM_THREADS",
         "OPENBLAS_NUM_THREADS",
