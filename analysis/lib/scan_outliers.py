@@ -6,8 +6,8 @@ reps: modified z-score (median/MAD) above Z_THRESHOLD and at least MIN_DEVIATION
 above the median rep. Each cell carries the features that tell the candidate causes
 apart: whether the whole distribution moved (median shift) or only its start (first
 tenth of requests against the rest), Python compute stall and thread dispatch, thermal
-throttling, and, from lib/placement.py's log, how its connections were spread across
-the python-service workers.
+throttling, and, from load-testing/lib/placement.py's log, how its connections were spread
+across the python-service workers.
 
 A placement's crowding is the number of connections on the worker serving a connection,
 itself included, averaged over connections: sum(c_i^2) / sum(c_i) for worker counts c_i.
