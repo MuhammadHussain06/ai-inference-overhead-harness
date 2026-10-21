@@ -25,8 +25,9 @@ public class WebClientConfig {
     @Value("${python.service.response-timeout-ms:5000}")
     private long responseTimeoutMs;
 
-    // Must exceed peak VUs, or outbound queueing lands in the network/Python metrics.
-    // The harness scripts export 2x their peak VUs; this default is for manual runs.
+    // Must exceed peak VUs, or the wait for a pooled connection lands in
+    // aiCallRoundTripTimeMs and so in the estimated bridge overhead. The harness
+    // scripts export 2x their peak VUs; this default is for manual runs.
     @Value("${python.service.max-connections:128}")
     private int maxConnections;
 
