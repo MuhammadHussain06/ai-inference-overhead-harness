@@ -21,32 +21,32 @@
 	</properties>
 
 	<dependencies>
-		<!-- WebFlux (Provides Netty server and WebClient for reactive pipelines) -->
+		<!-- WebFlux: Reactor Netty server and the non-blocking WebClient -->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-webflux</artifactId>
 		</dependency>
 
-		<!-- Reactive R2DBC Starter -->
+		<!-- Reactive persistence (R2DBC); disabled in benchmarks -->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-data-r2dbc</artifactId>
 		</dependency>
 
-		<!-- H2 R2DBC Driver -->
+		<!-- In-memory H2 driver for R2DBC -->
 		<dependency>
 			<groupId>io.r2dbc</groupId>
 			<artifactId>r2dbc-h2</artifactId>
 			<scope>runtime</scope>
 		</dependency>
 
-		<!-- Bean Validation -->
+		<!-- Jakarta Bean Validation for @Valid request DTOs -->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-validation</artifactId>
 		</dependency>
 
-		<!-- Lombok -->
+		<!-- Lombok; keep in step with the annotation processor path below -->
 		<dependency>
 			<groupId>org.projectlombok</groupId>
 			<artifactId>lombok</artifactId>
@@ -61,7 +61,7 @@
 			<scope>test</scope>
 		</dependency>
 
-		<!-- Reactor StepVerifier for reactive testing -->
+		<!-- Reactor StepVerifier for reactive tests -->
 		<dependency>
 			<groupId>io.projectreactor</groupId>
 			<artifactId>reactor-test</artifactId>
