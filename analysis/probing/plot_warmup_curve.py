@@ -10,9 +10,9 @@ throttling in a longer probe. The active-VU line needs the vus metric, which
 the harness filters out of finalized files; a raw or probe file keeps it.
 
 --thermal-log takes a `sensors`-polling log (package temp only).
---turbostat-log takes a `turbostat` log (temp + Bzy_MHz frequency, direct
-evidence of throttling rather than a temp proxy). If both are given,
-turbostat's temp reading wins.
+--turbostat-log takes a `turbostat` log (temp and Bzy_MHz, else Avg_MHz,
+frequency: direct evidence of throttling rather than a temp proxy). If both
+are given, the sensors log is ignored.
 
 Log format for both: timestamped blocks from a polling loop --
 
