@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Standalone diagnostic -- not wired into run-suite.sh or run-ablation.sh.
-# converge_warmup() in both scripts stops at MAX_WARMUP_CHUNKS and reports
-# whether a target converged by then, without showing where a non-converging
-# target actually settles. Runs the same duration-bounded, constant-vus
-# warm-up.js chunks converge_warmup() uses, past that cap, printing the gate's
-# own verdict (lib/warmup_gate.py) at every checkpoint.
+# Standalone diagnostic, not called by run-suite.sh or run-ablation.sh.
+# converge_warmup() stops at MAX_WARMUP_CHUNKS without showing where a non-converging
+# target settles. This runs the same constant-vus warm-up.js chunks for one target past
+# that cap and prints lib/warmup_gate.py's verdict at every checkpoint.
 #
 # Usage:
 #   ./probe_warmup_settle.sh LABEL TIER VUS [CPUSET CPUS WORKERS TOKENS] [MAX_CHUNKS] [CHUNK_DURATION_S]
