@@ -103,7 +103,8 @@ def collect(run):
 
 
 def comparisons(run, cells):
-    """{arm: (control, extreme)}, chosen as analyze-ablation.py's planned comparison does."""
+    """{arm: (control, extreme)}, chosen as analyze-ablation.py's planned comparison does;
+    the sweep's endpoints when the control value was not measured."""
     controls = ablation.control_cells(run.metadata)
     chosen = {}
     for arm in sorted({k[0] for k in cells}):
@@ -121,6 +122,8 @@ def _per_rep(cells, arm, value, metric):
 
 
 def build_metrics(data, choices, arms):
+    """Extreme-over-control series per family and arm, one per run. Names come from the
+    first run's choice; main() keeps only arms chosen identically on every run."""
     metrics = []
     for metric, family in FAMILIES:
         for arm in arms:
