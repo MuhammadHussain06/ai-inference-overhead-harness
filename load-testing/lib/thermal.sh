@@ -52,7 +52,7 @@ read_throttle_ms() {
 }
 
 # Samples governor, per-core frequency, temperature and throttle counters at a named
-# point in the run, so mid-suite throttling or a governor change is attributable to
+# point in the run, so mid-run throttling or a governor change is attributable to
 # a specific rep rather than inferred from one snapshot taken before it started.
 record_env_sample() {
   local governor freqs temp
@@ -79,15 +79,12 @@ record_cell_thermal() {
   echo "cell_${edge} ts=$(thermal_ts) temp_c=${temp:-na} $(read_throttle_ms) cell=${cell}" >> "$ENV_TRACE_LOG"
 }
 
-# Pauses at/above THERMAL_WARN_C and aborts only if still at/above THERMAL_CRIT_C
-# once cooling has stopped making progress: a thermally wedged host loses the whole
-# run, one that is still genuinely cooling gets more wall-clock time to keep doing
-# so. MAX_THERMAL_COOLDOWNS rounds are always given regardless of trend; beyond
-# that, a round is only granted if the previous one actually lowered the reading,
-# up to THERMAL_MAX_COOLDOWNS_EXTENDED total -- the moment a round fails to cool,
-# further waiting is assumed not to help either, so the check stops there rather
-# than spending the rest of the budget. Every check is logged with the time it
-# paused for, so the run's thermal pause cost is measured rather than estimated.
+# Pauses THERMAL_COOLDOWN_S per round while at/above THERMAL_WARN_C, then aborts if still
+# at/above THERMAL_CRIT_C. The first MAX_THERMAL_COOLDOWNS rounds are always granted; later
+# rounds only while the previous round lowered the reading, up to
+# THERMAL_MAX_COOLDOWNS_EXTENDED in total, so a host that is still cooling gets more time
+# and a wedged one does not use up the budget. Every check is logged with its pause time,
+# so the run's thermal pause cost is measured.
 check_thermal_safety() {
   local label="$1"
   local ts temp first cooldowns=0 pre
