@@ -1,3 +1,4 @@
+# Request and response models shared by the three arm routers.
 from typing import List
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -15,8 +16,8 @@ class TransactionPayload(BaseModel):
 class PythonTelemetryDto(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    # Defaults of 0.0 keep the field set identical across all three strategy arms,
-    # which is what makes decomposition by subtraction well defined.
+    # Defaults of 0.0 keep the field set identical across all three arms (zeros where
+    # an arm does no work), which makes decomposition by subtraction well defined.
     parsingRequestTimeMs: float = 0.0
     threadDispatchTimeMs: float = 0.0
     computationTimeMs: float = 0.0
