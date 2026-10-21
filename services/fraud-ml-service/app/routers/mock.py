@@ -12,8 +12,8 @@ router = APIRouter()
 
 
 def _score_mock():
-    # Reports computationTimeMs as 0.0 so this arm carries no compute term at all;
-    # the random draw's own cost therefore lands in threadDispatchTimeMs.
+    # Mock arm: reports computationTimeMs as 0.0, so the random draw's own cost lands
+    # in threadDispatchTimeMs.
     risk_score = random.uniform(0.0, 1.0)
     is_fraud = risk_score >= settings.FRAUD_THRESHOLD
     return is_fraud, risk_score, 0.0
