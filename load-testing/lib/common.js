@@ -4,8 +4,8 @@ import { Trend, Rate, Counter } from 'k6/metrics';
 
 export const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080/api/v1/transactions';
 
-// Maps TARGET env vars / filenames ('mock' | 'calibration' | '5' | '10' | '20' | '28') to tier config.
-// label is explicit so calibration (featureTier: null) can't collide with mock.
+// The six targets: TARGET values and filename labels mapped to arm (strategy) and tier.
+// label is explicit so calibration and mock (both featureTier: null) stay distinct.
 export const TARGETS = {
   mock: { strategy: 'DISTRIBUTED_MOCK_GATEWAY', featureTier: null, label: 'mock' },
   calibration: { strategy: 'DISTRIBUTED_CALIBRATION_ONLY', featureTier: null, label: 'calibration' },
@@ -15,8 +15,8 @@ export const TARGETS = {
   '28': { strategy: 'DISTRIBUTED_AI_SYNCHRONOUS', featureTier: 28, label: '28' },
 };
 
-// Only 200 is a valid outcome here, so k6's default (any 2xx/3xx) would let a cell
-// where every request failed still look healthy.
+// Only 200 counts as success; k6's default (any 2xx/3xx) could let a cell of failed
+// requests look healthy.
 http.setResponseCallback(http.expectedStatuses(200));
 
 const parsingTime = new Trend('python_parsing_time_ms', true);
@@ -24,30 +24,29 @@ const threadDispatchTime = new Trend('python_thread_dispatch_time_ms', true);
 const computationTime = new Trend('python_computation_time_ms', true);
 const dataframeConstructionTime = new Trend('python_dataframe_construction_time_ms', true);
 const modelInferenceTime = new Trend('python_model_inference_time_ms', true);
-// Off-CPU time within computation (GIL/scheduling stalls). Distinct from
-// threadDispatchTime, which is pre-execution queueing, and already contained in
-// computationTime rather than additive to it.
+// Compute stall: computation minus thread CPU time (GIL waits, preemption), floored at 0;
+// a subset of computationTime, not additive to it. Thread dispatch (limiter token wait,
+// hand-off, GIL acquisition, return to the event loop) lies outside computation.
 const computeStallTime = new Trend('python_compute_stall_time_ms', true);
 const serializationTime = new Trend('python_serialization_time_ms', true);
 const totalPythonTime = new Trend('python_total_time_ms', true);
 
-// Java-side estimate: aiCallRoundTripTimeMs minus Python's own totalPythonExecutionTimeMs.
-// Docker bridge-network and HTTP/serialization overhead between the two containers, not
-// a real network hop -- see README's telemetry notes.
+// Estimated bridge overhead: aiCallRoundTripTimeMs minus totalPythonExecutionTimeMs. The
+// Docker bridge hop on one host (not a real network), plus uvicorn HTTP handling, pre-P0
+// queueing, Java encode/decode and the serialization-estimate error; see the README.
 const javaEstimatedBridgeOverhead = new Trend('java_estimated_bridge_overhead_ms', true);
-// Java-side end-to-end. Recorded so http_req_duration minus this figure -- Netty
-// ingress, response encoding and the client hop -- is computable from the dataset.
+// Java execution time (T0 to just before the response DTO). Recorded so the client-side
+// remainder (http_req_duration minus this) can be computed from the dataset.
 const javaExecutionTime = new Trend('java_execution_time_ms', true);
 
-// Application-level HTTP errors (a non-200 response) are structurally different from
-// network-level timeouts (status 0, no response at all): the second censors the cell's
-// latency distribution, the first does not.
+// HTTP errors (a non-200 response) and timeouts (status 0, no response) are counted apart:
+// a timeout censors the cell's latency distribution, an HTTP error does not.
 const requestSuccess = new Rate('request_success');
 const requestHttpError = new Counter('request_http_error');
 const requestTimeoutError = new Counter('request_timeout_error');
 
-// Vendored rather than imported from jslib.k6.io, so a cell cannot fail on a CDN
-// lookup partway through a multi-hour suite.
+// Vendored rather than imported from jslib.k6.io, so a cell cannot fail on a CDN lookup
+// mid-run.
 function uuidv4() {
   let out = '';
   for (let i = 0; i < 36; i++) {
@@ -64,8 +63,8 @@ function uuidv4() {
   return out;
 }
 
-// Always 28 values regardless of tier, so the request body is the same size for every
-// condition and payload size cannot explain a tier difference. /predict/v{n} slices.
+// Callers always pass 28, so the body size is identical across targets and payload size
+// cannot explain a tier difference; /predict/v{n} takes the first n.
 export function randomFeatures(n) {
   const arr = [];
   for (let i = 0; i < n; i++) {
@@ -74,9 +73,9 @@ export function randomFeatures(n) {
   return arr;
 }
 
-// Executes a target transaction and records k6 metrics alongside the nested Python
-// telemetry. extraTags carries the grouping keys the analysis reads: vus/phase/rep/rate
-// for analyze-results.py, arm/arm_value for analyze-ablation.py.
+// Sends one transaction to a target and records its outcome and telemetry. extraTags carries
+// the grouping keys the analysis reads: vus/phase/rep/rate for analyze-results.py,
+// arm/arm_value for analyze-ablation.py.
 export function sendTransaction(target, extraTags) {
   const tierLabel = target.label;
 
@@ -97,7 +96,7 @@ export function sendTransaction(target, extraTags) {
 
   const res = http.post(BASE_URL, JSON.stringify(body), params);
 
-  // Aligns k6's built-in `checks` output with the custom Rate/Counter metrics above.
+  // Keeps k6's built-in `checks` output consistent with the custom Rate/Counters.
   const ok = check(res, { 'status is 200': (r) => r.status === 200 }, tags);
   requestSuccess.add(ok, tags);
 
@@ -108,8 +107,8 @@ export function sendTransaction(target, extraTags) {
     } catch (e) {
       console.error(`Unparseable 200 body [${target.strategy}/${tierLabel}]: ${e}`);
     }
-    // Telemetry is recorded only on this branch, so the Python Trends hold
-    // successful requests by construction and need no status filter downstream.
+    // Telemetry is recorded only here, so every telemetry Trend holds successful requests
+    // only and needs no status filter downstream.
     if (responseBody) {
       const telemetry = responseBody.pythonTelemetry;
       if (telemetry) {
