@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
-# Standalone probe -- NOT wired into run-suite.sh. Run by hand to check the
-# calibration idea against a given tier before it goes anywhere near the
-# real pipeline.
-#
-# What it does: runs one short cell at a reference VUS to measure that
-# tier's real throughput, then prints the ITERATIONS_PER_VU needed at each
-# affected concurrency level (8/16/32/64) to reach a target cell duration
-# (default 60s). Assumes what run-suite.sh's calibrate_target() assumes: a
-# tier's total throughput stays roughly constant across VUS, so one
-# measurement derives all four levels.
+# Standalone probe, not called by run-suite.sh; run by hand with the stack up.
+# Measures one target's throughput at a reference VUS and prints the ITERATIONS_PER_VU each
+# of VUS 8/16/32/64 needs for a duration-targeted cell (default 60 s). Same assumption as
+# run-suite.sh's calibrate_target(): a target's throughput is roughly flat across VUS, so
+# one measurement sizes all four levels. Unlike calibrate_target(), it counts every
+# phase=scan point, not only HTTP 200 responses.
 #
 # Usage: ./calibrate_scan_iterations.sh TIER [REFERENCE_VUS] [TARGET_DURATION_S] [CALIBRATION_ITER_PER_VU]
 set -euo pipefail
@@ -28,13 +24,13 @@ CALIBRATION_ITER_PER_VU="${4:-2000}"
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 COMPOSE_FILE="../../docker-compose.yml"
-# Fixed rather than overridable: CONTAINER_OUT below is tied to the compose mount of
-# ../../results, so any other host path would point the python step at a file k6
-# never wrote.
+# Fixed rather than overridable: CONTAINER_OUT is tied to the compose mount of
+# ../../results (RUN_RESULTS_DIR unset), so any other host path would point the python
+# step at a file k6 never wrote.
 RESULTS_DIR="../../results"
-# Path as the k6 container sees it (docker-compose.yml mounts ./results -> /results).
+# Path as the k6 container sees it (compose mounts ./results at /results).
 CONTAINER_OUT="/results/calib_${TIER}_vus${REFERENCE_VUS}.json"
-# Same file, as this host sees it -- the python step below runs outside docker.
+# Same file as the host sees it; the python step runs outside docker.
 HOST_OUT="${RESULTS_DIR}/calib_${TIER}_vus${REFERENCE_VUS}.json"
 
 echo "[calibrate] measuring throughput for tier=${TIER} at VUS=${REFERENCE_VUS} (${CALIBRATION_ITER_PER_VU} iter/vu)..."
@@ -86,8 +82,8 @@ if duration <= 0:
     print(f"[!] {n} points but a zero-length time span -- cannot compute throughput.",
           file=sys.stderr)
     sys.exit(1)
-# N completion timestamps bound N-1 inter-completion intervals, so the rate over that
-# span is (N-1)/span -- same convention as analyze-results.py's _throughput_reqs_per_s.
+# N completion timestamps bound N-1 intervals: rate = (N-1)/span, the convention of
+# analyze-results.py's _throughput_reqs_per_s.
 throughput = (n - 1) / duration
 target_total_requests = throughput * target_s
 
