@@ -37,7 +37,7 @@ public class RequestDto {
 
     // Required by DISTRIBUTED_AI_SYNCHRONOUS and checked against the tiers
     // FeatureTierRegistry reads from fraud-ml-service, so no tier list is pinned
-    // here. Ignored by the two baseline strategies.
+    // here. Ignored by the calibration and mock arms.
     private Integer featureTier;
 
     public RequestDto() {}
