@@ -29,8 +29,8 @@ public class FeatureTierRegistry {
         this.webClient = webClient;
     }
 
-    // In @PostConstruct so an unreachable fraud-ml-service fails startup outright
-    // rather than leaving the server accepting requests with no tier set.
+    // Retries MAX_ATTEMPTS times, RETRY_DELAY apart, then throws, so an unreachable
+    // fraud-ml-service fails startup instead of leaving a server with no tier set.
     @PostConstruct
     public void init() {
         RuntimeException lastError = null;
