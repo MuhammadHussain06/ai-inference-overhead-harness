@@ -21,10 +21,9 @@ setup() {
   THERMAL_COOLDOWN_S=60
   MAX_THERMAL_COOLDOWNS=2
   abort_suite() { echo "$*" > "$ABORT_RECORD"; exit 1; }
-  # Records each pause instead of taking it; a test that cools the host during a
-  # pause lowers the zone reading from here. COOL_SEQUENCE (space-separated
-  # millidegrees) applies one reading per call, in order, for scripting a specific
-  # multi-round curve; COOL_TO applies the same reading on every call.
+  # Records each pause instead of taking it, and can cool the zone during it.
+  # COOL_SEQUENCE (space-separated millidegrees) sets one reading per call, in order;
+  # COOL_TO sets the same reading on every call.
   sleep() {
     echo "slept $1" >> "${BATS_TEST_TMPDIR}/sleeps"
     if [ -n "${COOL_SEQUENCE:-}" ]; then
@@ -157,9 +156,9 @@ core_throttle() {
   COOL_SEQUENCE="95000 93000 93000 91000"
   run check_thermal_safety "scan target=28 vus=64 rep=1"
   [ "$status" -eq 0 ]
-  # 3 rounds: two guaranteed, one extended round that cooled 95->93; the next
-  # round would have started from 93 and did not cool it further, so it is
-  # never taken even though the cap allows two more.
+  # 3 rounds: two guaranteed (97->95->93), then one extended round, taken because the
+  # previous round cooled. It leaves the zone at 93, so a fourth round is not taken
+  # although the cap allows two more.
   [ "$(grep -c . "${BATS_TEST_TMPDIR}/sleeps")" = "3" ]
   [[ "$(cat "$ENV_TRACE_LOG")" == *" temp_c=97 temp_after_c=93 cooldowns=3 paused_s=180 label=scan target=28 vus=64 rep=1" ]]
 }
@@ -186,7 +185,7 @@ core_throttle() {
 
 @test "a caller that never sets the extended cap keeps the old fixed-count behavior" {
   # No THERMAL_MAX_COOLDOWNS_EXTENDED: hard_cap falls back to MAX_THERMAL_COOLDOWNS,
-  # matching every caller that predates the extension (the probing scripts included).
+  # as for callers that do not set it (the probing scripts).
   zone 0 97000
   COOL_SEQUENCE="95000 93000 91000"
   run check_thermal_safety "baseline target=28 rep=1"
