@@ -1,5 +1,6 @@
 # A CPU quota larger than the cpuset it applies to. The kernel enforces the smaller of the
-# two, so the run would record a six-CPU limit while applying a two-CPU one.
+# two, so the run would record a 64-CPU quota while the cpuset caps python-service at its own
+# CPU count.
 DESCRIPTION="CPU quota larger than the cpuset can supply"
 STAGE="pre-container"
 EXPECT_GUARD="[cpuset]"
