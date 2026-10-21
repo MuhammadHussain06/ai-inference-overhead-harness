@@ -1,5 +1,5 @@
-"""Table and figure writers shared by every analysis script, so all outputs drop into
-the same paper in the same three table formats."""
+"""Table and figure writers shared by every analysis script: tables as .csv, .md and
+.tex, figures as .png and .pdf."""
 
 import os
 import re
@@ -28,8 +28,7 @@ def save_table(df, name, out, caption=None, label=None):
         f.write(df.to_markdown(index=False))
     with open(f"{stem}.tex", "w") as f:
         f.write("\\begin{table}[t]\n\\centering\n")
-        # Caption precedes the tabular body so it renders above the table,
-        # matching Elsevier/JSS style.
+        # Caption before the tabular so it renders above the table (Elsevier/JSS style).
         if caption:
             f.write(f"\\caption{{{latex_text(caption)}}}\n")
         if label:
