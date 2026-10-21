@@ -8,6 +8,8 @@ import org.springframework.web.server.WebFilter;
 import org.springframework.web.server.WebFilterChain;
 import reactor.core.publisher.Mono;
 
+// Takes T0, the Java request-start stamp, as the first WebFilter. Every Java-side
+// timing is measured from it on the monotonic System.nanoTime clock.
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE)
 public class RequestTimingWebFilter implements WebFilter {
