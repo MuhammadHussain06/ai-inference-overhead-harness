@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Standalone probe -- NOT wired into run-ablation.sh. Checks whether ablation
-# cells, fixed at TARGET=28 VUS=64 ITERATIONS_PER_VU=100, suffer the same
-# per-vu-iterations wind-down contamination the main scan shows at that
-# combination, and whether a longer cell fixes it under this arm's real
-# processing capacity. Each ablation arm changes python-service's throughput by
-# design, so this has to be measured per config, not carried over from the main
-# scan's tier=28 numbers.
+# Standalone probe, not called by run-ablation.sh. For one ablation configuration at
+# TARGET=28 VUS=64, runs a short cell at ITERATIONS_PER_VU=100 (run-ablation.sh's fallback
+# value), measures throughput, then runs a duration-targeted cell (default 60 s), so the
+# per-vu-iterations taper can be compared between the two. Each ablation configuration
+# changes python-service's throughput by design, so cell length is sized per configuration,
+# not carried over from the main scan's tier 28. Throughput counts every phase=ablation
+# point, not only HTTP 200 responses.
 #
 # Usage: ./probe_ablation_taper.sh LABEL CPUSET CPUS WORKERS TOKENS [TARGET_DURATION_S]
 set -euo pipefail
@@ -30,8 +30,8 @@ COMPOSE_FILE="../../docker-compose.yml"
 RESULTS_DIR="../../results"
 TARGET=28
 VUS=64
-SHORT_ITER_PER_VU=100   # matches the real ablation cell exactly
-CALIB_ITER_PER_VU=500   # small, quick throughput measurement
+SHORT_ITER_PER_VU=100   # run-ablation.sh's fallback ITERATIONS_PER_VU
+CALIB_ITER_PER_VU=500   # short throughput measurement
 
 echo "[probe] ${LABEL}: restarting stack (cpuset=${CPUSET} cpus=${CPUS} workers=${WORKERS} tokens=${TOKENS})..."
 docker compose -f "$COMPOSE_FILE" down
@@ -100,8 +100,8 @@ if duration <= 0:
     print(f"[!] {len(times)} points but a zero-length time span -- cannot compute throughput.",
           file=sys.stderr)
     sys.exit(1)
-# N completion timestamps bound N-1 inter-completion intervals, so the rate over that
-# span is (N-1)/span -- same convention as analyze-results.py's _throughput_reqs_per_s.
+# N completion timestamps bound N-1 intervals: rate = (N-1)/span, the convention of
+# analyze-results.py's _throughput_reqs_per_s.
 throughput = (len(times) - 1) / duration
 target_total_requests = throughput * target_s
 print(max(1, round(target_total_requests / vus)))
