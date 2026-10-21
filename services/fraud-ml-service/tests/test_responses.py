@@ -1,4 +1,4 @@
-"""Guards the EWMA serialization estimator and the totals built on it."""
+"""Tests for the EWMA serialization estimate and the Python total built on it."""
 
 import json
 import time
@@ -44,7 +44,7 @@ def test_calibration_produces_a_positive_estimate():
 
 
 def test_calibration_is_sub_millisecond():
-    """A serialization estimate near the inference times it offsets would invalidate the decomposition."""
+    """The estimate is added to the Python total, so it must stay small next to inference time."""
     assert calibrate_serialization_estimate(n_warmup=20) < 1.0
 
 
