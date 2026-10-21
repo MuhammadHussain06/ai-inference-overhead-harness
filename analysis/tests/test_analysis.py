@@ -193,9 +193,8 @@ def _scan_rows(tier, vus, rep, n=20):
 
 
 def test_table4_sampling_column_reflects_the_runs_own_calibration_config(tmp_path):
-    """N differs by orders of magnitude between iteration-based and duration-calibrated
-    VUS levels; the Sampling column must say which regime produced each row rather than
-    leaving readers to infer it from the jump in N alone."""
+    """N jumps between iteration-based and duration-targeted VUS levels; the Sampling
+    column must say which regime produced each row, read from the run's metadata."""
     rows = _scan_rows("28", 2, 1) + _scan_rows("28", 8, 1)
     metadata = {"suite_config": {"calibration": {"affected_levels": [8], "target_duration_s": 60}}}
     results.analyze_scan(pd.DataFrame(rows), str(tmp_path), metadata=metadata)
@@ -207,8 +206,8 @@ def test_table4_sampling_column_reflects_the_runs_own_calibration_config(tmp_pat
 
 
 def test_table4_sampling_column_is_explicit_when_metadata_is_missing(tmp_path):
-    """No run_metadata.json (or an old one predating this field) must not make the column
-    silently guess -- it should say so rather than mislabel a row."""
+    """Without the calibration block in run_metadata.json the column says so rather than
+    guessing a regime."""
     rows = _scan_rows("28", 8, 1)
     results.analyze_scan(pd.DataFrame(rows), str(tmp_path))  # metadata omitted
     table4 = pd.read_csv(tmp_path / "tables" / "table4_concurrency_scan_summary_pooled.csv")
@@ -221,6 +220,22 @@ def test_baseline_warns_when_only_one_repetition_is_present(tmp_path, capsys):
              "time": pd.Timestamp("2026-01-01T00:00:00Z")}]
     results.analyze_baseline(pd.DataFrame(rows), str(tmp_path))
     assert "Only 1 repetition detected" in capsys.readouterr().out
+
+
+def test_table2_recovers_java_side_overhead_and_client_side_remainder(tmp_path):
+    """k6 records only execution time and the bridge from Java; the two derived columns
+    must close the decomposition against k6's own request duration."""
+    rows = []
+    for rep in ("1", "2"):
+        for metric, value in [("http_req_duration", 10.0), ("java_execution_time_ms", 8.0),
+                              ("java_estimated_bridge_overhead_ms", 1.0), ("python_total_time_ms", 5.0)]:
+            rows.append({"metric": metric, "value": value, "status": "200", "phase": "baseline",
+                         "tier": "28", "rep": rep, "source_file": f"baseline_28_rep{rep}.json.gz",
+                         "time": pd.Timestamp("2026-01-01T00:00:00Z")})
+    results.analyze_baseline(pd.DataFrame(rows), str(tmp_path))
+    table2 = pd.read_csv(tmp_path / "tables" / "table2_baseline_python_decomposition_mean_ms.csv")
+    assert table2["Java-side overhead (ms)"].iloc[0] == pytest.approx(2.0)
+    assert table2["Client-side remainder (ms)"].iloc[0] == pytest.approx(2.0)
 
 
 def test_scan_warns_when_only_one_repetition_is_present(tmp_path, capsys):
@@ -395,7 +410,7 @@ def test_summarize_falls_back_to_sample_n_without_a_true_counts_match():
     assert stats["N (pooled, all reps)"] == 3
 
 
-# --- GC log parsing, effect size, and throughput edge cases ---
+# GC log parsing, effect size, and throughput edge cases
 
 SERIAL_PAUSE_LOG = (
     "[2026-01-01T12:00:00.000+0000][0.005s][info][gc     ] Using Serial\n"
@@ -503,8 +518,10 @@ def test_openloop_check_reports_real_check_without_smoke_contamination(tmp_path,
     ol_rows = table[table["Model"].str.startswith("Open-loop")]
     assert len(ol_rows) == 1
     assert ol_rows.iloc[0]["Model"] == "Open-loop (rate=32/s)"
-    assert ol_rows.iloc[0]["Dropped iterations"] == 1
-    assert ol_rows.iloc[0]["N"] == 20
+    assert ol_rows.iloc[0]["Dropped iterations (sum)"] == 1
+    assert ol_rows.iloc[0]["N (all reps)"] == 20
+    # A single-rep file (REP=1, the pre-rep layout) still analyzes, as one rep.
+    assert ol_rows.iloc[0]["Reps"] == 1 and ol_rows.iloc[0]["P95 range across reps (ms)"] == "[10.000, 10.000]"
 
 
 def test_openloop_check_compares_against_the_scan_levels_this_run_actually_used(tmp_path):
@@ -537,7 +554,7 @@ def test_between_run_sd_is_not_estimable_from_one_rep():
     assert np.isnan(out["StdDev Across Reps (ms)"].iloc[0])
 
 
-# --- warm-up convergence (table0) ---
+# warm-up convergence (table 0)
 
 # Both bounds are in the header, so a reader can tell which one admitted a target.
 CONVERGED_COL = "Converged (tail <5% or <0.25ms)"
@@ -586,7 +603,7 @@ def test_warmup_criterion_defaults_match_the_live_shell_gate():
     """A run without recorded parameters is judged at the module's defaults, which
     must be the constants both scripts run the gate at."""
     params = warmup_check.gate_params()
-    for script in ("run-suite.sh", "run-ablation.sh"):
+    for script in ("lib/suite-stack.sh", "run-ablation.sh"):
         assert int(_shell_const(script, "WARMUP_WINDOW")) == params["base_window"] == WINDOW
         assert float(_shell_const(script, "WARMUP_WINDOW_MIN_S")) == params["min_span_s"]
         assert float(_shell_const(script, "WARMUP_TAIL_TOLERANCE_PCT")) == params["tol_pct"] == 5.0
@@ -706,11 +723,11 @@ def test_ablation_table0_reports_the_target_even_when_it_sent_nothing(tmp_path):
     assert table.set_index("Tier").loc["28", "Status"] == "no requests"
 
 
-# --- reservoir sampling in load_results ---
+# reservoir sampling in load_results
 
-# analyze-results.py's own cap. Cells are sized by wall-clock duration, so a zero-work
-# target logs far more points than a model-inference tier; the cap is what keeps peak
-# memory independent of that.
+# analyze-results.py's own cap. Duration-targeted cells scale their point count with
+# throughput, so a zero-work target logs far more points than a model tier; the cap keeps
+# peak memory independent of that.
 MAX_POINTS_PER_FILE = 250_000
 
 # Named here rather than read back from the module, so dropping one from the exemption
@@ -887,7 +904,7 @@ def test_throughput_is_not_deflated_by_cross_metric_reservoir_sharing(tmp_path):
     assert corrected == pytest.approx(true_throughput, rel=1e-6)
 
 
-# --- significance floor at low rep counts ---
+# significance floor at low rep counts
 
 def _rep_means_df(tier, values, phase="baseline"):
     return [{"metric": "http_req_duration", "phase": phase, "tier": tier,
@@ -916,7 +933,7 @@ def test_pairwise_mannwhitney_no_warning_once_alpha_is_reachable(capsys):
     assert "even perfect" not in capsys.readouterr().out
 
 
-# --- table7: a totally overloaded open-loop cell must not vanish ---
+# table 7: a totally overloaded open-loop cell must not vanish
 
 def _overloaded_openloop_rows(source_file, phase, rate, tier, n_failed, n_dropped, rep="1"):
     """Every attempted request timed out (status=0, k6's no-response code) -- the
@@ -948,12 +965,25 @@ def test_openloop_check_reports_a_totally_overloaded_cell_instead_of_dropping_it
     table = pd.read_csv(tmp_path / "tables" / "table7_openloop_validity_check.csv")
     ol_rows = table[table["Model"].str.startswith("Open-loop")]
     assert len(ol_rows) == 1
-    assert ol_rows.iloc[0]["Dropped iterations"] == 200
-    assert pd.isna(ol_rows.iloc[0]["P95 (ms)"])
-    assert ol_rows.iloc[0]["N"] == 0
+    assert ol_rows.iloc[0]["Dropped iterations (sum)"] == 200
+    assert pd.isna(ol_rows.iloc[0]["P95 median of reps (ms)"])
+    assert ol_rows.iloc[0]["N (all reps)"] == 0
+    assert ol_rows.iloc[0]["Reps"] == 1 and ol_rows.iloc[0]["Reps with HTTP 200"] == 0
 
 
-# --- silent success on empty/missing input ---
+def test_openloop_check_fully_failed_multi_rep_cell_keeps_its_row_with_drops_per_rep(tmp_path):
+    rows = (_overloaded_openloop_rows("openloop_28_rate5000_rep1.json", "openloop-check", "5000", "28",
+                                       n_failed=5, n_dropped=30, rep="1")
+            + _overloaded_openloop_rows("openloop_28_rate5000_rep2.json", "openloop-check", "5000", "28",
+                                         n_failed=5, n_dropped=50, rep="2"))
+    results.analyze_openloop_check(pd.DataFrame(rows), str(tmp_path))
+    row = pd.read_csv(tmp_path / "tables" / "table7_openloop_validity_check.csv").iloc[0]
+    assert (row["Reps"], row["Reps with HTTP 200"], row["N (all reps)"]) == (2, 0, 0)
+    assert (row["Dropped iterations (sum)"], row["Dropped iterations (max per rep)"]) == (80, 50)
+    assert row["P99 range across reps (ms)"] == "no HTTP 200"
+
+
+# silent success on empty/missing input
 
 def test_crosscheck_error_counters_warns_when_no_duration_table_to_check_against(capsys):
     """No http_req_duration-derived table (e.g. that phase's load pass was skipped)
@@ -983,7 +1013,7 @@ def test_analyze_gc_logs_warns_when_a_rep_has_no_parsable_records(tmp_path, caps
     assert "<=1% of wall-clock time in all reps" not in out
 
 
-# --- load_results edge cases ---
+# load_results edge cases
 
 def test_load_results_keeps_what_a_truncated_gzip_decompressed(tmp_path, capsys):
     tags = {"tier": "28", "phase": "scan", "rep": "1", "status": "200", "vus": "8"}
@@ -1010,7 +1040,7 @@ def test_true_time_span_orders_go_trimmed_timestamps_numerically(tmp_path):
     assert (t_max - t_min).total_seconds() == pytest.approx(1.25)
 
 
-# --- cpu-pin log re-verification ---
+# cpu-pin log re-verification
 
 def test_cpu_pin_log_treats_an_unreadable_cgroup_as_skipped_not_mismatched(tmp_path, capsys):
     (tmp_path / "cpu_pin_check_log.txt").write_text(
@@ -1032,7 +1062,7 @@ def test_cpu_pin_log_still_flags_a_real_mismatch(tmp_path, capsys):
     assert "2/2 checks mismatched" in capsys.readouterr().out
 
 
-# --- table1e ---
+# table 1e
 
 def test_measurement_floor_covers_model_tiers_and_exempts_mock(tmp_path):
     """mock adds only a random draw to calibration's path, so its fastest requests fall
@@ -1052,11 +1082,11 @@ def test_latex_captions_escape_what_latex_would_misread(tmp_path):
     assert "under 5\\% of therm\\_throt a\\&b \\#1, already 95\\% escaped" in tex
 
 
-# --- thermal telemetry ---
+# thermal telemetry
 
 def _shell_trace(tmp_path):
-    """A trace written by lib/thermal.sh itself against a synthetic sysfs tree, so the
-    parser is held to the format the harness actually emits."""
+    """A trace written by load-testing/lib/thermal.sh itself against a synthetic sysfs
+    tree, so the parser is held to the format the harness actually emits."""
     sysfs = tmp_path / "sys"
     (sysfs / "class/thermal/thermal_zone0").mkdir(parents=True)
     for cpu in range(4):
@@ -1107,7 +1137,7 @@ def test_cell_throttle_is_the_most_throttled_cpu_of_each_service(tmp_path):
 
 
 def _clock_line(cell, python_mhz, java_mhz):
-    """A cell_freq line in the exact format lib/cpufreq_sampler.py prints."""
+    """A cell_freq line in the exact format load-testing/lib/cpufreq_sampler.py prints."""
     sys.path.insert(0, str(LOAD_TESTING_DIR / "lib"))
     spec = importlib.util.spec_from_file_location("cpufreq_sampler", LOAD_TESTING_DIR / "lib" / "cpufreq_sampler.py")
     sampler = importlib.util.module_from_spec(spec)
@@ -1237,7 +1267,7 @@ def test_analyze_thermal_skips_a_trace_without_cell_samples(tmp_path, capsys):
     assert "no per-cell samples" in capsys.readouterr().out
 
 
-# --- the ablation's outcome tally, control and planned comparison ---
+# the ablation's outcome tally, control and planned comparison
 
 def _ablation_cell(path, n_ok, n_failed=0, n_timeout=0, dropped=0, dispatch=5.0, gz=True):
     m = ablation.CELL_FILE_RE.match(path.name)
@@ -1323,3 +1353,159 @@ def test_analyze_ablation_exits_non_zero_on_a_failed_run_or_no_data(tmp_path):
     (tmp_path / "ablation_run_failures_log.txt").write_text("[FATAL] [smt] overlap\n")
     failed = _run_ablation_main(tmp_path, tmp_path / "out")
     assert failed.returncode == 1 and "has entries" in failed.stdout
+
+
+# Table 9: predict_proba composition
+
+def _composition_tier(tier, total, traversal, n=2000, inplace=None):
+    t = {"tier": tier, "n": n,
+         "total_ms": {"median": total, "p25": total * 0.9, "p75": total * 1.1, "n": n},
+         "traversal_ms": {"median": traversal, "p25": traversal * 0.9, "p75": traversal * 1.1, "n": n}}
+    if inplace is not None:
+        t["inplace_ms"] = {"median": inplace, "p25": inplace * 0.9, "p75": inplace * 1.1, "n": n}
+    return t
+
+
+def test_predict_composition_table_recomputes_the_share_from_the_medians(tmp_path):
+    report = {"versions": {"xgboost": "2.1.1", "pandas": "2.2.2"},
+              "tiers": [_composition_tier(28, 4.0, 0.1, inplace=0.4), _composition_tier(5, 2.0, 0.5, n=1500)]}
+    (tmp_path / "predict_composition.json").write_text(json.dumps(report))
+    table = results.analyze_predict_composition(str(tmp_path), tmp_path)
+    assert list(table["Tier"]) == ["5", "28"]
+    first, last = table.iloc[0], table.iloc[1]
+    assert (first["Conversion (ms) median of reps"], first["Conversion share (%) median of reps"],
+            first["N per rep"], first["Reps"]) == (1.5, 75.0, 1500, 1)
+    assert last["Conversion (ms) median of reps"] == pytest.approx(3.9)
+    assert last["Conversion share (%) median of reps"] == pytest.approx(97.5)
+    assert last["Share vs. in-place (%) median of reps"] == pytest.approx(90.0)
+    assert np.isnan(first["Share vs. in-place (%) median of reps"])
+    assert first["Share vs. in-place (%) range"] == "no data"
+    tex = (tmp_path / "tables" / "table9_predict_proba_composition.tex").read_text()
+    assert "pre-built DMatrix" in tex and "xgboost 2.1.1" in tex
+    assert (tmp_path / "tables" / "table9_predict_proba_composition.csv").exists()
+
+
+def test_predict_composition_is_skipped_with_a_notice_when_absent(tmp_path, capsys):
+    assert results.analyze_predict_composition(str(tmp_path), tmp_path) is None
+    assert "[!] No predict_composition.json" in capsys.readouterr().out
+    assert not (tmp_path / "tables").exists()
+
+
+def test_predict_composition_reports_an_unreadable_file_rather_than_failing(tmp_path, capsys):
+    (tmp_path / "predict_composition.json").write_text('{"tiers": [{"tier": 5}]}')
+    assert results.analyze_predict_composition(str(tmp_path), tmp_path) is None
+    assert "is unreadable" in capsys.readouterr().out
+
+
+# Table 9: schema 2, one entry per repetition
+
+def _composition_report(reps):
+    """A schema-2 predict_composition.json: reps is [(rep, [(tier, total, traversal, inplace)])]."""
+    return {"schema": 2, "n_reps": len(reps), "versions": {"xgboost": "2.1.1", "pandas": "2.2.2"},
+            "reps": [{"rep": rep, "tier_order": [t[0] for t in tiers],
+                      "tiers": [_composition_tier(t, total, trav, n=100, inplace=inp)
+                                for t, total, trav, inp in tiers]} for rep, tiers in reps]}
+
+
+def test_predict_composition_table_takes_the_median_across_reps_of_each_reps_shares(tmp_path):
+    report = _composition_report([
+        (1, [(28, 4.0, 0.1, 0.4), (5, 2.0, 0.5, 0.6)]),
+        (2, [(5, 2.0, 1.0, 0.6), (28, 5.0, 0.1, 0.5)]),
+        (3, [(28, 4.4, 0.2, 0.4), (5, 4.0, 1.0, 0.6)]),
+    ])
+    (tmp_path / "predict_composition.json").write_text(json.dumps(report))
+    table = results.analyze_predict_composition(str(tmp_path), tmp_path).set_index("Tier")
+    v5 = table.loc["5"]
+    # Per-rep shares 75, 50, 75: the median of the shares, not the share of the median times.
+    assert v5["Conversion share (%) median of reps"] == 75.0
+    assert v5["Conversion share (%) range"] == "[50.0, 75.0]"
+    assert v5["Total (ms) median of reps"] == 2.0 and v5["Total (ms) range"] == "[2.0000, 4.0000]"
+    assert v5["Conversion (ms) median of reps"] == pytest.approx(1.5)
+    assert (v5["Reps"], v5["N per rep"]) == (3, 100)
+    assert table.loc["28", "Traversal (ms) median of reps"] == pytest.approx(0.1)
+    tex = (tmp_path / "tables" / "table9_predict_proba_composition.tex").read_text()
+    assert "3 here" in tex and "median across reps" in tex
+
+
+def test_predict_composition_schema_1_reads_as_one_rep():
+    report = {"schema": 1, "tiers": [_composition_tier(10, 3.0, 0.3)]}
+    assert results.composition_reps(report) == [(1, report["tiers"])]
+    row = results.predict_composition_table(report).iloc[0]
+    assert (row["Reps"], row["Conversion share (%) median of reps"]) == (1, 90.0)
+
+
+def test_composition_failures_mark_table_9_without_rejecting_the_run(tmp_path, capsys):
+    (tmp_path / "predict_composition.json").write_text(json.dumps(
+        _composition_report([(1, [(5, 2.0, 0.5, 0.6)])])))
+    (tmp_path / "composition_failures_log.txt").write_text("ts rep=2 [FATAL] [thermal] composition rep=2: hot\n")
+    assert results.analyze_predict_composition(str(tmp_path), tmp_path) is not None
+    assert "1 entry in composition_failures_log.txt" in capsys.readouterr().out
+    tex = (tmp_path / "tables" / "table9_predict_proba_composition.tex").read_text()
+    assert "NOTE: composition" in tex and "records 1 abort" in tex
+    assert results.parse_run_failures(str(tmp_path)) == []
+
+
+# Table 7: the repetition as the unit
+
+def _openloop_rep_rows(source_file, rate, rep, values, n_dropped=0, tier="28"):
+    rows = [{"metric": "http_req_duration", "value": v, "status": "200", "phase": "openloop-check",
+             "tier": tier, "rate": rate, "rep": rep, "vus": np.nan, "source_file": source_file,
+             "time": pd.Timestamp("2026-01-01T00:00:00Z")} for v in values]
+    rows += [{"metric": "dropped_iterations", "value": 1.0, "status": np.nan, "phase": np.nan,
+              "tier": np.nan, "rate": np.nan, "rep": np.nan, "vus": np.nan, "source_file": source_file,
+              "time": pd.Timestamp("2026-01-01T00:00:00Z")} for _ in range(n_dropped)]
+    return rows
+
+
+def _scan_rep_rows(vus, rep, values, tier="28"):
+    return [{"metric": "http_req_duration", "value": v, "status": "200", "phase": "scan", "tier": tier,
+             "rate": np.nan, "rep": rep, "vus": float(vus), "source_file": f"scan_{tier}_vus{vus}_rep{rep}.json.gz",
+             "time": pd.Timestamp("2026-01-01T00:00:00Z")} for v in values]
+
+
+def test_table7_summarizes_each_reps_tail_then_takes_the_median_across_reps(tmp_path):
+    rows = (_openloop_rep_rows("openloop_28_rate50_rep1.json.gz", "50", "1", [10.0] * 100, n_dropped=2)
+            + _openloop_rep_rows("openloop_28_rate50_rep2.json.gz", "50", "2", [20.0] * 50, n_dropped=7)
+            + _openloop_rep_rows("openloop_28_rate50_rep3.json.gz", "50", "3", [30.0] * 80)
+            + _openloop_rep_rows("openloop_28_rate40_rep1.json.gz", "40", "1", [5.0] * 10)
+            + _scan_rep_rows(32, "1", [4.0] * 20) + _scan_rep_rows(32, "2", [6.0] * 20)
+            + _scan_rep_rows(64, "1", [8.0] * 20) + _scan_rep_rows(64, "2", [9.0] * 30))
+    results.analyze_openloop_check(pd.DataFrame(rows), str(tmp_path))
+    table = pd.read_csv(tmp_path / "tables" / "table7_openloop_validity_check.csv").set_index("Model")
+    ol = table.loc["Open-loop (rate=50/s)"]
+    assert (ol["Reps"], ol["Reps with HTTP 200"]) == (3, 3)
+    assert ol["P95 median of reps (ms)"] == 20.0 and ol["P95 range across reps (ms)"] == "[10.000, 30.000]"
+    assert ol["P99 median of reps (ms)"] == 20.0
+    assert (ol["N per rep (median)"], ol["N (all reps)"]) == (80, 230)
+    assert (int(ol["Dropped iterations (sum)"]), int(ol["Dropped iterations (max per rep)"])) == (9, 7)
+    assert ol["Pooled P95 95% CI (ms)"].startswith("[")
+    # Rates stay separate.
+    assert table.loc["Open-loop (rate=40/s)", "Reps"] == 1
+    cl = table.loc["Closed-loop VUS=64"]
+    assert (cl["Reps"], cl["P95 median of reps (ms)"], cl["P95 range across reps (ms)"]) == (2, 8.5, "[8.000, 9.000]")
+    assert cl["Dropped iterations (sum)"] == "not applicable"
+    assert table.loc["Closed-loop VUS=32", "N (all reps)"] == 40
+    tex = (tmp_path / "tables" / "table7_openloop_validity_check.tex").read_text()
+    assert "repetition is the" in tex and "summed over all reps" in tex
+    assert (tmp_path / "figures" / "figure7_openloop_validity_check.png").exists()
+
+
+def test_openloop_failures_mark_table_7_without_rejecting_the_suite_run(tmp_path, capsys):
+    run_dir = tmp_path / "suite_host_20260101T000000Z"
+    run_dir.mkdir()
+    (run_dir / "run_metadata.json").write_text(json.dumps({"run_id": run_dir.name}))
+    tags = {"tier": "28", "phase": "openloop-check", "rep": "1", "status": "200", "rate": "50"}
+    (run_dir / "openloop_28_rate50_rep1.json").write_text(
+        "\n".join(_point("http_req_duration", 10.0, tags) for _ in range(20)) + "\n")
+    scan_tags = {"tier": "28", "phase": "scan", "rep": "1", "status": "200", "vus": "64"}
+    (run_dir / "scan_28_vus64_rep1.json").write_text(
+        "\n".join(_point("http_req_duration", 5.0, scan_tags) for _ in range(20)) + "\n")
+    (run_dir / "openloop_failures_log.txt").write_text(
+        "ts target=28 rep=2 [FATAL] [cpu-pin] openloop rep=2: live cpuset differs\n")
+    run = results.run_dirs.Run("suite", str(run_dir))
+    out = tmp_path / "out"
+    assert results.analyze_run(run, str(out)) is True
+    printed = capsys.readouterr().out
+    assert "1 entry in openloop_failures_log.txt" in printed and "Run rejected" not in printed
+    tex = (out / "tables" / "table7_openloop_validity_check.tex").read_text()
+    assert "NOTE: openloop" in tex and "records 1 abort" in tex
