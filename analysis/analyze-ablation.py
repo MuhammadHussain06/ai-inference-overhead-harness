@@ -1,13 +1,13 @@
 """
-Analyzes run-ablation.sh's output: isolates which of three candidate
-mechanisms (AnyIO thread-limiter capacity, physical-core ceiling, GIL
-contention via process count) drives Thread Dispatch time at VUS=64.
+Analyzes run-ablation.sh's output: which of three candidate mechanisms (AnyIO
+thread-limiter capacity, available CPUs, GIL contention via worker-process count)
+drives thread-dispatch time at the ablation's concurrency (64 VUs by default).
 
 Each arm holds the other mechanisms at their control value and sweeps one.
-Rep-level stats use the same cluster-bootstrap and Mann-Whitney approach
-as analyze-results.py, applied to one planned comparison per arm (its
-control value against the sweep value farthest from it) rather than a full
-pairwise grid, since each arm has an a priori ordered sweep.
+Rep-level statistics use the same cluster bootstrap and Mann-Whitney approach as
+analyze-results.py, applied to one planned comparison per arm (its control value
+against the sweep value farthest from it) rather than a full pairwise grid, since
+each arm has an a priori ordered sweep.
 
 Every run-ablation.sh run directory found under --results-dir is analyzed in turn,
 into its own folder under output/tables/ and output/figures/.
@@ -52,14 +52,13 @@ METRICS = {
     "python_total_time_ms": "Total",
 }
 
-# ablation_<arm>_<value>_rep<N>.json[.gz]. The _rep<N> suffix already rejects
-# ablation_run_metadata.json; gating on a known arm additionally rejects
-# ablation_warmup_*, which otherwise parses with arm='warmup_<arm>'.
+# ablation_<arm>_<value>_rep<N>.json[.gz]. The _rep<N> suffix rejects
+# ablation_run_metadata.json and ablation_calib_*; gating on a known arm (_is_cell_file)
+# rejects ablation_warmup_*, which otherwise parses with arm='warmup_<arm>'.
 CELL_FILE_RE = re.compile(r"^ablation_(?P<arm>[a-z_]+)_(?P<value>[^_]+)_rep(?P<rep>\d+)\.json(\.gz)?$")
 
-# ablation_warmup_<arm>_<value>_rep<N>.json[.gz]. The warm-up call itself carries no
-# arm/arm_value tag (only the real cell that follows sets ARM/ARM_VALUE), so which
-# cell a warm-up file belongs to comes from its filename, same as CELL_FILE_RE.
+# ablation_warmup_<arm>_<value>_rep<N>.json[.gz]. Warm-up points carry no arm/arm_value
+# tag (only the measured cell sets ARM/ARM_VALUE), so the cell comes from the filename.
 WARMUP_FILE_RE = re.compile(r"^ablation_warmup_(?P<arm>[a-z_]+)_(?P<value>[^_]+)_rep(?P<rep>\d+)\.json(\.gz)?$")
 
 # The shared control configuration, keyed by the arm_value whose cell realizes it,
@@ -69,10 +68,9 @@ WARMUP_FILE_RE = re.compile(r"^ablation_warmup_(?P<arm>[a-z_]+)_(?P<value>[^_]+)
 # rescales tokens to 13, so it is a different configuration.
 CONTROL_CELL = {"thread_limiter": "40", "cpuset": "0-1,4-5,8-9", "workers": "3"}
 
-# Same per-file cap as analyze-results.py's load_results(), sized identically so
-# both loaders behave alike. Ablation cells sit at one model-inference tier and
-# keep 3 metrics, so the cap is normally slack; it bounds memory if an arm/value
-# combination ever raises throughput enough to reach it.
+# Same per-file reservoir cap as analyze-results.py's load_results(). Ablation cells keep
+# three metrics at one tier, so the cap is normally slack; it bounds memory if an arm
+# value raises throughput enough to reach it.
 MAX_POINTS_PER_FILE = 250_000
 
 
@@ -216,7 +214,8 @@ def load_ablation_cells(results_dir, files=None):
 
 
 def cluster_bootstrap_ci(sub_df, n_boot=2000, ci=0.95, seed=42):
-    """Resamples whole reps with replacement to avoid pseudoreplication; same approach as analyze-results.py."""
+    """Percentile CI (default 95%) of the mean by cluster bootstrap over reps, as in
+    analyze-results.py. (nan, nan) below two reps."""
     reps = sub_df["rep"].unique()
     if len(reps) < 2:
         return (np.nan, np.nan)
@@ -252,7 +251,9 @@ def _effect_magnitude(delta):
 
 
 def build_decomposition_table(df, counts=None):
-    """counts: load_ablation_cells()'s outcome tally, for an N that sampling did not reduce."""
+    """Per arm and value: reps, HTTP 200 count, mean and cluster-bootstrap CI of each
+    METRICS stage, and dispatch as % of total. counts: load_ablation_cells()'s outcome
+    tally, for an N that sampling did not reduce."""
     rows = []
     for arm in sorted(df["arm"].unique()):
         arm_df = df[df["arm"] == arm]
@@ -395,6 +396,7 @@ def build_error_table(counts):
 
 
 def plot_ablation(df, output_dir, vus=None):
+    """One panel per arm: thread dispatch stacked on the rest of the Python total, per value."""
     arms = sorted(df["arm"].unique())
     fig, axes = plt.subplots(1, len(arms), figsize=(5 * len(arms), 4), sharey=True)
     if len(arms) == 1:
@@ -436,9 +438,10 @@ def plot_ablation(df, output_dir, vus=None):
 
 
 def build_ablation_warmup_table(results_dir, metadata=None):
-    """Per-cell warm-up convergence, judged by the live gate (lib/warmup_gate.py) at
-    the parameters run-ablation.sh recorded. Reads ablation_warmup_* files, which
-    load_ablation_cells() never touches. Returns (table, gate parameters)."""
+    """Per-cell warm-up convergence, judged by the live gate
+    (load-testing/lib/warmup_gate.py) at the parameters run-ablation.sh recorded. Reads
+    ablation_warmup_* files, which load_ablation_cells() never touches. Returns (table,
+    gate parameters)."""
     config = (metadata or {}).get("ablation_config", {})
     params = warmup_check.gate_params(config.get("warmup_gate"))
     expect = [str(config["target"])] if config.get("target") else []
@@ -460,7 +463,7 @@ def build_ablation_warmup_table(results_dir, metadata=None):
     return pd.DataFrame(rows), params
 
 
-# thermal state per cell
+# Thermal state per cell
 
 def _ablation_phase(name):
     """Run phase of a trace line's name: an env-sample label, a cell or a thermal-check label."""
