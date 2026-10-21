@@ -3,22 +3,29 @@ package com.audit.transaction_service.service;
 import com.audit.transaction_service.dto.RequestDto;
 import com.audit.transaction_service.dto.ResponseDto;
 import com.audit.transaction_service.exception.UpstreamInferenceException;
+import io.netty.channel.ConnectTimeoutException;
+import io.netty.handler.timeout.ReadTimeoutException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.web.reactive.function.client.ClientResponse;
 import org.springframework.web.reactive.function.client.ExchangeFunction;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
 import java.math.BigDecimal;
+import java.net.ConnectException;
+import java.net.URI;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -78,6 +85,25 @@ class TransactionServiceTest {
                 .exchangeFunction(stub)
                 .build();
         return new TransactionService(null, client, registryOf(VALID_TIERS));
+    }
+
+    /** Fails the exchange the way the Reactor Netty connector does: transport errors arrive as the cause. */
+    private static TransactionService serviceErroringWith(Throwable transportError) {
+        ExchangeFunction stub = request -> Mono.error(new WebClientRequestException(
+                transportError, HttpMethod.POST, URI.create("http://python:8000/predict/v5"), new HttpHeaders()));
+        WebClient client = WebClient.builder()
+                .baseUrl("http://python:8000")
+                .exchangeFunction(stub)
+                .build();
+        return new TransactionService(null, client, registryOf(VALID_TIERS));
+    }
+
+    private static HttpStatus upstreamStatusFor(TransactionService service) {
+        AtomicReference<HttpStatus> status = new AtomicReference<>();
+        StepVerifier.create(service.processTransaction(request("DISTRIBUTED_AI_SYNCHRONOUS", 5), System.nanoTime()))
+                .expectErrorSatisfies(error -> status.set(((UpstreamInferenceException) error).getUpstreamStatus()))
+                .verify();
+        return status.get();
     }
 
     private static RequestDto request(String strategy, Integer featureTier) {
@@ -313,5 +339,28 @@ class TransactionServiceTest {
                 .expectErrorSatisfies(error -> assertThat(((UpstreamInferenceException) error).getUpstreamStatus())
                         .isEqualTo(HttpStatus.BAD_REQUEST))
                 .verify();
+    }
+
+    // transport failure mapping (library exception types)
+
+    @Test
+    void timeoutAsTheTransportCauseBecomesGatewayTimeout() {
+        assertThat(upstreamStatusFor(serviceErroringWith(new TimeoutException("pending acquire timed out"))))
+                .isEqualTo(HttpStatus.GATEWAY_TIMEOUT);
+    }
+
+    @Test
+    void readTimeoutAsTheTransportCauseBecomesGatewayTimeout() {
+        assertThat(upstreamStatusFor(serviceErroringWith(ReadTimeoutException.INSTANCE)))
+                .isEqualTo(HttpStatus.GATEWAY_TIMEOUT);
+    }
+
+    @Test
+    void connectTimeoutIsAConnectFailureAndBecomesBadGateway() {
+        ConnectTimeoutException connectTimeout = new ConnectTimeoutException("connection timed out");
+
+        // Netty reports a connect timeout as a ConnectException, not a TimeoutException.
+        assertThat(connectTimeout).isInstanceOf(ConnectException.class).isNotInstanceOf(TimeoutException.class);
+        assertThat(upstreamStatusFor(serviceErroringWith(connectTimeout))).isEqualTo(HttpStatus.BAD_GATEWAY);
     }
 }
