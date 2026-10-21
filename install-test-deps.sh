@@ -1,19 +1,11 @@
 #!/usr/bin/env bash
-# One-shot setup for every *test* dependency across the repo -- as opposed to
-# setup.sh, which only sets up what's needed to actually run the measurement
-# stack for real numbers (.env, results/gc-logs, analysis/venv). Safe to re-run.
-#
-# Covers, in order:
-#   - Java:          transaction-service's JDK (Maven itself and its test deps
-#                    -- JUnit, spring-boot-starter-test, reactor-test -- are
-#                    fetched automatically by ./mvnw on first `./mvnw test`,
-#                    so there's nothing else to pre-install there).
-#   - Python/analysis:      analysis/venv, from analysis/requirements.txt +
-#                    analysis/requirements-dev.txt (pytest, for analysis/tests/).
-#   - Python/fraud-ml:      services/fraud-ml-service/.venv, from its own
-#                    requirements-dev.txt (pytest + httpx, on top of the
-#                    service's real requirements.txt).
-#   - Bash/load-testing:    bats-core, for load-testing/tests/*.bats.
+# Installs every test dependency in the repo; setup.sh covers only what a measurement
+# run needs (.env, results/gc-logs, analysis/venv). Safe to re-run. Covers, in order:
+#   - Java:             a JDK for transaction-service (./mvnw fetches Maven and the test deps).
+#   - Python/analysis:  analysis/venv from requirements.txt + requirements-dev.txt (pytest).
+#   - Python/fraud-ml:  services/fraud-ml-service/.venv from requirements-dev.txt
+#                       (pytest + httpx on top of the service's requirements.txt).
+#   - Bash/load-testing: bats-core for load-testing/tests/*.bats.
 #
 # Usage: ./install-test-deps.sh   (run from the repo root)
 
@@ -30,9 +22,8 @@ MIN_JAVA_MAJOR=21
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# Runs an apt-get install non-interactively as root if we already are root,
-# via sudo if that's available, or not at all -- printing why -- otherwise.
-# Returns 1 without attempting anything if neither path is available.
+# apt-get install as root, or via sudo; returns 1 (with a message when apt-get exists)
+# if neither is available.
 apt_install() {
   if ! have apt-get; then
     return 1
@@ -49,12 +40,9 @@ apt_install() {
   fi
 }
 
-# Picks python3.11 when it's available (the version this repo's pandas/xgboost
-# pins are known to build cleanly against) over a bare `python3`, which on a
-# fresh Ubuntu 24.04+ box can resolve to something too new to have prebuilt
-# wheels for pandas==2.2.2 -- forcing a source build that fails outright under
-# newer GCC. Falls back to installing python3.11 via apt, then to plain
-# python3 with a warning, rather than failing outright.
+# Prefers python3.11, which the pinned pandas/xgboost have prebuilt wheels for; a newer
+# default python3 (e.g. Ubuntu 24.04+) can force a pandas source build that fails under
+# newer GCC. Tries to apt-install python3.11, else falls back to python3 with a warning.
 pick_python() {
   if have python3.11; then
     echo "python3.11"
@@ -72,15 +60,18 @@ pick_python() {
   echo "python3"
 }
 
-# Builds (or reuses) a venv at $1 with the given python, then pip-installs
-# every requirements file passed after it. Always re-runs pip install even if
-# the venv already existed, so a changed requirements file is picked up.
+# build_venv DIR PYTHON REQ...: creates or reuses the venv, then always re-runs pip install
+# so a changed requirements file is picked up. A directory without an executable bin/python
+# and bin/pip (a Windows venv's Scripts/ layout, or a half-created one) is rebuilt in place.
 build_venv() {
   local venv_dir="$1" python_bin="$2"
   shift 2
   if [ ! -d "$venv_dir" ]; then
     "$python_bin" -m venv "$venv_dir"
     echo "  created $venv_dir ($("$python_bin" --version))"
+  elif [ ! -x "$venv_dir/bin/python" ] || [ ! -x "$venv_dir/bin/pip" ]; then
+    "$python_bin" -m venv --clear "$venv_dir"
+    echo "  recreated $venv_dir: it had no usable bin/python or bin/pip ($("$python_bin" --version))"
   else
     echo "  reusing $venv_dir"
   fi
