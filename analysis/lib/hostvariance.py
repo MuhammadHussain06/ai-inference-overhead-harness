@@ -180,8 +180,9 @@ def _digest(value):
 
 
 def _display(value):
-    """A SHA-256 value (fingerprint, image digest) as its first 12 hex digits; any other
-    long value as "hash:" and the first 12 hex digits of its own SHA-256."""
+    """Values up to MAX_DISPLAY_CHARS unchanged; a longer SHA-256 value (fingerprint, image
+    digest) as its first 12 hex digits; any other long value as "hash:" and the first 12
+    hex digits of its own SHA-256."""
     if value is None:
         return "unrecorded"
     text = str(value)
@@ -205,9 +206,9 @@ def environment_table(runs, labels, config_of):
     """Every gated and reported environment field per run. Gated fields must agree:
     "MISMATCH" where two runs recorded different values, "unverified" or "unrecorded"
     where some or all runs recorded none. Per-machine fields must agree only between runs
-    of one machine. Reported fields describe the hardware and toolchain, which may differ. config_of(run) returns the run's design configuration
-    with host-specific CPU numbers normalized away. Returns (table, mismatched fields,
-    unverified fields)."""
+    of one machine. Reported fields describe the hardware and toolchain, which may differ.
+    config_of(run) returns the run's design configuration with host-specific CPU numbers
+    normalized away. Returns (table, mismatched fields, unverified fields)."""
     fingerprints = [_known(r.metadata.get("measurement_fingerprint")) for r in runs]
     if all(fingerprints):
         code = ("Measured code (fingerprint)", lambda r: _known(r.metadata.get("measurement_fingerprint")))
