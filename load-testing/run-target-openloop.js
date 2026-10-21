@@ -1,9 +1,9 @@
 import { sendTransaction, TARGETS } from './lib/common.js';
 
-// Open-loop check on the closed-loop scan's coordinated omission, run by
-// run-openloop.sh. constant-arrival-rate fires on a fixed schedule
-// regardless of response time; k6's own dropped_iterations rises once maxVUs can no
-// longer sustain RATE, marking the point where the arrival rate exceeded capacity.
+// One open-loop cell, run by run-openloop.sh to check the closed-loop scan's tail for
+// coordinated omission. constant-arrival-rate starts requests on a fixed schedule whatever
+// the response time; dropped_iterations rises once MAX_VUS cannot sustain RATE, i.e. the
+// arrival rate exceeded capacity.
 
 const targetKey = __ENV.TARGET;
 if (!targetKey || !(targetKey in TARGETS)) {
