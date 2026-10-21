@@ -53,7 +53,7 @@ power_source_state() {
 }
 
 # Reports whether interrupts are being migrated across cores during the run. An
-# active balancer can move NIC interrupt handling onto a pinned core mid-suite.
+# active balancer can move NIC interrupt handling onto a pinned core mid-run.
 irqbalance_state() {
   if command -v systemctl >/dev/null 2>&1; then
     local state
