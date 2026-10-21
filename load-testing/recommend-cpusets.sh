@@ -84,8 +84,9 @@ echo "export K6_CPUS=\"$(topo_count_cpus "$K6").0\""
 echo "export ABLATION_CPUSET_NARROW=\"${PY_NARROW}\""
 echo "export ABLATION_CPUSET_WIDE=\"${PY_WIDE}\""
 
-# Confirms the recommendation passes the guard that will gate the run, so a value this
-# script prints can never be one the suite then refuses.
+# Runs the guard that gates the run on the widest Python cpuset, Java and k6 (the control
+# and narrow sets are subsets of the wide one), so a printed value is never one the
+# harness then refuses.
 for svc in "python-service:${PY_WIDE}" "transaction-service:${JAVA}" "k6:${K6}"; do
   verify_service_cpuset "self-check" "${svc%%:*}" "${svc#*:}" "$(topo_count_cpus "${svc#*:}")" > /dev/null
 done
