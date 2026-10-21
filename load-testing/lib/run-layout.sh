@@ -70,7 +70,7 @@ archive_superseded_runs() {
   done
 }
 
-# Moves the files a pre-v1.2 <kind> run left directly in results_root into
+# Moves the files a flat-layout <kind> run left directly in results_root into
 # results_root/archive/<timestamp>/ (suite) or <timestamp>_ablation/ (ablation). ablation_*
 # files are the ablation's; every other top-level result file is the suite's, except the
 # probes' output: probe_* and calib_*.json (the suite's own calib_* files are gzipped).
