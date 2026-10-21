@@ -1,4 +1,4 @@
-"""Guards the Python-side timing instruments the paper reports on."""
+"""Tests for the tier predict path and its timing fields, and for n_jobs pinning."""
 
 import math
 
@@ -57,8 +57,8 @@ def test_rejects_payload_with_too_few_features(tier):
 
 
 def test_predict_proba_value_error_is_a_server_fault_not_400(tier, payload):
-    """A ValueError from inside predict_proba itself is a computation fault, not the
-    same client input problem the too-few-features check above reports as 400."""
+    """A ValueError from predict_proba is a server fault (500), kept apart from the
+    too-few-features client error (400)."""
     tier.model = FailingModel()
     with pytest.raises(HTTPException) as exc:
         tier.predict(payload)
@@ -87,8 +87,7 @@ def test_unloaded_tier_raises_500(payload):
     with pytest.raises(HTTPException) as exc:
         FraudMLTier(5).predict(payload)
     assert exc.value.status_code == 500
-    # Detail intact, so the `except HTTPException: raise` clause has not been
-    # replaced by the generic handler below it.
+    # The guard's own detail, not the generic "Inference failed" wrapper.
     assert "Model not initialized" in exc.value.detail
 
 
