@@ -19,8 +19,7 @@ RESULT_FILE_RE = {
     "suite": re.compile(r"^(?:baseline|scan|openloop|warmup)_.+\.json(?:\.gz)?$"),
     "ablation": re.compile(r"^ablation_.+_rep\d+\.json(?:\.gz)?$"),
 }
-# Subdirectories that hold a run's scratch or logs, run-all.sh's logs, or superseded runs,
-# never a run of their own.
+# Subdirectories holding a run's scratch files, logs or superseded runs; never a run themselves.
 NON_RUN_SUBDIRS = {"archive", "raw", "gc-logs", "probes", "logs"}
 RUN_DIR_RE = re.compile(r"^(?P<kind>suite|ablation)_(?P<host>[a-z0-9.-]+)_(?P<ts>\d{8}T\d{6}Z)$")
 # Keeps a joined run-label list inside common file-name limits.
@@ -28,7 +27,8 @@ MAX_SUFFIX_LABEL_CHARS = 150
 
 
 def host_label(name):
-    """Lowercased and reduced to [a-z0-9.-], matching lib/run-layout.sh's run_host_label."""
+    """Lowercased and reduced to [a-z0-9.-], matching run_host_label in
+    load-testing/lib/run-layout.sh."""
     label = re.sub(r"[^a-z0-9.-]", "-", str(name or "").lower()).strip("-")
     return label or "unknown-host"
 
