@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Runs the whole design unattended: run-suite.sh, run-openloop.sh against that suite
-# run, run-ablation.sh, then analyze-results.py and analyze-ablation.py on the two runs
-# this invocation produced. START_AT=openloop|ablation|analysis resumes at that step
-# against this host's latest runs.
+# Runs the whole design unattended: run-suite.sh, run-openloop.sh and
+# run-predict-composition.sh against that suite run, run-ablation.sh, then
+# analyze-results.py and analyze-ablation.py on the two runs this invocation produced.
+# START_AT=openloop|composition|ablation|analysis resumes at that step against this
+# host's latest runs.
 #
-# A suite failure stops the chain. A failed open-loop step is reported and the ablation
-# still runs; a failed ablation skips its analysis. The exit status is non-zero if any
-# step failed. Each step's output goes to results/logs/run-all_<UTC timestamp>/. An
-# unprepared host (see prepare-host.sh) is refused before any step starts.
+# A suite failure stops the chain. A failed open-loop or composition step is reported and
+# the chain continues; a failed ablation skips its analysis. Both checks run at the suite's
+# controls with 7 reps each (about 50 and 5 minutes at their defaults). The exit status is non-zero
+# if any step failed. Each step's output goes to results/logs/run-all_<UTC timestamp>/.
+# An unprepared host (see prepare-host.sh) is refused before any step starts.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
@@ -15,7 +17,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 . lib/host-provenance.sh
 . lib/power-state.sh
 
-STEPS=(suite openloop ablation analysis)
+STEPS=(suite openloop composition ablation analysis)
 START_AT="${START_AT:-suite}"
 START_INDEX=-1
 for i in "${!STEPS[@]}"; do
@@ -75,6 +77,18 @@ if runs openloop; then
     step "openloop: done"
   else
     step "openloop: FAILED (see openloop.log); continuing"
+    failed=1
+  fi
+fi
+
+if runs composition; then
+  step "composition: start"
+  # The check refuses to share the host with the measured stack, which the suite leaves up.
+  docker compose -f ../docker-compose.yml down > /dev/null 2>&1 < /dev/null || true
+  if ./run-predict-composition.sh "$(latest_run suite)" > "${LOG_DIR}/composition.log" 2>&1 < /dev/null; then
+    step "composition: done"
+  else
+    step "composition: FAILED (see composition.log); continuing"
     failed=1
   fi
 fi
