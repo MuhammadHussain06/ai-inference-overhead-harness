@@ -1,19 +1,13 @@
 #!/usr/bin/env bash
-# Standalone probe -- NOT wired into run-suite.sh. Run by hand, stack already up.
-#
-# calibrate_target() in run-suite.sh remeasures a target's throughput once per
-# rep (REPS_SCAN times), even though the quantity it measures -- a target's
-# throughput at a reference VUS -- is assumed constant across reps. If that
-# holds, most of those remeasurements are redundant wall-clock cost that could
-# be cut by calibrating once per target instead of once per (target, rep),
-# without touching REPS_SCAN itself. This probe checks whether it holds on
-# this host: it repeats calibrate_target's own measurement back-to-back and
-# reports how much the result actually moves.
+# Standalone probe, not called by run-suite.sh; run by hand with the stack up.
+# run-suite.sh measures each target's throughput once (calibrate_scan_targets()) and every
+# scan rep reuses the derived counts, which assumes throughput at a reference VUS is stable
+# across reps. This repeats calibrate_target()'s measurement back to back and reports the
+# spread, which bounds how far a rep's cell can stray from the target duration.
 #
 # Usage: ./probe_calibration_drift.sh TIER [N_MEASUREMENTS] [REFERENCE_VUS] [ITER_PER_VU] [COOLDOWN_S]
-# Defaults mirror run-suite.sh's own calibration: REFERENCE_VUS=16 (CALIB_VUS),
-# ITER_PER_VU=2000 (CALIB_ITER_PER_VU), COOLDOWN_S=10 (COOLDOWN_S),
-# N_MEASUREMENTS=7 (REPS_SCAN) so the spread reflects what a real run would see.
+# Defaults mirror run-suite.sh: REFERENCE_VUS=16 (CALIB_VUS), ITER_PER_VU=2000
+# (CALIB_ITER_PER_VU), COOLDOWN_S=10 (COOLDOWN_S), N_MEASUREMENTS=7 (REPS_SCAN).
 set -euo pipefail
 
 for _req_cmd in docker curl python3; do
@@ -35,12 +29,9 @@ COMPOSE_FILE="../../docker-compose.yml"
 RESULTS_DIR="../../results"
 CONTAINER_OUT_DIR="/results"
 
-# "run --rm" starts only the k6 one-off container -- k6 has no depends_on, so
-# compose will not bring python-service/transaction-service up for it. If
-# they're not already running (or transaction-service hasn't been created yet
-# because it's still waiting on python-service's healthcheck), every request
-# fails DNS resolution for "java" instantly, and that looks nothing like a
-# real network problem: check for it up front instead of burning a measurement.
+# "run --rm" starts only the k6 container (k6 has no depends_on), so without a running,
+# healthy stack every request fails DNS resolution instantly. Check up front rather than
+# spend a measurement on it.
 for svc in python-service transaction-service; do
   cid=$(docker compose -f "$COMPOSE_FILE" ps -q "$svc" 2>/dev/null || true)
   if [ -z "$cid" ]; then
@@ -101,10 +92,9 @@ with open(sys.argv[1]) as f:
         if tags.get("phase") != "scan":
             continue
         total += 1
-        # Same filter analyze-results.py applies before any throughput calc: an
-        # all-failed cell (e.g. DNS/connection errors) still emits points, and
-        # counting those in would report a "throughput" for traffic that never
-        # reached the service.
+        # Only HTTP 200, as in calibrate_target() and analyze-results.py: failed requests
+        # still emit points, and counting them would measure traffic that never reached
+        # the service.
         if tags.get("status") == "200":
             times.append(parse_iso(obj["data"]["time"]))
 
@@ -121,8 +111,8 @@ if n < 2:
 duration = (max(times) - min(times)).total_seconds()
 if duration <= 0:
     sys.exit("points share one timestamp -- cannot compute throughput")
-# N completion timestamps bound N-1 inter-completion intervals, so the rate over that
-# span is (N-1)/span -- same convention as analyze-results.py's _throughput_reqs_per_s.
+# N completion timestamps bound N-1 intervals: rate = (N-1)/span, the convention of
+# analyze-results.py's _throughput_reqs_per_s.
 print((n - 1) / duration)
 PYEOF
   )
