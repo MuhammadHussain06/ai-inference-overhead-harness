@@ -1,26 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Standalone diagnostic -- not wired into run-suite.sh or run-ablation.sh.
-# run-suite.sh's converge_warmup() gates the baseline and scan warm-up passes
-# on ALL SIX targets (WARMUP_TARGETS="mock calibration 5 10 20 28") converging
-# in the SAME chunk, not on any one target in isolation. probe_warmup_settle.sh
-# only probes one target at a time, so it can't show whether that harder,
-# joint AND condition is actually reachable, or which target is the laggard
-# when it isn't. This warms all six targets per chunk as converge_warmup()
-# does (though as six separate warm-up.js calls -- see below), past its
-# MAX_WARMUP_CHUNKS cap, printing every target's tail drift and the joint
-# pass/fail at each checkpoint.
+# Standalone diagnostic, not called by run-suite.sh or run-ablation.sh.
+# converge_warmup() passes only when every expected target (all six by default) converges
+# in the same chunk. This warms all six targets per chunk, past the MAX_WARMUP_CHUNKS cap,
+# and prints each target's verdict and the joint result at every checkpoint, to show
+# whether the joint condition is reachable and which target lags.
+# probe_warmup_settle.sh covers a single target.
 #
 # Usage:
 #   ./probe_warmup_joint.sh LABEL VUS [CPUSET CPUS WORKERS TOKENS] [MAX_CHUNKS] [CHUNK_DURATION_S] [WINDOW] [TOL] [ABS_FLOOR_MS] [MIN_SPAN_S]
 #
-# VUS=5 reproduces the baseline/default-VUS-scan warm-up call; VUS=64 (this
-# suite's MAX_VUS) reproduces the scan_maxvus call. CPUSET/CPUS/WORKERS/TOKENS
-# default to docker-compose.yml's own defaults, matching both real call sites.
-# WINDOW/TOL/ABS_FLOOR_MS/MIN_SPAN_S default to converge_warmup()'s own
-# production values, and every checkpoint runs the gate itself
-# (lib/warmup_gate.py), so this reproduces the real gate unless overridden.
+# VUS=5 reproduces the baseline and default-VUS scan warm-up; VUS=64 (MAX_VUS) the
+# max-VUS pass. CPUSET/CPUS/WORKERS/TOKENS default to docker-compose.yml's defaults.
+# WINDOW/TOL/ABS_FLOOR_MS/MIN_SPAN_S default to converge_warmup()'s values, and every
+# checkpoint runs lib/warmup_gate.py itself, so the verdicts are the real gate's.
 #
 # Examples:
 #   ./probe_warmup_joint.sh joint_baseline 5
@@ -107,8 +101,7 @@ k6_run() {
     "${env_flags[@]}" k6 run "/scripts/${script}" "$@"
 }
 
-# Every target's gate verdict and whether ALL of them converged in this SAME chunk
-# -- the gate itself, run the way converge_warmup() runs it, plus the joint result
+# Runs the gate as converge_warmup() does: per-target verdicts, plus the joint result
 # converge_warmup() acts on but does not print.
 report_checkpoint() {
   local combined="$1" chunk="$2" joint
@@ -131,10 +124,8 @@ echo "[*] ${LABEL}: targets=(${TARGETS}) vus=${VUS} cpuset=${CPUSET} cpus=${CPUS
 echo "[*] running up to ${MAX_CHUNKS} chunks of ${CHUNK_DURATION_S}s/target, 6 targets/chunk as 6 separate calls" \
      "(~$((MAX_CHUNKS * CHUNK_DURATION_S * 6))s of load plus per-call container overhead) -- not stopping early, we want the full curve"
 
-# Each target in a chunk runs as its own warm-up.js call rather than one call
-# covering all six: a single six-target call holds the pinned cores under
-# continuous load for the whole chunk before check_thermal_safety gets to look,
-# so splitting it catches a hot system between targets, not only between chunks.
+# One warm-up.js call per target rather than one six-target call (as converge_warmup()
+# does), so check_thermal_safety runs between targets, not only between chunks.
 for chunk in $(seq 1 "$MAX_CHUNKS"); do
   for tier in $TARGETS; do
     target_name="${LABEL}_chunk${chunk}_${tier}.json"
