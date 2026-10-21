@@ -266,12 +266,12 @@ stub_id() { printf '#!/bin/sh\necho %s\n' "$1" > "${STUB}/id"; chmod +x "${STUB}
 
 # --- the harness scripts read only the live host ---
 
-@test "run-suite.sh, run-ablation.sh and run-openloop.sh refuse a synthetic power tree" {
+@test "run-suite.sh, run-ablation.sh, run-openloop.sh and run-predict-composition.sh refuse a synthetic power tree" {
   for cmd in docker curl shuf; do
     printf '#!/bin/sh\nexit 0\n' > "${STUB}/${cmd}"
     chmod +x "${STUB}/${cmd}"
   done
-  for script in run-suite.sh run-ablation.sh run-openloop.sh; do
+  for script in run-suite.sh run-ablation.sh run-openloop.sh run-predict-composition.sh; do
     run "${LT_DIR}/${script}"
     [ "$status" -eq 1 ]
     [[ "$output" == *"POWER_SYSFS_ROOT is set to"* ]]
