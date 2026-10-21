@@ -24,8 +24,8 @@ public class ResponseDto {
 
     private String strategy;
 
-    // Number of features (V1..Vn) the scoring model actually used. Null for the
-    // mock-gateway and calibration-only strategies, which score nothing.
+    // Tier: the model scored V1..Vn (plus the log amount). Null for the calibration
+    // and mock arms, which run no model.
     private Integer featureTier;
 
     public ResponseDto() {}
@@ -92,8 +92,8 @@ public class ResponseDto {
         private double computationTimeMs = 0.0;
         private double dataframeConstructionTimeMs = 0.0;
         private double modelInferenceTimeMs = 0.0;
-        // Time the worker thread spends off-CPU during computation (GIL
-        // contention or OS scheduling). 0.0 for mock/calibration strategies.
+        // Computation minus thread CPU time (GIL waits, OS preemption), floored at 0;
+        // a subset of computationTimeMs, not additive. 0.0 for calibration and mock.
         private double computeStallMs = 0.0;
         private double serializationResponseTimeMs = 0.0;
         private double totalPythonExecutionTimeMs = 0.0;
