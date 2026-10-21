@@ -1,3 +1,4 @@
+# One loaded XGBoost model per tier, its timed predict path, and the tier registry.
 import time
 
 import joblib
@@ -57,10 +58,9 @@ class FraudMLTier:
         cpu_start = time.thread_time()
         try:
             if len(payload.features) < self.n_features:
-                # Raised as HTTPException directly, not ValueError: a bare ValueError
-                # here would be indistinguishable from one predict_proba raises for a
-                # server-side computation fault, and the except clause below would
-                # report both as this client error.
+                # Client error: raised as HTTPException so it passes through as 400,
+                # while the generic handler below reports every other failure
+                # (including a ValueError from predict_proba) as 500.
                 raise HTTPException(
                     status_code=400,
                     detail=f"Expected at least {self.n_features} feature values, got {len(payload.features)}"
@@ -74,8 +74,9 @@ class FraudMLTier:
             df_input = pd.DataFrame([row], columns=self.column_names)
             dataframe_construction_time_ms = (time.perf_counter() - start_df) * 1000
 
-            # Covers the whole predict_proba call: feature validation, the pandas to
-            # DMatrix conversion, and tree traversal.
+            # Model inference: the whole predict_proba call, i.e. XGBoost's per-call conversion
+            # of the DataFrame (in-place prediction path, no DMatrix), feature-name validation
+            # and tree traversal. Conversion dominates (table 9, run-predict-composition.sh).
             start_infer = time.perf_counter()
             risk_score = float(self.model.predict_proba(df_input)[0][1])
             model_inference_time_ms = (time.perf_counter() - start_infer) * 1000
@@ -84,20 +85,18 @@ class FraudMLTier:
         except HTTPException:
             raise
         except Exception as e:
-            # Includes ValueError raised inside predict_proba itself (e.g. a shape or
-            # NaN fault) -- those are server-side computation faults, not the client
-            # input problem the explicit HTTPException above already carves out.
-            raise HTTPException(status_code=500, detail=f"Inference failed: {e}")  # server fault, not client error
+            # Server-side computation fault, including a ValueError from predict_proba.
+            raise HTTPException(status_code=500, detail=f"Inference failed: {e}")
 
         computation_time_ms = (time.perf_counter() - start_comp) * 1000
         cpu_time_ms = (time.thread_time() - cpu_start) * 1000
-        # Off-CPU time within the computation window (GIL contention, scheduling).
-        # Floored at 0 because the two clocks are read a line apart and can skew.
-        # This decomposes computation_time_ms rather than adding to it.
+        # Compute stall: off-CPU time within the computation window (GIL wait, OS
+        # preemption), a subset of computation_time_ms. Floored at 0 because the two
+        # clocks are read a line apart and can disagree by a rounding step.
         compute_stall_time_ms = max(0.0, computation_time_ms - cpu_time_ms)
 
-        # Runs after every timing window, once per tier per process, to catch a
-        # library that resets n_jobs when the booster is first exercised.
+        # Runs after every timing window has closed, once per tier per process, to catch
+        # a library that resets n_jobs when the booster is first exercised.
         if self.n_jobs_runtime_verified is None:
             self.n_jobs_runtime_verified = (getattr(self.model, "n_jobs", None) == 1)
             if not self.n_jobs_runtime_verified:
@@ -116,7 +115,7 @@ class FraudModelRegistry:
     def load_all(self):
         for n in settings.FEATURE_TIERS:
             tier = FraudMLTier(n)
-            # Assigns only after load() returns, so a partially loaded registry cannot exist.
+            # Assigned only after load() returns, so a partially loaded tier is never registered.
             tier.load()
             self.tiers[n] = tier
 
