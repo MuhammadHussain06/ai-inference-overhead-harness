@@ -45,8 +45,9 @@ public class TransactionService {
     public Mono<ResponseDto> processTransaction(RequestDto request, long requestStartNanos) {
         long overallStartTime = requestStartNanos;
 
-        // Field-level presence and format are already enforced by @Valid before
-        // dispatch; only the cross-field strategy/tier rules are checked here.
+        // Field-level rules are enforced by @Valid before this method runs; only the
+        // cross-field arm (strategy) and tier rules are checked here. Locale.ROOT keeps
+        // the uppercasing independent of the JVM default locale.
         String strategy = request.getStrategy().toUpperCase(Locale.ROOT);
         String endpoint;
         Integer featureTier = null;
@@ -71,7 +72,8 @@ public class TransactionService {
                 endpoint = "/predict/mock";
                 break;
             case "DISTRIBUTED_CALIBRATION_ONLY":
-                // Zero business logic on the Python side; isolates instrumentation overhead.
+                // Calibration arm: same Python path, thread hand-off included, but no model
+                // work; the floor that bounds instrumentation cost.
                 endpoint = "/predict/calibrate";
                 break;
             default:
@@ -81,23 +83,21 @@ public class TransactionService {
 
         final Integer resolvedFeatureTier = featureTier;
 
-        // Covers WebFlux dispatch, body decode and bean validation (timed from the
-        // filter's stamp) plus the cross-field switch above; despite the name, none of
-        // that is pure deserialization.
+        // T0 to the end of the arm/tier checks: WebFlux dispatch, body decode, bean
+        // validation and the switch above. Broader than deserialization, hence the name.
         double requestPreprocessingTimeMs = (System.nanoTime() - requestStartNanos) / 1_000_000.0;
 
-        // Forwards the full feature list unsliced, so the request body is the same size
-        // for every tier and payload size cannot explain a tier difference.
+        // Forwards the full feature list unsliced, so the body size does not vary with
+        // tier; fraud-ml-service takes only the features each tier needs.
         AiRequestDto aiPayload = new AiRequestDto(
                 request.getTransactionId(),
                 request.getAmount().doubleValue(),
                 request.getFeatures()
         );
 
-        // Deferred so netStart is read at subscription, not here at assembly time.
-        // Without this, the gap between assembly and Spring actually subscribing
-        // (handler return, downstream .map, WebFlux's result-handler dispatch) is
-        // charged to aiCallRoundTripTimeMs instead of framework overhead.
+        // Deferred so netStart is read at subscription, not at assembly. Otherwise the
+        // gap until WebFlux subscribes (handler return, the controller's .map, result
+        // handling) would be charged to aiCallRoundTripTimeMs and hence to the bridge.
         return Mono.defer(() -> {
                     long netStart = System.nanoTime();
                     return webClient.post()
@@ -121,7 +121,8 @@ public class TransactionService {
                     log.error("[Transaction ID: {}] Failed to communicate with Python endpoint {}: {}",
                             request.getTransactionId(), endpoint, e.getMessage());
 
-                    // timeout -> 504, distinct from generic unreachable -> 502
+                    // Timeout (direct or as the immediate cause) -> 504; upstream 4xx -> 400;
+                    // anything else (unreachable, upstream 5xx) -> 502.
                     boolean isTimeout = e instanceof java.util.concurrent.TimeoutException
                             || e instanceof io.netty.handler.timeout.ReadTimeoutException
                             || (e.getCause() != null
@@ -186,8 +187,9 @@ public class TransactionService {
     private ResponseDto buildResponse(RequestDto request, double riskScore, String status, String strategy,
                                       Integer featureTier, long overallStartTime, double preprocessingTime, double netTime,
                                       double dbTime, ResponseDto.PythonTelemetryDto pythonTelemetry) {
-        // executionTimeMs first, so responseObjectBuildTimeMs measures the DTO assembly
-        // alone. Neither includes WebFlux's serialization of the response body.
+        // executionTimeMs is read first, so it excludes the DTO build that
+        // responseObjectBuildTimeMs times. Neither includes WebFlux's encoding of the
+        // response body; that falls in the client-side remainder.
         double executionTimeMs = (System.nanoTime() - overallStartTime) / 1_000_000.0;
         long responseBuildStart = System.nanoTime();
 
@@ -205,9 +207,10 @@ public class TransactionService {
         response.setRequestPreprocessingTimeMs(preprocessingTime);
         response.setAiCallRoundTripTimeMs(netTime);
 
-        // Unclamped: a negative value means Python's reported total exceeded Java's round
-        // trip, which is a measurement signal. Clamping would hide it and bias the mean
-        // upward. analyze-results.py reports the rate and minimum per tier.
+        // Estimated bridge overhead, unclamped: a negative value means Python's reported
+        // total exceeded Java's round trip, a measurement signal that clamping would hide
+        // while biasing the mean upward. analyze-results.py reports the rate and minimum
+        // per tier.
         double estimatedBridgeOverheadMs = netTime - pythonTelemetry.getTotalPythonExecutionTimeMs();
         response.setEstimatedBridgeOverheadMs(estimatedBridgeOverheadMs);
         response.setDbWriteTimeMs(dbTime);
