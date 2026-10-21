@@ -1,4 +1,4 @@
-# python-service on the other hyperthread of each of the Java service's cores, with both
+# python-service on the other hyperthread(s) of each of the Java service's cores, with both
 # quotas matched to their cpusets. No logical CPU is shared, so only the SMT sibling
 # comparison can tell the two services are on the same hardware.
 DESCRIPTION="python-service on the sibling hyperthreads of the Java service's cores"
