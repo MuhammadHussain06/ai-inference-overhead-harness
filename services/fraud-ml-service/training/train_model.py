@@ -1,3 +1,5 @@
+# Offline training of the four tier models (not in the measured path). The committed
+# .joblib files are what the service loads.
 import argparse
 import os
 
@@ -21,6 +23,7 @@ def output_path(n_features: int) -> str:
 def load_real_data(n_features: int):
     csv_path = os.path.join(os.path.dirname(__file__), "data", "creditcard.csv")
     df = pd.read_csv(csv_path)
+    # Same log1p transform the service applies to amount at predict time.
     df["Amount"] = np.log1p(df["Amount"])
     columns = ALL_V_COLUMNS[:n_features] + ["Amount"]
     return df[columns], df["Class"]
@@ -34,7 +37,7 @@ def make_synthetic_data(n_features: int, n=20000, seed=42):
     X["Amount"] = np.log1p(amount)
     # Rare synthetic "fraud" signal: large |V1| combined with large amount.
     score = X["V1"].abs() * 0.6 + X["Amount"] * 0.4
-    threshold = np.quantile(score, 0.98)  # ~2% positive rate, similar to real dataset
+    threshold = np.quantile(score, 0.98)  # about 2% positives
     y = (score > threshold).astype(int)
     return X, y
 
@@ -51,9 +54,11 @@ def train_one(n_features: int, synthetic: bool):
         X, y, test_size=0.2, random_state=42
     )
 
+    # Oversamples the training split only, so the test split keeps the real class balance.
     smote = SMOTE(random_state=42)
     X_train_balanced, y_train_balanced = smote.fit_resample(X_train, y_train)
 
+    # Fixed hyperparameters; tree count is XGBoost's default (100).
     model = xgb.XGBClassifier(max_depth=4, learning_rate=0.1)
     model.fit(X_train_balanced, y_train_balanced)
 
