@@ -1,26 +1,23 @@
 #!/usr/bin/env bats
-# Unit tests for converge_warmup(), the warm-up convergence gate in run-suite.sh and
-# run-ablation.sh. The gate decides when warm-up stops, so a gate that is too strict
-# burns MAX_WARMUP_CHUNKS on an already-settled stack and one that is too loose hands
-# the measured phase a target that is still moving. Neither shows up as a failure
-# anywhere -- table0 only reports the drift after the fact.
+# Unit tests for converge_warmup(), the warm-up convergence gate in lib/suite-stack.sh
+# (run-suite.sh, run-openloop.sh) and run-ablation.sh. Too strict a gate spends MAX_WARMUP_CHUNKS on a settled stack; too
+# loose hands the measured phase a target that is still moving. Neither fails a run;
+# table0 only reports the drift afterwards.
 #
-# The function and its constants are sourced out of the live script text (never a
-# copy), and its criterion is the real lib/warmup_gate.py. filter_chunk and
-# gzip_only are sourced the same way, since converge_warmup's output depends on
-# their real behavior. Only k6_run, finalize_result and check_thermal_safety are
-# stubbed: k6_run replays a crafted JSON chunk instead of starting a container.
+# converge_warmup, its constants, filter_chunk and gzip_only are extracted from the live
+# script text, and the criterion is the real lib/warmup_gate.py. Only k6_run (replays a
+# crafted JSON chunk), finalize_result and check_thermal_safety are stubbed.
 
 setup_file() {
   export LOAD_TESTING_DIR="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
   export SUITE_SH="${LOAD_TESTING_DIR}/run-suite.sh"
+  export STACK_SH="${LOAD_TESTING_DIR}/lib/suite-stack.sh"
   export ABLATION_SH="${LOAD_TESTING_DIR}/run-ablation.sh"
 
-  # Emits k6-shaped http_req_duration points into one chunk file. Each spec is
-  # "tier:status:value:count"; specs are laid down in order, one point every
-  # STEP_MS milliseconds from start_index, so chunks appended end to end stay in
-  # time order. The default 10 ms spacing puts 500 requests across 5 s, so the
-  # gate's window is WARMUP_WINDOW requests exactly.
+  # Writes k6-shaped http_req_duration points to one chunk file. Each spec is
+  # "tier:status:value:count", laid down in order one point every STEP_MS ms from
+  # start_index, so consecutive chunks stay in time order. At the default 10 ms, 500
+  # requests span 5 s, so the window is exactly WARMUP_WINDOW requests.
   cat > "${BATS_FILE_TMPDIR}/gen_chunk.py" <<'EOF'
 import os, sys
 from datetime import datetime, timedelta, timezone
@@ -66,10 +63,8 @@ setup() {
   : > "$THERMAL_LOG"
   K6_CHUNK=0
 
-  # Stands in for the container run: records the invocation and writes this
-  # chunk's fixture to wherever --out json=/results/raw/<name> pointed. A chunk
-  # with no fixture writes an empty file, which is how a target that stops
-  # producing data is represented.
+  # Records the invocation and copies this chunk's fixture to the --out
+  # json=/results/raw/<name> path; a chunk without a fixture writes an empty file.
   k6_run() {
     printf '%s\n' "$*" >> "$K6_LOG"
     K6_CHUNK=$((K6_CHUNK + 1))
@@ -87,10 +82,10 @@ setup() {
   check_thermal_safety() { printf '%s\n' "$1" >> "$THERMAL_LOG"; }
 
   eval "$(grep -E '^KEEP_METRICS=' "$SUITE_SH")"
-  eval "$(extract_fn "$SUITE_SH" filter_chunk)"
-  eval "$(extract_fn "$SUITE_SH" gzip_only)"
-  eval "$(gate_constants "$SUITE_SH")"
-  eval "$(extract_fn "$SUITE_SH" converge_warmup)"
+  eval "$(extract_fn "$STACK_SH" filter_chunk)"
+  eval "$(extract_fn "$STACK_SH" gzip_only)"
+  eval "$(gate_constants "$STACK_SH")"
+  eval "$(extract_fn "$STACK_SH" converge_warmup)"
 }
 
 # Writes one chunk fixture. Usage: chunk <n> <start_index> <tier:status:value:count>...
@@ -119,11 +114,11 @@ print(g.BASE_WINDOW, g.MIN_WINDOW_SPAN_S, g.TAIL_TOLERANCE_PCT, g.TAIL_ABS_FLOOR
   [ "$output" = "500 3.0 5.0 0.25" ]
 }
 
-@test "run-ablation.sh's gate is identical to run-suite.sh's" {
-  # The two copies are maintained by hand; a divergence would silently give the
-  # ablation a different steady-state definition from the main suite.
-  [ "$(extract_fn "$SUITE_SH" converge_warmup)" = "$(extract_fn "$ABLATION_SH" converge_warmup)" ]
-  [ "$(gate_constants "$SUITE_SH" | grep -v '^WARMUP_TABLE=')" \
+@test "run-ablation.sh's gate is identical to the suite's" {
+  # The two copies are maintained by hand; a divergence would give the ablation a
+  # different steady-state definition from the main suite.
+  [ "$(extract_fn "$STACK_SH" converge_warmup)" = "$(extract_fn "$ABLATION_SH" converge_warmup)" ]
+  [ "$(gate_constants "$STACK_SH" | grep -v '^WARMUP_TABLE=')" \
     = "$(gate_constants "$ABLATION_SH" | grep -v '^WARMUP_TABLE=')" ]
 }
 
@@ -154,9 +149,8 @@ print(g.BASE_WINDOW, g.MIN_WINDOW_SPAN_S, g.TAIL_TOLERANCE_PCT, g.TAIL_ABS_FLOOR
 }
 
 @test "the absolute floor admits a sub-millisecond target the percentage bound rejects" {
-  # 0.20ms -> 0.40ms is a 100% drift but a 0.20ms gap: inside timer and scheduler
-  # jitter, and the settled mock/calibration case a percentage-only bound would
-  # hold warm-up open on forever.
+  # 0.20 ms -> 0.40 ms is a 100% drift but a 0.20 ms gap, within scheduler jitter; a
+  # percentage-only bound would never pass a settled mock or calibration target.
   chunk 1 0 "mock:200:0.20:1000" "mock:200:0.40:500"
   run converge_warmup "warmup_scan_rep1" WARMUP_TARGETS=mock WARMUP_VUS=5 REP=1
   [ "$status" -eq 0 ]
@@ -164,8 +158,7 @@ print(g.BASE_WINDOW, g.MIN_WINDOW_SPAN_S, g.TAIL_TOLERANCE_PCT, g.TAIL_ABS_FLOOR
 }
 
 @test "the percentage tolerance admits a slow target the absolute floor rejects" {
-  # 100ms -> 102ms is a 2ms gap, far above the floor, but only 2% of the target's
-  # own latency scale.
+  # 100 ms -> 102 ms is a 2 ms gap, above the floor, but only 2% drift.
   chunk 1 0 "28:200:100.0:1000" "28:200:102.0:500"
   run converge_warmup "warmup_scan_rep1" WARMUP_TARGETS=28 WARMUP_VUS=5 REP=1
   [ "$status" -eq 0 ]
@@ -175,9 +168,9 @@ print(g.BASE_WINDOW, g.MIN_WINDOW_SPAN_S, g.TAIL_TOLERANCE_PCT, g.TAIL_ABS_FLOOR
 # --- the time-defined window ---
 
 @test "a window spans at least WARMUP_WINDOW_MIN_S, so a sub-second blip is not drift" {
-  # 1ms per point: 500 requests cover half a second. The last 500 are slower, which
-  # a 500-request window would read as a 100% jump; the gate widens the window to
-  # the first multiple of 500 spanning 3s, whose median the blip does not move.
+  # 1 ms per point: 500 requests cover 0.5 s. The last 500 are slower, a 100% jump for a
+  # 500-request window; the gate widens the window to the first multiple of 500 spanning
+  # at least 3 s, whose median the blip does not move.
   STEP_MS=1 chunk 1 0 "mock:200:10.0:11500" "mock:200:20.0:500"
   run converge_warmup "warmup_scan_rep1" WARMUP_TARGETS=mock WARMUP_VUS=5 REP=1
   [ "$status" -eq 0 ]
@@ -197,8 +190,7 @@ print(g.BASE_WINDOW, g.MIN_WINDOW_SPAN_S, g.TAIL_TOLERANCE_PCT, g.TAIL_ABS_FLOOR
 # --- the joint condition across targets ---
 
 @test "one lagging target blocks the chunk that every other target passed" {
-  # mock is flat from chunk 1; tier 28 only settles in chunk 2. Stopping at chunk
-  # 1 would hand the measured phase a target that was still moving.
+  # mock is flat from chunk 1; tier 28 settles only in chunk 2.
   chunk 1 0 "mock:200:0.50:1500" "28:200:10.0:1000" "28:200:20.0:500"
   chunk 2 3000 "mock:200:0.50:1500" "28:200:20.0:1500"
   run converge_warmup "warmup_scan_rep1" "WARMUP_TARGETS=mock 28" WARMUP_VUS=5 REP=1
@@ -208,8 +200,8 @@ print(g.BASE_WINDOW, g.MIN_WINDOW_SPAN_S, g.TAIL_TOLERANCE_PCT, g.TAIL_ABS_FLOOR
 }
 
 @test "an expected target with no data blocks convergence" {
-  # Every target that produced points is flat, but mock produced none: judging
-  # only the targets present would pass a warm-up that never reached mock.
+  # The targets with points are flat, but mock has none; judging only the targets
+  # present would pass a warm-up that never reached mock.
   chunk 1 0 "28:200:10.0:1500"
   run converge_warmup "warmup_scan_rep1" "WARMUP_TARGETS=28 mock" WARMUP_VUS=5 REP=1
   [ "$status" -eq 0 ]
@@ -230,8 +222,8 @@ print(g.BASE_WINDOW, g.MIN_WINDOW_SPAN_S, g.TAIL_TOLERANCE_PCT, g.TAIL_ABS_FLOOR
 # --- what the gate refuses to read ---
 
 @test "non-200 points are excluded from the tail comparison" {
-  # The 200 series is flat throughout; the failed requests in the middle would
-  # dominate the penultimate window and read as drift if they were counted.
+  # The 200 series is flat; counted, the failed requests in the middle would dominate
+  # the penultimate window and read as drift.
   chunk 1 0 "28:200:10.0:1000" "28:0:900.0:250" "28:200:10.0:500"
   run converge_warmup "warmup_scan_rep1" WARMUP_TARGETS=28 WARMUP_VUS=5 REP=1
   [ "$status" -eq 0 ]
@@ -247,8 +239,8 @@ print(g.BASE_WINDOW, g.MIN_WINDOW_SPAN_S, g.TAIL_TOLERANCE_PCT, g.TAIL_ABS_FLOOR
 }
 
 @test "a target short of three windows does not converge" {
-  # One point below 3 * WARMUP_WINDOW: there is no penultimate window to compare
-  # against, so "no drift measured" must not be read as "no drift".
+  # One point short of 3 * WARMUP_WINDOW, the gate's minimum: "no drift measured" must
+  # not read as "no drift".
   chunk 1 0 "28:200:10.0:1499"
   run converge_warmup "warmup_scan_rep1" WARMUP_TARGETS=28 WARMUP_VUS=5 REP=1
   [ "$status" -eq 0 ]
@@ -258,8 +250,8 @@ print(g.BASE_WINDOW, g.MIN_WINDOW_SPAN_S, g.TAIL_TOLERANCE_PCT, g.TAIL_ABS_FLOOR
 }
 
 @test "the verdict after the last chunk is the one reported" {
-  # Flat throughout, but only the fourth chunk brings the target to three windows:
-  # that is the state the measured phase starts from.
+  # Flat throughout, but only the fourth chunk brings the target to three windows; that
+  # final verdict is the state the measured phase starts from.
   chunk 1 0    "28:200:10.0:400"
   chunk 2 400  "28:200:10.0:400"
   chunk 3 800  "28:200:10.0:400"
@@ -280,8 +272,8 @@ print(g.BASE_WINDOW, g.MIN_WINDOW_SPAN_S, g.TAIL_TOLERANCE_PCT, g.TAIL_ABS_FLOOR
   [ ! -e "${RAW_RESULTS_DIR}/warmup_scan_rep1_combined.json" ]
   [ -e "${RESULTS_DIR}/warmup_scan_rep1.json.gz" ]
   [ "$(gunzip -c "${RESULTS_DIR}/warmup_scan_rep1.json.gz" | grep -c .)" = "3000" ]
-  # The chunked path gzips the already-filtered file directly; finalize_result
-  # is only used by the WARMUP_ITERATIONS_PER_TARGET bypass.
+  # The chunked path gzips the filtered file directly; only the
+  # WARMUP_ITERATIONS_PER_TARGET bypass uses finalize_result.
   [ ! -s "$FINALIZE_LOG" ]
 }
 
@@ -306,8 +298,7 @@ print(g.BASE_WINDOW, g.MIN_WINDOW_SPAN_S, g.TAIL_TOLERANCE_PCT, g.TAIL_ABS_FLOOR
 # --- the fixed-iteration escape hatch ---
 
 @test "WARMUP_ITERATIONS_PER_TARGET bypasses the gate for a single fixed pass" {
-  # What keeps the smoke test and every fault-injection case fast: one pass, no
-  # chunking, no convergence check at all.
+  # Used by the smoke test and fault injection: one pass, no chunking, no gate.
   chunk 1 0 "28:200:10.0:1000" "28:200:20.0:500"
   run converge_warmup "warmup_scan_rep1" WARMUP_TARGETS=28 WARMUP_VUS=5 WARMUP_ITERATIONS_PER_TARGET=50 REP=1
   [ "$status" -eq 0 ]
@@ -318,8 +309,7 @@ print(g.BASE_WINDOW, g.MIN_WINDOW_SPAN_S, g.TAIL_TOLERANCE_PCT, g.TAIL_ABS_FLOOR
 
 # --- what warm-up.js does with the env the gate sends it ---
 
-# k6 normally runs containerized, so a host that can run the rest of this file may
-# not have the binary; the scenario config is only inspectable where it does.
+# k6 normally runs in a container; these tests skip when the binary is not on PATH.
 require_k6() {
   command -v k6 >/dev/null 2>&1 || skip "k6 is not on PATH (the suite runs it containerized)"
 }
@@ -331,9 +321,8 @@ scenario_field() {
 }
 
 @test "warm-up.js defaults to constant-vus cut at the chunk duration with no drain" {
-  # gracefulStop '0s' keeps the chunk's tail at full concurrency: a staggered
-  # per-VU drain thins the load, and the thinner load reads as faster, settled
-  # latency when it is only fewer VUs contending.
+  # gracefulStop '0s' keeps the chunk's tail at full concurrency; a staggered drain
+  # thins the load, which reads as faster, settled latency.
   require_k6
   run scenario_field -e WARMUP_DURATION_S=15
   [ "$status" -eq 0 ]
@@ -344,8 +333,8 @@ scenario_field() {
 
 @test "WARMUP_ITERATIONS_PER_TARGET selects the fixed-count executor instead" {
   # The bypass path: a fixed total budget split across VUS, bounded by maxDuration
-  # rather than run to a wall clock. Nothing checks its tail, so it carries no
-  # gracefulStop override.
+  # rather than a fixed duration. It also sets gracefulStop '0s', since k6's default
+  # drain after maxDuration would outlast the slot padding.
   require_k6
   run scenario_field -e WARMUP_ITERATIONS_PER_TARGET=50 -e WARMUP_VUS=5
   [ "$status" -eq 0 ]
