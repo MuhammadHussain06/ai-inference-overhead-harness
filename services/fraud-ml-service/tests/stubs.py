@@ -17,7 +17,7 @@ class StubModel:
 
 
 class UnpinnableModel(StubModel):
-    """Ignores set_params(n_jobs=...), reproducing a model that resists pinning."""
+    """Ignores set_params(n_jobs=...), like a model that resists pinning."""
 
     def __init__(self, n_jobs: int = 8):
         super().__init__(n_jobs=n_jobs)
@@ -28,8 +28,8 @@ class UnpinnableModel(StubModel):
 
 
 class FailingModel(StubModel):
-    """Raises ValueError from predict_proba, reproducing a server-side computation
-    fault (e.g. a shape or NaN error) rather than a client input problem."""
+    """Raises ValueError from predict_proba, like a server-side computation fault
+    (e.g. a shape or NaN error)."""
 
     def predict_proba(self, frame):
         raise ValueError("simulated internal computation fault")
