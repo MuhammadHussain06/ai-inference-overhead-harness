@@ -1,0 +1,5 @@
+# A recorded CPU quota larger than the recorded cpuset can supply: the kernel would enforce
+# the smaller of the two, so the quota the check runs under would not be the one recorded.
+DESCRIPTION="recorded CPU quota larger than the recorded cpuset can supply"
+EXPECT_GUARD="[cpuset]"
+PATCH_METADATA="set cores_used_by_suite.python_service_cpus_quota 64"

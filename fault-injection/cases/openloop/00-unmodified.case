@@ -1,0 +1,4 @@
+# Control. The copy is the suite run as recorded, so every guard must stay silent and the
+# one-rep check must complete. Without this case, a check that rejects everything would
+# look like success.
+DESCRIPTION="unmodified suite run"

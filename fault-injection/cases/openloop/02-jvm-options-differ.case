@@ -1,0 +1,6 @@
+# The suite ran with JVM options other than those docker-compose.yml now resolves to, as when
+# the file changed after the suite run. JAVA_TOOL_OPTIONS is a literal in the compose file,
+# so the recorded value is the side that can be made to differ.
+DESCRIPTION="JVM options differ from those the suite run recorded"
+EXPECT_GUARD="[recorded-settings]"
+PATCH_METADATA="append jvm_pinned_options -XX:+AlwaysPreTouch"

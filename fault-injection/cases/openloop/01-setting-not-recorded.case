@@ -1,0 +1,5 @@
+# The suite run carries no thread-limiter token count, so the open-loop stack could only
+# start on compose's current default, not on the suite's configuration.
+DESCRIPTION="suite run recorded no thread-limiter token count"
+EXPECT_REFUSAL="recorded no suite_config.thread_limiter_tokens"
+PATCH_METADATA="del suite_config.thread_limiter_tokens"

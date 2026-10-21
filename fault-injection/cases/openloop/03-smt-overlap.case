@@ -1,0 +1,11 @@
+# The recorded Java cores split by hyperthread: Java keeps the lowest sibling of each and
+# python-service takes the others, so no logical CPU is shared but every physical core is.
+# The open-loop stack starts on these recorded cpusets, and only its startup SMT guard
+# compares physical cores.
+DESCRIPTION="recorded cpusets put python-service on the Java cores' sibling hyperthreads"
+EXPECT_GUARD="[smt]"
+REQUIRES="smt"
+PATCH_METADATA="set cores_used_by_suite.python_service_cpuset ${FAULT_SMT_PYTHON}
+set cores_used_by_suite.python_service_cpus_quota ${FAULT_SMT_PYTHON_CPUS}
+set cores_used_by_suite.transaction_service_cpuset ${FAULT_SMT_JAVA}
+set cores_used_by_suite.transaction_service_cpus_quota ${FAULT_SMT_JAVA_CPUS}"
