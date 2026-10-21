@@ -1,13 +1,11 @@
 import { sendTransaction, TARGETS } from './lib/common.js';
 
-// Warms JIT tiers, connection pools, and OS/network buffers past compilation
-// thresholds. Defaults to constant-vus with gracefulStop: '0s' -- every VU is cut
-// at DURATION_S rather than draining individually, since a staggered drain thins
-// concurrency during the grace window and reads as fast, "converged" latency to a
-// tail-window convergence check when it is really just fewer VUs contending.
-// WARMUP_ITERATIONS_PER_TARGET selects a fixed-count per-vu-iterations pass
-// instead, for smoke tests that want a fast, deterministic run and don't check
-// the tail.
+// Warm-up traffic (JIT, connection pools, OS buffers), one target after another in time
+// slots, tagged phase=warmup. Default: constant-vus with gracefulStop: '0s', so every VU stops
+// at the deadline; a staggered drain would thin concurrency at the end of the chunk, and the
+// convergence gate would read that fast, uncontended latency as converged.
+// WARMUP_ITERATIONS_PER_TARGET selects a fixed-count per-vu-iterations pass instead (smoke
+// test, fault injection); the shell harness then skips the convergence gate.
 
 const VUS = parseInt(__ENV.WARMUP_VUS || '5', 10);
 const MAX_DURATION_S = parseInt(__ENV.WARMUP_MAX_DURATION_S || '60', 10);
@@ -25,11 +23,8 @@ let scenarioFor;
 if (USE_ITERATIONS) {
     const ITERATIONS_PER_TARGET = parseInt(ITERATIONS_PER_TARGET_RAW, 10);
     const ITERATIONS_PER_VU = Math.max(1, Math.ceil(ITERATIONS_PER_TARGET / VUS));
-    // Buffer past MAX_DURATION_S so the next target's scenario doesn't overlap this
-    // one's. gracefulStop: '0s' matches the constant-vus branch below -- without it,
-    // a run actually capped by maxDuration would drain into k6's default 30s
-    // gracefulStop, which is longer than this buffer and could bleed into the next
-    // target's slot.
+    // Slot padded past MAX_DURATION_S so targets do not overlap. gracefulStop: '0s' because
+    // k6's default 30s drain after a maxDuration cap is longer than the padding.
     SLOT_S = MAX_DURATION_S + 5;
     scenarioFor = (key, i) => ({
         executor: 'per-vu-iterations',
