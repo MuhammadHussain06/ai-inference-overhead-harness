@@ -1,3 +1,4 @@
+# Base pinned by digest so every build starts from the same image bytes.
 FROM python:3.11-slim@sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b41e
 WORKDIR /app
 
@@ -9,12 +10,15 @@ COPY app/ ./app/
 COPY models/ ./models/
 
 EXPOSE 8000
+# Default of 1; compose sets 3 and the ablation's workers arm varies it.
 ENV UVICORN_WORKERS=1
 
+# n_jobs=1 on the model does not constrain the numeric libraries beneath it, so cap
+# them here too; /health reports these and the harness checks them every rep.
 ENV OMP_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1
-# --no-access-log: uvicorn logs every request to stdout by default, synchronously,
-# on the request-handling coroutine -- disabled to keep it off the measured path.
+# sh -c expands ${UVICORN_WORKERS}, which exec-form CMD does not. --no-access-log keeps
+# uvicorn's synchronous per-request stdout write off the measured path.
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS} --no-access-log"]
