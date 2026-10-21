@@ -10,15 +10,15 @@ router = APIRouter()
 
 
 def _noop():
-    """No business logic -- the whole point of this tier is to have nothing here."""
+    """No work: the calibration arm has nothing behind the thread hand-off."""
     return False, 0.0, 0.0
 
 
 @router.post("/predict/calibrate", response_model=TransactionResponse, response_model_by_alias=True)
 async def predict_calibrate(payload: TransactionPayload, request: Request):
-    """Measures framework, dispatch and serialization overhead with zero computation
-    behind it. Still goes through run_in_threadpool: the calibration arm must traverse
-    every layer the AI arm does, so the difference isolates computation alone."""
+    """Calibration arm: framework, thread dispatch and serialization cost with no work
+    behind them. It still goes through run_in_threadpool so it traverses every layer the
+    AI arm does, and the difference between the two isolates the model work."""
     start_total = request.state.start_time
 
     parsing_time_ms = (time.perf_counter() - start_total) * 1000
