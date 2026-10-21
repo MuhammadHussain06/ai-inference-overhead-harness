@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-# Checks that the harness's abort guards fire. Each case misconfigures one pinned setting
-# the suite claims to enforce, runs a minimal slice of run-suite.sh against that
-# configuration, and records whether the expected guard rejected it.
+# Fault injection for the harness guards. Each case in cases/ misconfigures one pinned
+# setting, runs a minimal slice of run-suite.sh against it, and passes only if the run aborts
+# through the expected guard (its tag in the failures log). Case 00 is the unmodified control
+# and must run clean, so a harness that rejects everything is reported as a failure.
 #
-# A guard that never fires is indistinguishable from a guard that cannot fail, and both
-# report a clean run. These cases are what separates the two. Case 00 runs unmodified and
-# must pass, so a suite where every case aborts is itself reported as a failure.
-#
-# Nothing here touches ../results: each case runs against a generated copy of the compose
-# configuration whose bind mounts and results directory point inside this folder.
+# Nothing here touches ../results: each case runs against a generated compose configuration
+# whose bind mounts and results directory point into scratch/<case>/.
 
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 
-# render_compose() repoints mounts that resolve to the repo's own results/; an inherited
-# per-run directory would resolve elsewhere and escape that rewrite.
+# render_compose() repoints only mounts under the repo's results/; an inherited per-run
+# directory would resolve elsewhere and escape that rewrite.
 unset RUN_RESULTS_DIR
 
 for _req_cmd in docker python3 timeout; do
@@ -25,8 +22,8 @@ for _req_cmd in docker python3 timeout; do
   fi
 done
 
-# Every case runs run-suite.sh, which refuses an unprepared host; without this check each
-# case would read as aborting through the wrong guard.
+# Every case runs run-suite.sh, which refuses an unprepared host; without this check every
+# case would abort through the power guard and score as the wrong guard firing.
 . ../load-testing/lib/host-provenance.sh
 . ../load-testing/lib/power-state.sh
 require_prepared_host "${REQUIRED_TURBO_OVERRIDE:-off}"
@@ -42,12 +39,10 @@ REPORT_MD="${REPORT_DIR}/guard_verification_report.md"
 REPORT_CSV="${REPORT_DIR}/guard_verification_report.csv"
 echo "case,description,stage,expected_guard,outcome,exit_code,verdict" > "$REPORT_CSV"
 
-# Baseline cpusets for this host. The compose defaults name whole physical cores on one
-# machine only; on any other host every case would abort on the baseline rather than on its
-# own fault. The defaults are used when they still hold here, and recommend-cpusets.sh
-# supplies values when they do not.
-# The checks below are reused to test the baseline rather than to reject a run, so
-# abort_suite records instead of exiting and each call is read from what it recorded.
+# Baseline cpusets for this host: the compose defaults if they describe whole physical cores
+# here, otherwise recommend-cpusets.sh's values, so each case fails on its own fault rather
+# than on a baseline that does not fit the host. The topology guards are reused to test the
+# baseline, so abort_suite records the reason instead of exiting.
 # shellcheck disable=SC2034  # read by the sourced topology helpers
 CPU_PIN_LOG=/dev/null
 BASELINE_ABORT=""
@@ -89,8 +84,8 @@ else
   exit 2
 fi
 
-# First CPU of python-service's cpuset: on an SMT host its sibling is in the cpuset too,
-# so pinning to it alone leaves a half-owned core on any topology.
+# First CPU of python-service's baseline cpuset (case 02). On an SMT host its sibling is in
+# the baseline too, so pinning python-service to it alone leaves half a core unclaimed.
 PYTHON_BASELINE_CPUSET="${PYTHON_CPUSET:-$(compose_default python-service cpuset)}"
 FAULT_HALF_CORE=$(tr ',' '\n' <<< "$PYTHON_BASELINE_CPUSET" | head -1 | cut -d- -f1)
 export FAULT_HALF_CORE PYTHON_BASELINE_CPUSET
@@ -102,18 +97,17 @@ PASSED=0
 FAILED=0
 SKIPPED=0
 
-# Some faults only exist on a host with hyperthreading: on a machine where every logical
-# CPU is its own physical core, a cpuset cannot take half of one. Those cases are skipped
-# rather than counted, since the guard is untested here, not proven absent.
+# SMT-only faults cannot be expressed where every logical CPU is its own core. Those cases
+# are SKIP, not PASS: the guard is untested on this host, not proven.
 host_has_smt() {
   local siblings="/sys/devices/system/cpu/cpu0/topology/thread_siblings_list"
   [ -r "$siblings" ] || return 1
   [ "$(tr ',-' '\n' < "$siblings" | grep -c .)" -gt 1 ]
 }
 
-# Java's baseline cores split by hyperthread: Java keeps the lowest sibling of each core
-# and python-service takes the others. The two cpusets share no logical CPU, so only the
-# physical-core comparison can see that they share hardware. Empty on a host without SMT.
+# Case 01: Java's baseline cores split by hyperthread. Java keeps the lowest sibling of each
+# core and python-service takes the others, so the cpusets share no logical CPU but every
+# physical core; only the physical-core comparison catches it. Empty on a host without SMT.
 JAVA_BASELINE_CPUSET="${JAVA_CPUSET:-$(compose_default transaction-service cpuset)}"
 FAULT_SMT_JAVA=""
 FAULT_SMT_PYTHON=""
@@ -136,9 +130,9 @@ FAULT_SMT_JAVA_CPUS="$(topo_count_cpus "$FAULT_SMT_JAVA").0"
 FAULT_SMT_PYTHON_CPUS="$(topo_count_cpus "$FAULT_SMT_PYTHON").0"
 export FAULT_SMT_JAVA FAULT_SMT_PYTHON FAULT_SMT_JAVA_CPUS FAULT_SMT_PYTHON_CPUS
 
-# Writes a compose configuration for one case: the repo's own file resolved with the
-# case's environment, then the requested env value replaced, then every bind mount
-# repointed into this case's scratch directory.
+# Writes one case's compose configuration: the repo's file resolved with the baseline and
+# case environment, bind mounts under results/ repointed into the case's scratch directory,
+# then the optional PATCH_SET_ENV value replaced.
 render_compose() {
   local case_env="$1" patch_set_env="$2" out="$3" case_results="$4"
 
